@@ -5,7 +5,7 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from django_rq import get_queue
+#from django_rq import get_queue
 
 from accounts.permissions import IsAdminRole, IsInstructorOrAdmin
 from audit.utils import log_audit
@@ -80,8 +80,8 @@ class VideoViewSet(viewsets.ModelViewSet):
     def analyze(self, request, pk=None):
         video = self.get_object()
         job = AnalysisJob.objects.create(video=video, status=AnalysisJob.Status.QUEUED)
-        queue = get_queue("default")
-        django_job = queue.enqueue(run_analysis_job, job.id, request.user.id)
+      #  queue = get_queue("default")
+        #django_job = queue.enqueue(run_analysis_job, job.id, request.user.id)
         job.rq_job_id = str(getattr(django_job, "id", django_job))
         job.save(update_fields=["rq_job_id"])
         log_audit(

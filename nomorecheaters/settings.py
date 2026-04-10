@@ -84,7 +84,6 @@ INSTALLED_APPS = [
     "rest_framework",
     "rest_framework_simplejwt",
     "corsheaders",
-    "django_rq",
     "accounts",
     "proctoring",
     "audit",
@@ -193,5 +192,5 @@ def _parse_redis_url(url: str) -> dict:
 
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
-RQ_QUEUES = {"default": _parse_redis_url(REDIS_URL)}
+
 
