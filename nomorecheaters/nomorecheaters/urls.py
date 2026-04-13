@@ -24,7 +24,8 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include('apis.urls')),
     path('api-auth/', include('rest_framework.urls')),
-#     path('accounts/register/', auth_views.LoginView.as_view(), name='login'),
-#     path('accounts/login/', auth_views.LogoutView.as_view(), name='logout'),
-#     path('accounts/register/', views.register, name='register'),
+    path('api/dj-rest-auth/', include('dj_rest_auth.urls')),
+    path('api/dj-rest-auth/registration/',
+        include('dj_rest_auth.registration.urls')),
+
 ]

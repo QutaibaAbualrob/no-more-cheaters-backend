@@ -2,3 +2,7 @@
 # Use Python 3.10–3.13. Install when online: pip install -r requirements.txt
 
 djangorestframework
+dj-rest-auth
+django-allauth
+django-cors-headers
+requests
