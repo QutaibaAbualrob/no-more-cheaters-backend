@@ -37,19 +37,48 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    
+    # Required for allauth
+    'django.contrib.sites',
+    
+    
+    # Rest frameork and token authentication
     'rest_framework',
-    'apis',
+    "corsheaders",
+    'rest_framework.authtoken',
+    
+    # Allauth packages 
+    'allauth',
+    'allauth.account',
+    'allauth.socialaccount',
+    
+    # dj-rest-auth packages
+    'dj_rest_auth',
+    'dj_rest_auth.registration',
+    
+    'apis',  
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    # For CORS headers to be used by react or any other domain or api
+    "corsheaders.middleware.CorsMiddleware",
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    # all auth middleware
+    'allauth.account.middleware.AccountMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+# To be used by react or any other domain or api
+CORS_ORIGIN_WHITELIST = ( 
+    "http://localhost:3000", 
+    "http://localhost:8000",
+)
+
 
 ROOT_URLCONF = 'nomorecheaters.urls'
 
@@ -63,10 +92,18 @@ TEMPLATES = [
                 'django.template.context_processors.request',
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
+                
+                # all auth context processor
+                'django.template.context_processors.request',
             ],
         },
     },
 ]
+
+# settings for allauth
+EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+SITE_ID = 1
+
 
 WSGI_APPLICATION = 'nomorecheaters.wsgi.application'
 
@@ -79,6 +116,17 @@ DATABASES = {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'db.sqlite3',
     }
+}
+
+REST_FRAMEWORK = {
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
+    
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.SessionAuthentication',
+        'rest_framework.authentication.TokenAuthentication',
+    ],
 }
 
 
