@@ -23,6 +23,7 @@ from . import views
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('api/', include('apis.urls')),
 #     path('accounts/register/', auth_views.LoginView.as_view(), name='login'),
 #     path('accounts/login/', auth_views.LogoutView.as_view(), name='logout'),
 #     path('accounts/register/', views.register, name='register'),
