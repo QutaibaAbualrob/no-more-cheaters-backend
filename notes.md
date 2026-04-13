@@ -45,6 +45,13 @@ Using third party packages in authentication in django:
 
     Endpoints summery:
 
-        dj-rest-auth/registration/
         dj-rest-auth/login/
+        dj-rest-auth/logout/
+
+        dj-rest-auth/password/reset
+        dj-rest-auth/password/reset/confirm
+        
+
+        dj-rest-auth/registration/
+        
 
