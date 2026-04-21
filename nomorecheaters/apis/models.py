@@ -114,7 +114,7 @@ class AuditLog(models.Model):
         return f"{self.action} by {self.user.email if self.user else 'Unknown'} at {self.performed_at}"
 
 
-class SystemSetting(models.Model):
+class SystemSettings(models.Model):
     setting_key = models.CharField(max_length=100, primary_key=True)
     setting_value = models.CharField(max_length=500, null=False, blank=False)
     description = models.TextField(null=True, blank=True)
