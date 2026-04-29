@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from rest_framework import serializers
 
 from .models import AnalysisResult, GlobalThresholdSettings, UserThresholdSettings, Video
@@ -15,11 +17,13 @@ class AnalysisResultSerializer(serializers.ModelSerializer):
 class VideoSerializer(serializers.ModelSerializer):
     analysis = AnalysisResultSerializer(read_only=True)
     uploaded_by_email = serializers.CharField(source="uploaded_by.email", read_only=True)
+    file_url = serializers.SerializerMethodField()
 
     class Meta:
         model = Video
         fields = (
             "id",
+            "file_url",
             "original_filename",
             "content_type",
             "size_bytes",
@@ -32,6 +36,16 @@ class VideoSerializer(serializers.ModelSerializer):
         )
         read_only_fields = fields
 
+    def get_file_url(self, obj):
+        if not obj.file:
+            return ""
+
+        url = obj.file.url
+        request = self.context.get("request")
+        if request is not None:
+            return request.build_absolute_uri(url)
+        return url
+
 
 class VideoUploadSerializer(serializers.Serializer):
     file = serializers.FileField()
@@ -40,6 +54,18 @@ class VideoUploadSerializer(serializers.Serializer):
         max_bytes = 524_288_000  # 500MB default; can be overridden at reverse proxy
         if getattr(value, "size", 0) and value.size > max_bytes:
             raise serializers.ValidationError("File is too large.")
+
+        content_type = (getattr(value, "content_type", "") or "").lower()
+        extension = Path(getattr(value, "name", "") or "").suffix.lower()
+        allowed_extensions = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
+        generic_types = {"", "application/octet-stream"}
+
+        if not content_type.startswith("video/") and content_type not in generic_types:
+            raise serializers.ValidationError("Upload a valid video file.")
+
+        if extension not in allowed_extensions:
+            raise serializers.ValidationError("Supported video formats: mp4, mov, m4v, webm, avi, mkv.")
+
         return value
 
 
