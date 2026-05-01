@@ -104,6 +104,13 @@ TEMPLATES = [
 EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 SITE_ID = 1
 
+# setting for allauth for user login using email
+# this is essential because we overriden the deafult user
+# 
+ACCOUNT_AUTHENTICATION_METHOD = 'email'
+ACCOUNT_EMAIL_REQUIRED = True
+
+
 
 WSGI_APPLICATION = 'nomorecheaters.wsgi.application'
 
@@ -170,3 +177,7 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+AUTH_USER_MODEL = 'apis.User'
+
+
+
