@@ -8,7 +8,7 @@ from django.core.validators import MinValueValidator, MaxValueValidator
 
 
 class User(AbstractUser):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    uid = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     email = models.EmailField(unique=True, null=False, blank=False)
     
     class Role(models.TextChoices):

@@ -3,8 +3,7 @@ from rest_framework import generics, permissions
 
 
 from django.views.generic import ListView
-from django.contrib.auth.models import User
-
+from .models import User
 from .serializers import UserSerializer
 
 

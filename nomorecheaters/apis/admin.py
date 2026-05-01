@@ -1,7 +1,7 @@
 from django.contrib import admin
 
 # Register your models here.
-from .models import User, ExamSession, Video, Alert, AuditLog, SystemSetting
+from .models import User, ExamSession, Video, Alert, AuditLog, SystemSettings
 
 
 @admin.register(User)
@@ -40,8 +40,8 @@ class AuditLogAdmin(admin.ModelAdmin):
     readonly_fields = ['performed_at']
 
 
-@admin.register(SystemSetting)
-class SystemSettingAdmin(admin.ModelAdmin):
+@admin.register(SystemSettings)
+class SystemSettingsAdmin(admin.ModelAdmin):
     list_display = ['setting_key', 'setting_value', 'updated_by', 'updated_at']
     search_fields = ['setting_key', 'description']
     readonly_fields = ['updated_at']
