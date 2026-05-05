@@ -1,22 +1,17 @@
-
-from rest_framework import generics, permissions
-
-
-from django.views.generic import ListView
-from django.contrib.auth.models import User
+from django.contrib.auth import get_user_model
+from rest_framework import generics
 
 from .serializers import UserSerializer
 
 
-# Create your views here.
+User = get_user_model()
+
 
 class UsersListView(generics.ListAPIView):
     queryset = User.objects.all()
     serializer_class = UserSerializer
-    
+
+
 class DeleteUserView(generics.RetrieveUpdateDestroyAPIView):
-    # permission_classes = (permissions.IsAdminUser,)
     queryset = User.objects.all()
     serializer_class = UserSerializer
-    
-    
