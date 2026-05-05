@@ -1,16 +1,41 @@
+"""
+DRF serializers for the No More Cheaters REST API.
+
+Each domain model has a **Read** serializer (all fields read-only, safe for
+list/detail responses) and, where applicable, a **Create** or **Update**
+serializer that carries validation and authorisation logic.
+
+Common authorisation pattern
+---------------------------
+Most write serializers include a ``validate_<fk>`` method that ensures the
+requesting user is either:
+
+* The instructor who owns the related exam, **or**
+* An administrator (``role == ADMIN`` / ``is_superuser``).
+"""
+
 import hashlib
 from pathlib import Path
 
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from .models import Alert, AuditLog, Exam, ExamSession, SystemSettings, Video
+from .models import (
+    Alert, AnalysisJob, AuditLog, Exam, ExamSession, Report,
+    SystemSettings, Video,
+)
 
 
 User = get_user_model()
 
 
 class UserReadSerializer(serializers.ModelSerializer):
+    """Read-only representation of a user account.
+
+    Exposes only non-sensitive fields; passwords and permissions are
+    intentionally excluded.
+    """
+
     class Meta:
         model = User
         fields = ['id', 'email', 'username', 'role', 'is_active', 'created_at']
@@ -18,6 +43,8 @@ class UserReadSerializer(serializers.ModelSerializer):
 
 
 class ExamReadSerializer(serializers.ModelSerializer):
+    """Read-only representation of an exam, including the instructor's email."""
+
     instructor_email = serializers.EmailField(source='instructor.email', read_only=True)
 
     class Meta:
@@ -35,16 +62,33 @@ class ExamReadSerializer(serializers.ModelSerializer):
 
 
 class ExamCreateSerializer(serializers.ModelSerializer):
+    """Create a new exam.
+
+    The ``instructor`` is automatically set to the authenticated user from
+    the request context — clients cannot specify it.
+    """
+
     class Meta:
         model = Exam
         fields = ['name', 'description']
 
     def create(self, validated_data):
+        """Persist the exam with the requesting user as instructor."""
         request = self.context['request']
         return Exam.objects.create(instructor=request.user, **validated_data)
 
 
+class ExamUpdateSerializer(serializers.ModelSerializer):
+    """Update an existing exam's name and/or description."""
+
+    class Meta:
+        model = Exam
+        fields = ['name', 'description']
+
+
 class ExamSessionReadSerializer(serializers.ModelSerializer):
+    """Read-only exam session with denormalised exam name and instructor email."""
+
     exam_name = serializers.CharField(source='exam.name', read_only=True)
     instructor_email = serializers.EmailField(source='exam.instructor.email', read_only=True)
 
@@ -64,11 +108,17 @@ class ExamSessionReadSerializer(serializers.ModelSerializer):
 
 
 class ExamSessionCreateSerializer(serializers.ModelSerializer):
+    """Create a new exam session for a specific student.
+
+    Only the exam's owning instructor (or an admin) may create sessions.
+    """
+
     class Meta:
         model = ExamSession
         fields = ['exam', 'student_identifier']
 
     def validate_exam(self, exam):
+        """Ensure the requesting user owns this exam (or is an admin)."""
         request = self.context['request']
         is_admin = getattr(request.user, 'role', '') == User.Role.ADMIN or request.user.is_superuser
         if not is_admin and exam.instructor_id != request.user.id:
@@ -77,6 +127,12 @@ class ExamSessionCreateSerializer(serializers.ModelSerializer):
 
 
 class VideoReadSerializer(serializers.ModelSerializer):
+    """Read-only video representation with an absolute ``file_url``.
+
+    Includes denormalised exam name and student identifier for convenience
+    so that API consumers don't need a second request.
+    """
+
     file_url = serializers.SerializerMethodField()
     exam_name = serializers.CharField(source='session.exam.name', read_only=True)
     student_identifier = serializers.CharField(source='session.student_identifier', read_only=True)
@@ -95,10 +151,16 @@ class VideoReadSerializer(serializers.ModelSerializer):
             'file_hash',
             'duration_seconds',
             'uploaded_at',
+            'expires_at',
         ]
         read_only_fields = fields
 
     def get_file_url(self, obj):
+        """Return an absolute URL to the stored video file.
+
+        Falls back to a relative URL when no request is available in the
+        serializer context (e.g. during management commands).
+        """
         if not obj.file:
             return ''
 
@@ -109,6 +171,19 @@ class VideoReadSerializer(serializers.ModelSerializer):
 
 
 class VideoUploadSerializer(serializers.ModelSerializer):
+    """Handle video file uploads with format validation and deduplication.
+
+    Validation steps:
+
+    1. **Ownership** — only the session's instructor (or admin) may upload.
+    2. **Format** — both the MIME type and file extension are checked.
+    3. **Deduplication (FR4)** — a SHA-256 hash is computed over the entire
+       file content; if the hash already exists the upload is rejected.
+
+    On success the serializer auto-populates ``original_filename``,
+    ``content_type``, ``size_bytes``, and ``file_hash``.
+    """
+
     class Meta:
         model = Video
         fields = ['session', 'file', 'duration_seconds']
@@ -117,6 +192,7 @@ class VideoUploadSerializer(serializers.ModelSerializer):
         }
 
     def validate_session(self, session):
+        """Ensure the requesting user owns this session's exam."""
         request = self.context['request']
         is_admin = getattr(request.user, 'role', '') == User.Role.ADMIN or request.user.is_superuser
         if not is_admin and session.exam.instructor_id != request.user.id:
@@ -124,6 +200,11 @@ class VideoUploadSerializer(serializers.ModelSerializer):
         return session
 
     def validate_file(self, file):
+        """Reject files that are not a recognised video format.
+
+        Checks both the ``Content-Type`` header and the file extension.
+        Allowed formats: mp4, mov, m4v, webm, avi, mkv.
+        """
         content_type = getattr(file, 'content_type', '') or ''
         extension = Path(getattr(file, 'name', '')).suffix.lower()
         allowed_extensions = {'.mp4', '.mov', '.m4v', '.webm', '.avi', '.mkv'}
@@ -137,24 +218,43 @@ class VideoUploadSerializer(serializers.ModelSerializer):
         return file
 
     def create(self, validated_data):
+        """Compute file hash, check for duplicates, then persist the Video.
+
+        Raises :class:`~rest_framework.serializers.ValidationError` if a
+        video with identical content has already been uploaded (FR4).
+        """
         file = validated_data['file']
         digest = hashlib.sha256()
         for chunk in file.chunks():
             digest.update(chunk)
         file.seek(0)
 
+        file_hash = digest.hexdigest()
+        if Video.objects.filter(file_hash=file_hash).exists():
+            raise serializers.ValidationError(
+                {'file': 'This video has already been uploaded (duplicate content).'}
+            )
+
         return Video.objects.create(
             **validated_data,
             original_filename=getattr(file, 'name', '') or 'upload',
             content_type=getattr(file, 'content_type', '') or '',
             size_bytes=getattr(file, 'size', 0) or 0,
-            file_hash=digest.hexdigest(),
+            file_hash=file_hash,
         )
 
 
 class AlertReadSerializer(serializers.ModelSerializer):
+    """Read-only alert with denormalised exam name and reviewer email.
+
+    ``reviewed_by_email`` defaults to ``None`` when the alert has not yet
+    been reviewed (the FK is nullable).
+    """
+
     exam_name = serializers.CharField(source='session.exam.name', read_only=True)
-    reviewed_by_email = serializers.EmailField(source='reviewed_by.email', read_only=True)
+    reviewed_by_email = serializers.EmailField(
+        source='reviewed_by.email', read_only=True, default=None,
+    )
 
     class Meta:
         model = Alert
@@ -167,6 +267,7 @@ class AlertReadSerializer(serializers.ModelSerializer):
             'severity',
             'confidence_score',
             'metadata',
+            'snapshot_url',
             'is_reviewed',
             'reviewed_at',
             'reviewed_by',
@@ -177,11 +278,19 @@ class AlertReadSerializer(serializers.ModelSerializer):
 
 
 class AlertCreateSerializer(serializers.ModelSerializer):
+    """Create a new alert for an exam session.
+
+    Typically called by the AI pipeline after detecting a suspicious
+    behaviour in a video frame.  Ownership validation ensures only the
+    session's instructor (or an admin) can write alerts.
+    """
+
     class Meta:
         model = Alert
-        fields = ['session', 'timestamp_sec', 'behavior_type', 'severity', 'confidence_score', 'metadata']
+        fields = ['session', 'timestamp_sec', 'behavior_type', 'severity', 'confidence_score', 'metadata', 'snapshot_url']
 
     def validate_session(self, session):
+        """Ensure the requesting user owns this session's exam."""
         request = self.context['request']
         is_admin = getattr(request.user, 'role', '') == User.Role.ADMIN or request.user.is_superuser
         if not is_admin and session.exam.instructor_id != request.user.id:
@@ -190,11 +299,18 @@ class AlertCreateSerializer(serializers.ModelSerializer):
 
 
 class AlertReviewSerializer(serializers.ModelSerializer):
+    """Mark an alert as reviewed or revert it to unreviewed.
+
+    When ``is_reviewed`` is ``True`` the alert's ``mark_reviewed()`` model
+    method is called.  When ``False`` the review fields are cleared.
+    """
+
     class Meta:
         model = Alert
         fields = ['is_reviewed']
 
     def update(self, instance, validated_data):
+        """Toggle the review state and persist."""
         request = self.context['request']
         if validated_data.get('is_reviewed'):
             instance.mark_reviewed(request.user)
@@ -208,7 +324,13 @@ class AlertReviewSerializer(serializers.ModelSerializer):
 
 
 class AuditLogReadSerializer(serializers.ModelSerializer):
-    user_email = serializers.EmailField(source='user.email', read_only=True)
+    """Read-only audit log entry.
+
+    ``user_email`` defaults to ``None`` when the acting user has been deleted
+    (the FK uses ``SET_NULL``).
+    """
+
+    user_email = serializers.EmailField(source='user.email', read_only=True, default=None)
 
     class Meta:
         model = AuditLog
@@ -227,7 +349,9 @@ class AuditLogReadSerializer(serializers.ModelSerializer):
 
 
 class SystemSettingsReadSerializer(serializers.ModelSerializer):
-    updated_by_email = serializers.EmailField(source='updated_by.email', read_only=True)
+    """Read-only system setting with the last modifier's email."""
+
+    updated_by_email = serializers.EmailField(source='updated_by.email', read_only=True, default=None)
 
     class Meta:
         model = SystemSettings
@@ -243,17 +367,119 @@ class SystemSettingsReadSerializer(serializers.ModelSerializer):
 
 
 class SystemSettingsUpdateSerializer(serializers.ModelSerializer):
+    """Update a system setting's value and/or description.
+
+    Automatically records the requesting user as ``updated_by``.
+    """
+
     class Meta:
         model = SystemSettings
         fields = ['setting_value', 'description']
 
     def update(self, instance, validated_data):
+        """Apply changes and stamp the current user as the modifier."""
         request = self.context['request']
         instance.setting_value = validated_data.get('setting_value', instance.setting_value)
         instance.description = validated_data.get('description', instance.description)
         instance.updated_by = request.user
         instance.save(update_fields=['setting_value', 'description', 'updated_by', 'updated_at'])
         return instance
+
+
+class AnalysisJobReadSerializer(serializers.ModelSerializer):
+    """Read-only analysis job with denormalised exam/student info."""
+
+    exam_name = serializers.CharField(source='session.exam.name', read_only=True)
+    student_identifier = serializers.CharField(source='session.student_identifier', read_only=True)
+
+    class Meta:
+        model = AnalysisJob
+        fields = [
+            'id',
+            'session',
+            'exam_name',
+            'student_identifier',
+            'status',
+            'ai_model_version',
+            'frame_sample_rate',
+            'started_at',
+            'completed_at',
+            'error_message',
+            'metadata',
+            'created_at',
+        ]
+        read_only_fields = fields
+
+
+class AnalysisJobCreateSerializer(serializers.ModelSerializer):
+    """Queue a new AI analysis job for an exam session.
+
+    Ownership validation ensures only the session's instructor (or admin)
+    can trigger analysis.
+    """
+
+    class Meta:
+        model = AnalysisJob
+        fields = ['session', 'ai_model_version', 'frame_sample_rate']
+
+    def validate_session(self, session):
+        """Ensure the requesting user owns this session's exam."""
+        request = self.context['request']
+        is_admin = getattr(request.user, 'role', '') == User.Role.ADMIN or request.user.is_superuser
+        if not is_admin and session.exam.instructor_id != request.user.id:
+            raise serializers.ValidationError('You can only create analysis jobs for your own exam sessions.')
+        return session
+
+
+class ReportReadSerializer(serializers.ModelSerializer):
+    """Read-only analysis report with denormalised exam/student info."""
+
+    exam_name = serializers.CharField(source='session.exam.name', read_only=True)
+    student_identifier = serializers.CharField(source='session.student_identifier', read_only=True)
+
+    class Meta:
+        model = Report
+        fields = [
+            'id',
+            'session',
+            'exam_name',
+            'student_identifier',
+            'overall_cheating_probability',
+            'total_alerts',
+            'alerts_by_type',
+            'processing_time_seconds',
+            'summary',
+            'generated_at',
+        ]
+        read_only_fields = fields
+
+
+class ReportCreateSerializer(serializers.ModelSerializer):
+    """Create an analysis report for a completed exam session.
+
+    Typically called by the AI pipeline once analysis finishes.
+    Ownership validation ensures only the session's instructor (or admin)
+    can write reports.
+    """
+
+    class Meta:
+        model = Report
+        fields = [
+            'session',
+            'overall_cheating_probability',
+            'total_alerts',
+            'alerts_by_type',
+            'processing_time_seconds',
+            'summary',
+        ]
+
+    def validate_session(self, session):
+        """Ensure the requesting user owns this session's exam."""
+        request = self.context['request']
+        is_admin = getattr(request.user, 'role', '') == User.Role.ADMIN or request.user.is_superuser
+        if not is_admin and session.exam.instructor_id != request.user.id:
+            raise serializers.ValidationError('You can only create reports for your own exam sessions.')
+        return session
 
 
 # Backwards-compatible names for the current simple views.
@@ -263,3 +489,5 @@ VideoSerializer = VideoReadSerializer
 AlertSerializer = AlertReadSerializer
 AuditLogSerializer = AuditLogReadSerializer
 SystemSettingsSerializer = SystemSettingsReadSerializer
+AnalysisJobSerializer = AnalysisJobReadSerializer
+ReportSerializer = ReportReadSerializer

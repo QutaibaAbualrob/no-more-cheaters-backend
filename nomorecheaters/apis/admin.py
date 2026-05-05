@@ -1,7 +1,10 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 
-from .models import Alert, AuditLog, Exam, ExamSession, SystemSettings, User, Video
+from .models import (
+    Alert, AnalysisJob, AuditLog, Exam, ExamSession, Report,
+    SystemSettings, User, Video,
+)
 
 
 @admin.register(User)
@@ -95,6 +98,9 @@ class AuditLogAdmin(admin.ModelAdmin):
     def has_change_permission(self, request, obj=None):
         return False
 
+    def has_delete_permission(self, request, obj=None):
+        return False
+
 
 @admin.register(SystemSettings)
 class SystemSettingsAdmin(admin.ModelAdmin):
@@ -103,3 +109,25 @@ class SystemSettingsAdmin(admin.ModelAdmin):
     autocomplete_fields = ['updated_by']
     readonly_fields = ['updated_at']
     list_select_related = ['updated_by']
+
+
+@admin.register(AnalysisJob)
+class AnalysisJobAdmin(admin.ModelAdmin):
+    list_display = ['session', 'status', 'ai_model_version', 'started_at', 'completed_at', 'created_at']
+    list_filter = ['status', 'created_at']
+    search_fields = ['session__exam__name', 'session__student_identifier', 'ai_model_version']
+    autocomplete_fields = ['session']
+    readonly_fields = ['id', 'created_at']
+    list_select_related = ['session', 'session__exam']
+    date_hierarchy = 'created_at'
+
+
+@admin.register(Report)
+class ReportAdmin(admin.ModelAdmin):
+    list_display = ['session', 'overall_cheating_probability', 'total_alerts', 'processing_time_seconds', 'generated_at']
+    list_filter = ['generated_at']
+    search_fields = ['session__exam__name', 'session__student_identifier', 'summary']
+    autocomplete_fields = ['session']
+    readonly_fields = ['id', 'generated_at']
+    list_select_related = ['session', 'session__exam']
+    date_hierarchy = 'generated_at'
