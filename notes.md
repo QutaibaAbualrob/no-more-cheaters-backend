@@ -1,10 +1,4 @@
 
-
-
-
-
-
-
 Using third party packages in authentication in django:
     
     book pages: 103 - 113
@@ -50,11 +44,19 @@ Using third party packages in authentication in django:
 
         dj-rest-auth/password/reset
         dj-rest-auth/password/reset/confirm
-        
+
 
         dj-rest-auth/registration/
         
-#Changing the default django User model:
+        final version:
+
+            root/login/
+            root/logout/
+
+            root/password/reset
+            root/password/reset/confirm
+
+            root/register/
 
     Problems found
 
