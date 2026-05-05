@@ -37,7 +37,7 @@ Using third party packages in authentication in django:
 
                 SITE_ID = 1
 
-    Endpoints summery:
+    #Endpoints summery:
 
         dj-rest-auth/login/
         dj-rest-auth/logout/
@@ -58,3 +58,33 @@ Using third party packages in authentication in django:
 
             root/register/
 
+    Problems found
+
+        In admin.py, I imported SystemSetting, but the actual model name was SystemSettings.
+
+        Django raised reverse accessor clashes for groups and user_permissions because I created a custom User model but had not told Django to use it as the main authentication model.
+
+        After adding AUTH_USER_MODEL = 'apis.User' in settings.py, Django correctly swapped out auth.User.
+
+        Then another error appeared because some files such as views.py were still importing User from django.contrib.auth.models, which no longer works after swapping the user model.
+
+        Fixes applied
+            Corrected the typo in admin.py:
+
+        
+            from .models import User, ExamSession, Video, Alert, AuditLog, SystemSettings
+            Added the custom user model setting in settings.py:
+
+        
+        AUTH_USER_MODEL = 'apis.User'
+            Updated imports in files like views.py and serializers.py to use the custom user model instead of django.contrib.auth.models.User.
+
+        Recommended approach:
+            from django.contrib.auth import get_user_model
+
+            User = get_user_model()
+        Or directly:
+
+            from .models import User
+
+    
