@@ -15,9 +15,11 @@ requesting user is either:
 """
 
 import hashlib
+from datetime import timedelta
 from pathlib import Path
 
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 from rest_framework import serializers
 
 from .models import (
@@ -40,6 +42,33 @@ class UserReadSerializer(serializers.ModelSerializer):
         model = User
         fields = ['id', 'email', 'username', 'role', 'is_active', 'created_at']
         read_only_fields = fields
+
+
+class UserCreateSerializer(serializers.ModelSerializer):
+    """Create a new user account (admin only).
+
+    Password is write-only and hashed via ``create_user()``.
+    """
+
+    password = serializers.CharField(write_only=True, min_length=8)
+
+    class Meta:
+        model = User
+        fields = ['email', 'username', 'password', 'role']
+
+    def create(self, validated_data):
+        return User.objects.create_user(**validated_data)
+
+
+class UserUpdateSerializer(serializers.ModelSerializer):
+    """Update an existing user's profile fields (admin only).
+
+    Password changes are handled separately by dj-rest-auth.
+    """
+
+    class Meta:
+        model = User
+        fields = ['email', 'username', 'role', 'is_active']
 
 
 class ExamReadSerializer(serializers.ModelSerializer):
@@ -241,6 +270,7 @@ class VideoUploadSerializer(serializers.ModelSerializer):
             content_type=getattr(file, 'content_type', '') or '',
             size_bytes=getattr(file, 'size', 0) or 0,
             file_hash=file_hash,
+            expires_at=timezone.now() + timedelta(days=30),
         )
 
 
