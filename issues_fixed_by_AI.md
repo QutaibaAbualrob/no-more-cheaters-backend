@@ -1,4 +1,104 @@
-# Issues Fixed by AI — Code Review of Commit `ccbacc2`
+# Issues Fixed by AI - Code Review of Commit `ccbacc2`
+
+## Update - 2026-05-11
+
+**Reviewer:** AI Agent (Codex)  
+**Tests:** 31 -> 38 (all passing)  
+**Files changed:** `models.py`, `serializers.py`, `views.py`, `urls.py`, `admin.py`, `tests.py`, migration `0003`
+
+---
+
+## New Feature - Authenticated User Preferences
+
+### Issue 11 - Missing per-user preferences support
+
+**Problem:** The backend had a custom `User` model for account identity, but no separate place to store per-user application preferences such as notifications, language, timezone, theme, or frontend-specific metadata.
+
+**Fix:** Added a dedicated `UserPreferences` model linked one-to-one with the custom user model.
+
+**Fields added:**
+- `user` (OneToOne -> custom user model)
+- `email_notifications` (default `True`)
+- `dashboard_alerts` (default `True`)
+- `preferred_language` (default `en`)
+- `timezone` (default `UTC`)
+- `theme` (`LIGHT` / `DARK` / `SYSTEM`, default `SYSTEM`)
+- `metadata` (JSON, default `{}`)
+- `updated_at` (auto-updated timestamp)
+
+**Files:** `models.py`, migration `0003_userpreferences.py`
+
+---
+
+### Issue 12 - Preferences serializers needed ownership-safe fields
+
+**Problem:** A preferences API should not allow clients to submit or change the owning user id. Exposing a writable `user` field would create a cross-account update risk.
+
+**Fix:** Added two serializers:
+- `UserPreferencesReadSerializer` returns preference fields plus `user_email`, with all fields read-only.
+- `UserPreferencesUpdateSerializer` accepts only preference fields and intentionally excludes `user`.
+
+**Compatibility:** Added `UserPreferencesSerializer = UserPreferencesReadSerializer` alias for the current simple serializer naming pattern.
+
+**Files:** `serializers.py`
+
+---
+
+### Issue 13 - Missing authenticated `/me/preferences/` endpoint
+
+**Problem:** There was no endpoint for an authenticated user to retrieve or update their own preferences.
+
+**Fix:** Added `MyPreferencesView` with:
+- `GET /me/preferences/` to lazily create default preferences for the authenticated user and return them.
+- `PATCH /me/preferences/` to update only the authenticated user's own preference row.
+
+Authentication is enforced by the project's global DRF `IsAuthenticated` default permission setting.
+
+**Files:** `views.py`, `urls.py`
+
+---
+
+### Issue 14 - Preferences missing from Django admin
+
+**Problem:** Admin users had no way to inspect or manage `UserPreferences` rows.
+
+**Fix:** Registered `UserPreferencesAdmin` with useful list columns, filters, search fields, user autocomplete, `updated_at` read-only, and `list_select_related` for user lookup efficiency.
+
+**Files:** `admin.py`
+
+---
+
+## Tests Added / Updated
+
+| # | Test Class | Test Name | What it covers |
+|---|---|---|---|
+| 1 | `UserPreferencesModelTests` | `test_user_preferences_defaults_are_sensible` | Default values for new preference rows |
+| 2 | `UserPreferencesSerializerTests` | `test_read_serializer_does_not_expose_writable_user_id` | Read serializer hides writable ownership |
+| 3 | `UserPreferencesSerializerTests` | `test_update_serializer_changes_preferences_without_changing_owner` | Update serializer changes preferences but preserves owner |
+| 4 | `MyPreferencesAPITests` | `test_preferences_endpoint_requires_authentication` | Endpoint is protected |
+| 5 | `MyPreferencesAPITests` | `test_get_preferences_creates_defaults_for_authenticated_user` | Lazy preference creation and read response |
+| 6 | `MyPreferencesAPITests` | `test_patch_preferences_updates_authenticated_users_preferences` | Authenticated preference updates |
+| 7 | `MyPreferencesAPITests` | `test_patch_preferences_cannot_change_owner` | PATCH input cannot move preferences to another user |
+
+Updated existing `AdminRegistrationTests.test_core_models_are_registered_in_admin` to include `UserPreferences`.
+
+**Verification:**
+```bash
+python manage.py test apis
+```
+
+Result: 38 tests passing.
+
+### Migration Required
+
+Run:
+```bash
+python manage.py migrate
+```
+
+This applies `0003_userpreferences.py`.
+
+---
 
 **Date:** 2026-05-05  
 **Reviewer:** AI Agent (Antigravity)  

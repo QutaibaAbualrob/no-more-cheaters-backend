@@ -24,7 +24,7 @@ from rest_framework import serializers
 
 from .models import (
     Alert, AnalysisJob, AuditLog, Exam, ExamSession, Report,
-    SystemSettings, Video,
+    SystemSettings, UserPreferences, Video,
 )
 
 
@@ -69,6 +69,49 @@ class UserUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ['email', 'username', 'role', 'is_active']
+
+
+class UserPreferencesReadSerializer(serializers.ModelSerializer):
+    """Read-only representation of the authenticated user's preferences.
+
+    The owning user is represented by email only. Clients should not receive
+    or submit a writable ``user`` field for preferences.
+    """
+
+    user_email = serializers.EmailField(source='user.email', read_only=True)
+
+    class Meta:
+        model = UserPreferences
+        fields = [
+            'email_notifications',
+            'dashboard_alerts',
+            'preferred_language',
+            'timezone',
+            'theme',
+            'metadata',
+            'user_email',
+            'updated_at',
+        ]
+        read_only_fields = fields
+
+
+class UserPreferencesUpdateSerializer(serializers.ModelSerializer):
+    """Update preference fields for the authenticated user.
+
+    Ownership is handled in the view through ``request.user``. The ``user``
+    field is intentionally not exposed, preventing cross-account updates.
+    """
+
+    class Meta:
+        model = UserPreferences
+        fields = [
+            'email_notifications',
+            'dashboard_alerts',
+            'preferred_language',
+            'timezone',
+            'theme',
+            'metadata',
+        ]
 
 
 class ExamReadSerializer(serializers.ModelSerializer):
@@ -514,6 +557,7 @@ class ReportCreateSerializer(serializers.ModelSerializer):
 
 # Backwards-compatible names for the current simple views.
 UserSerializer = UserReadSerializer
+UserPreferencesSerializer = UserPreferencesReadSerializer
 ExamSessionSerializer = ExamSessionReadSerializer
 VideoSerializer = VideoReadSerializer
 AlertSerializer = AlertReadSerializer

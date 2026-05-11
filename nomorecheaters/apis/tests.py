@@ -31,7 +31,10 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from .models import Alert, AnalysisJob, AuditLog, Exam, ExamSession, Report, SystemSettings, Video
+from .models import (
+    Alert, AnalysisJob, AuditLog, Exam, ExamSession, Report,
+    SystemSettings, UserPreferences, Video,
+)
 from .serializers import (
     AlertCreateSerializer,
     AlertReviewSerializer,
@@ -39,6 +42,8 @@ from .serializers import (
     ExamSessionCreateSerializer,
     ReportCreateSerializer,
     SystemSettingsUpdateSerializer,
+    UserPreferencesReadSerializer,
+    UserPreferencesUpdateSerializer,
     VideoUploadSerializer,
 )
 
@@ -97,6 +102,21 @@ class UserModelTests(TestCase):
 
         self.assertIsInstance(user.id, uuid.UUID)
         self.assertEqual(user.pk, user.id)
+
+
+class UserPreferencesModelTests(TestCase):
+    """Verify default preference values for new preference rows."""
+
+    def test_user_preferences_defaults_are_sensible(self):
+        user = make_user()
+        preferences = UserPreferences.objects.create(user=user)
+
+        self.assertTrue(preferences.email_notifications)
+        self.assertTrue(preferences.dashboard_alerts)
+        self.assertEqual(preferences.preferred_language, 'en')
+        self.assertEqual(preferences.timezone, 'UTC')
+        self.assertEqual(preferences.theme, UserPreferences.Theme.SYSTEM)
+        self.assertEqual(preferences.metadata, {})
 
 
 class ExamSessionModelTests(TestCase):
@@ -178,6 +198,48 @@ class ExamSerializerTests(TestCase):
         exam = serializer.save()
 
         self.assertEqual(exam.instructor, instructor)
+
+
+class UserPreferencesSerializerTests(TestCase):
+    """Verify preference serializers expose safe fields and update values."""
+
+    def test_read_serializer_does_not_expose_writable_user_id(self):
+        user = make_user()
+        preferences = UserPreferences.objects.create(user=user)
+
+        data = UserPreferencesReadSerializer(preferences).data
+
+        self.assertNotIn('user', data)
+        self.assertEqual(data['user_email'], user.email)
+
+    def test_update_serializer_changes_preferences_without_changing_owner(self):
+        owner = make_user()
+        other = make_user()
+        preferences = UserPreferences.objects.create(user=owner)
+        serializer = UserPreferencesUpdateSerializer(
+            instance=preferences,
+            data={
+                'email_notifications': False,
+                'dashboard_alerts': False,
+                'preferred_language': 'ar',
+                'timezone': 'Asia/Jerusalem',
+                'theme': UserPreferences.Theme.DARK,
+                'metadata': {'compact_dashboard': True},
+                'user': str(other.id),
+            },
+            partial=True,
+        )
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        updated = serializer.save()
+
+        self.assertEqual(updated.user, owner)
+        self.assertFalse(updated.email_notifications)
+        self.assertFalse(updated.dashboard_alerts)
+        self.assertEqual(updated.preferred_language, 'ar')
+        self.assertEqual(updated.timezone, 'Asia/Jerusalem')
+        self.assertEqual(updated.theme, UserPreferences.Theme.DARK)
+        self.assertEqual(updated.metadata, {'compact_dashboard': True})
 
 
 class ExamSessionSerializerTests(TestCase):
@@ -354,7 +416,7 @@ class AdminRegistrationTests(TestCase):
 
     def test_core_models_are_registered_in_admin(self):
         for model in [User, Exam, ExamSession, Video, Alert, AuditLog,
-                      SystemSettings, AnalysisJob, Report]:
+                      SystemSettings, UserPreferences, AnalysisJob, Report]:
             self.assertIn(model, admin.site._registry)
 
 
@@ -397,6 +459,70 @@ class UserAPITests(APITestCase):
         response = self.client.get('/api/1/')
 
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class MyPreferencesAPITests(APITestCase):
+    """Integration tests for the authenticated user's preferences endpoint."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = make_user(username='prefsuser', email='prefs@example.com')
+
+    def test_preferences_endpoint_requires_authentication(self):
+        response = self.client.get(reverse('my_preferences'))
+
+        self.assertIn(response.status_code, [status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN])
+
+    def test_get_preferences_creates_defaults_for_authenticated_user(self):
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse('my_preferences'))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(UserPreferences.objects.filter(user=self.user).count(), 1)
+        self.assertEqual(response.data['user_email'], self.user.email)
+        self.assertTrue(response.data['email_notifications'])
+        self.assertEqual(response.data['theme'], UserPreferences.Theme.SYSTEM)
+
+    def test_patch_preferences_updates_authenticated_users_preferences(self):
+        self.client.force_authenticate(self.user)
+
+        response = self.client.patch(
+            reverse('my_preferences'),
+            {
+                'email_notifications': False,
+                'dashboard_alerts': False,
+                'preferred_language': 'ar',
+                'timezone': 'Asia/Jerusalem',
+                'theme': UserPreferences.Theme.DARK,
+                'metadata': {'compact_dashboard': True},
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        preferences = UserPreferences.objects.get(user=self.user)
+        self.assertFalse(preferences.email_notifications)
+        self.assertFalse(preferences.dashboard_alerts)
+        self.assertEqual(preferences.preferred_language, 'ar')
+        self.assertEqual(preferences.timezone, 'Asia/Jerusalem')
+        self.assertEqual(preferences.theme, UserPreferences.Theme.DARK)
+        self.assertEqual(preferences.metadata, {'compact_dashboard': True})
+
+    def test_patch_preferences_cannot_change_owner(self):
+        other = make_user()
+        self.client.force_authenticate(self.user)
+
+        response = self.client.patch(
+            reverse('my_preferences'),
+            {'user': str(other.id), 'theme': UserPreferences.Theme.LIGHT},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        preferences = UserPreferences.objects.get(user=self.user)
+        self.assertEqual(preferences.user, self.user)
+        self.assertEqual(UserPreferences.objects.filter(user=other).count(), 0)
 
 
 class DuplicateVideoHashTests(TestCase):
