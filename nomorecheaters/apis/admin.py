@@ -3,7 +3,7 @@ from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 
 from .models import (
     Alert, AnalysisJob, AuditLog, Exam, ExamSession, Report,
-    SystemSettings, User, Video,
+    SystemSettings, User, UserPreferences, Video,
 )
 
 
@@ -32,6 +32,16 @@ class ExamAdmin(admin.ModelAdmin):
     readonly_fields = ['id', 'created_at', 'updated_at']
     list_select_related = ['instructor']
     date_hierarchy = 'created_at'
+
+
+@admin.register(UserPreferences)
+class UserPreferencesAdmin(admin.ModelAdmin):
+    list_display = ['user', 'preferred_language', 'timezone', 'theme', 'email_notifications', 'dashboard_alerts', 'updated_at']
+    list_filter = ['theme', 'email_notifications', 'dashboard_alerts', 'updated_at']
+    search_fields = ['user__email', 'user__username', 'preferred_language', 'timezone']
+    autocomplete_fields = ['user']
+    readonly_fields = ['updated_at']
+    list_select_related = ['user']
 
 
 @admin.register(ExamSession)

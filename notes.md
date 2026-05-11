@@ -86,3 +86,87 @@ Using third party packages in authentication in django:
             from .models import User
 
     
+
+# User preferences endpoint:
+
+    Added a separate UserPreferences model instead of putting UI and notification
+    settings directly on the custom User model.
+
+    Why:
+
+        User is for account identity and authentication fields.
+
+        UserPreferences is for per-user app settings that may grow over time,
+        such as notifications, language, timezone, theme, and frontend metadata.
+
+    Model:
+
+        UserPreferences has a OneToOneField to AUTH_USER_MODEL with
+        related_name='preferences'.
+
+        Default values:
+
+            email_notifications = True
+            dashboard_alerts = True
+            preferred_language = 'en'
+            timezone = 'UTC'
+            theme = 'SYSTEM'
+            metadata = {}
+
+    Serializers:
+
+        UserPreferencesReadSerializer:
+
+            Used for GET responses.
+            Shows user_email, but does not expose a writable user id.
+
+        UserPreferencesUpdateSerializer:
+
+            Used for PATCH requests.
+            Allows only preference fields to be updated.
+            Does not expose user, so clients cannot move preferences to another account.
+
+    View:
+
+        MyPreferencesView:
+
+            GET /me/preferences/
+                Creates default preferences lazily for the authenticated user
+                if no row exists yet, then returns them.
+
+            PATCH /me/preferences/
+                Updates only the authenticated user's own preferences.
+
+        Authentication is enforced by the global DRF setting:
+
+            DEFAULT_PERMISSION_CLASSES = [
+                'rest_framework.permissions.IsAuthenticated',
+            ]
+
+    URL:
+
+        me/preferences/
+
+    Admin:
+
+        UserPreferences is registered in admin with filters, search fields,
+        autocomplete for user, and updated_at as read-only.
+
+    Migration:
+
+        0003_userpreferences.py
+
+        Run:
+
+            python manage.py migrate
+
+    Tests:
+
+        Added model tests for default values.
+        Added serializer tests to check safe fields and owner protection.
+        Added API tests for authentication, lazy creation, updates, and owner safety.
+
+        Current test result:
+
+            python manage.py test apis
+            38 tests passing

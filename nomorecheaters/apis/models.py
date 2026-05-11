@@ -67,6 +67,40 @@ class User(AbstractUser):
         return f"{self.email} ({self.role})"
 
 
+class UserPreferences(models.Model):
+    """Per-user application preferences.
+
+    Kept separate from :class:`User` so account identity and personal UI /
+    notification settings can evolve independently. This avoids bloating the
+    authentication model every time the frontend needs a new preference.
+    """
+
+    class Theme(models.TextChoices):
+        LIGHT = 'LIGHT', 'Light'
+        DARK = 'DARK', 'Dark'
+        SYSTEM = 'SYSTEM', 'Use system setting'
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='preferences',
+    )
+    email_notifications = models.BooleanField(default=True)
+    dashboard_alerts = models.BooleanField(default=True)
+    preferred_language = models.CharField(max_length=20, default='en')
+    timezone = models.CharField(max_length=64, default='UTC')
+    theme = models.CharField(max_length=20, choices=Theme.choices, default=Theme.SYSTEM)
+    metadata = models.JSONField(default=dict, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'user preference'
+        verbose_name_plural = 'user preferences'
+
+    def __str__(self):
+        return f"Preferences for {self.user.email}"
+
+
 class Exam(models.Model):
     """An exam created by an instructor.
 
