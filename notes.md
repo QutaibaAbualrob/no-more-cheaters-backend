@@ -1,172 +1,267 @@
+# No More Cheaters - Project Notes
 
+Last revised: 2026-05-22
 
+These notes summarize the current backend/frontend integration work in the
+`Senior Project` folder. Implementation files were not changed during this
+documentation pass.
 
+## Authentication Packages
 
+The project uses third-party Django authentication packages:
 
+1. `dj-rest-auth`
 
+    Used for login, logout, password reset, password reset confirm, and user
+    account endpoints.
 
-Using third party packages in authentication in django:
-    
-    book pages: 103 - 113
+    Install command:
 
-    1- dj-rest-auth (log in, log out, password reset, password reset confirm):
+        python -m pip install dj-rest-auth
 
-        a- First we will add log in, log out, and password reset API endpoints:
+2. `django-allauth`
 
-            python -m pip install dj-rest-auth
+    Used for registration and account management support.
 
-            add it in settings
+    Required apps added to `INSTALLED_APPS`:
 
+        django.contrib.sites
+        allauth
+        allauth.account
+        allauth.socialaccount
+        dj_rest_auth
+        dj_rest_auth.registration
 
-    2- django-allauth (sign up new user, sign up using social media):
+    Required template context processor:
 
-        a- added to installed apps:
-            "django.contrib.sites"
+        django.template.context_processors.request
 
-            "allauth"
-            "allauth.account"
-            "allauth.socialaccount"
-            "dj_rest_auth"
-            "dj_rest_auth.registration"
+    Required settings:
 
+        EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+        SITE_ID = 1
 
-        b- added new values to TEMPLATES in settings:
+## Authentication Endpoints
 
-            "django.template.context_processors.request"
+Current frontend authentication calls target the backend's mounted
+`dj-rest-auth` URLs:
 
-        c- added new vars:
+    /api/dj-rest-auth/login/
+    /api/dj-rest-auth/logout/
+    /api/dj-rest-auth/user/
+    /api/dj-rest-auth/password/change/
+    /api/dj-rest-auth/password/reset/
+    /api/dj-rest-auth/password/reset/confirm/
+    /api/dj-rest-auth/registration/
 
-            Needed for user account confirmation:
-                EMAIL_BACKEND = "django.core.mail.backends.console. 
+## Custom User Model
 
-            Needed as allauth uses a features in django to host multiple sites from one django project so we have to specifiy be default:
+The project uses `apis.User` as the Django authentication model.
 
-                SITE_ID = 1
+Important setting:
 
-    #Endpoints summery:
+    AUTH_USER_MODEL = 'apis.User'
 
-        dj-rest-auth/login/
-        dj-rest-auth/logout/
+Problems previously fixed:
 
-        dj-rest-auth/password/reset
-        dj-rest-auth/password/reset/confirm
-        
+    admin.py imported SystemSetting, but the actual model name was
+    SystemSettings.
 
-        dj-rest-auth/registration/
-        
-#Changing the default django User model:
+    The custom User model caused reverse accessor clashes for groups and
+    user_permissions until AUTH_USER_MODEL was configured.
 
-    Problems found
+    Some files still imported User from django.contrib.auth.models after the
+    custom user model was enabled.
 
-        In admin.py, I imported SystemSetting, but the actual model name was SystemSettings.
+Recommended import pattern:
 
-        Django raised reverse accessor clashes for groups and user_permissions because I created a custom User model but had not told Django to use it as the main authentication model.
+    from django.contrib.auth import get_user_model
 
-        After adding AUTH_USER_MODEL = 'apis.User' in settings.py, Django correctly swapped out auth.User.
+    User = get_user_model()
 
-        Then another error appeared because some files such as views.py were still importing User from django.contrib.auth.models, which no longer works after swapping the user model.
+The `User.role` field now defaults to `INSTRUCTOR`, applied by migration:
 
-        Fixes applied
-            Corrected the typo in admin.py:
+    0004_alter_user_role.py
 
-        
-            from .models import User, ExamSession, Video, Alert, AuditLog, SystemSettings
-            Added the custom user model setting in settings.py:
+## User Preferences
 
-        
-        AUTH_USER_MODEL = 'apis.User'
-            Updated imports in files like views.py and serializers.py to use the custom user model instead of django.contrib.auth.models.User.
+`UserPreferences` stores per-user application preferences separately from the
+custom `User` model.
 
-        Recommended approach:
-            from django.contrib.auth import get_user_model
+Why it is separate:
 
-            User = get_user_model()
-        Or directly:
+    User is for account identity and authentication fields.
 
-            from .models import User
+    UserPreferences is for app settings that may grow over time, such as
+    notifications, language, timezone, theme, metadata, and user-specific AI
+    threshold overrides.
 
-    
+Model defaults:
 
-# User preferences endpoint:
+    email_notifications = True
+    dashboard_alerts = True
+    preferred_language = 'en'
+    timezone = 'UTC'
+    theme = 'SYSTEM'
+    metadata = {}
 
-    Added a separate UserPreferences model instead of putting UI and notification
-    settings directly on the custom User model.
+Endpoint:
 
-    Why:
+    GET /api/me/preferences/
+    PATCH /api/me/preferences/
 
-        User is for account identity and authentication fields.
+Behavior:
 
-        UserPreferences is for per-user app settings that may grow over time,
-        such as notifications, language, timezone, theme, and frontend metadata.
+    GET lazily creates default preferences for the authenticated user.
 
-    Model:
+    PATCH updates only the authenticated user's preference row.
 
-        UserPreferences has a OneToOneField to AUTH_USER_MODEL with
-        related_name='preferences'.
+    The serializers do not expose a writable user field, so clients cannot
+    move preferences to another account.
 
-        Default values:
+Migration:
 
-            email_notifications = True
-            dashboard_alerts = True
-            preferred_language = 'en'
-            timezone = 'UTC'
-            theme = 'SYSTEM'
-            metadata = {}
+    0003_userpreferences.py
 
-    Serializers:
+## Backend API Added For Frontend Integration
 
-        UserPreferencesReadSerializer:
+The backend now exposes the app workflow endpoints used by the frontend:
 
-            Used for GET responses.
-            Shows user_email, but does not expose a writable user id.
+    GET  /api/videos/
+    POST /api/videos/upload/
+    GET  /api/videos/<uuid:pk>/
+    POST /api/videos/<uuid:pk>/analyze/
+    GET  /api/history/
 
-        UserPreferencesUpdateSerializer:
+    GET  /api/dashboard/stats/
+    GET  /api/dashboard/activity/
 
-            Used for PATCH requests.
-            Allows only preference fields to be updated.
-            Does not expose user, so clients cannot move preferences to another account.
+    GET   /api/thresholds/
+    PATCH /api/thresholds/me/
+    PATCH /api/thresholds/global/
 
-    View:
+    GET /api/system/logs/
+    GET /api/system/metrics/
 
-        MyPreferencesView:
+    GET /api/<uuid:pk>/activity/
 
-            GET /me/preferences/
-                Creates default preferences lazily for the authenticated user
-                if no row exists yet, then returns them.
+Important behavior:
 
-            PATCH /me/preferences/
-                Updates only the authenticated user's own preferences.
+    Video upload can accept an explicit session or auto-create a default
+    "Uploaded Videos" exam/session for direct uploads.
 
-        Authentication is enforced by the global DRF setting:
+    Analyze video currently runs deterministic demo analysis through
+    `run_demo_analysis`. It creates/updates AnalysisJob, Alert, Report, session
+    status, and audit logs. This is a placeholder until the production AI
+    worker is connected.
 
-            DEFAULT_PERMISSION_CLASSES = [
-                'rest_framework.permissions.IsAuthenticated',
-            ]
+    Video history returns completed/analyzed videos.
 
-    URL:
+    Dashboard endpoints return scoped counts and seven-day activity series.
 
-        me/preferences/
+    Threshold endpoints combine global SystemSettings values with optional
+    per-user overrides stored in UserPreferences.metadata.
 
-    Admin:
+    Global threshold updates are admin-only and write audit logs.
 
-        UserPreferences is registered in admin with filters, search fields,
-        autocomplete for user, and updated_at as read-only.
+    System logs and metrics are admin-only.
 
-    Migration:
+## Backend Structure
 
-        0003_userpreferences.py
+New helper modules:
 
-        Run:
+    apis/selectors.py
 
-            python manage.py migrate
+        Centralizes role checks and scoped querysets:
+        is_admin, users_visible_to, owned_sessions, owned_videos,
+        owned_reports, recent_day_window.
 
-    Tests:
+    apis/services.py
 
-        Added model tests for default values.
-        Added serializer tests to check safe fields and owner protection.
-        Added API tests for authentication, lazy creation, updates, and owner safety.
+        Holds workflow logic for audit logging, thresholds, upload session
+        creation, demo analysis, dashboard stats/activity, and system metrics.
 
-        Current test result:
+This keeps the view classes mostly focused on request/response handling.
 
-            python manage.py test apis
-            38 tests passing
+## Frontend Integration
+
+The frontend API layer now calls real backend endpoints instead of local
+placeholder data for:
+
+    Authentication
+    Videos
+    Dashboard stats and activity
+    User activity
+    Thresholds
+    System logs and metrics
+    Onboarding preferences
+
+Notable frontend changes:
+
+    src/api/auth.ts now uses /api/dj-rest-auth/... routes.
+
+    src/api/videos.ts uploads files with FormData, maps backend UUID ids, and
+    calls the analyze/history endpoints.
+
+    src/api/dashboard.ts, src/api/system.ts, src/api/thresholds.ts, and
+    src/api/users.ts now call backend APIs.
+
+    src/api/onboarding.ts still stores onboarding locally, but also attempts to
+    sync notification preferences and onboarding metadata to /api/me/preferences/.
+
+    src/pages/Dashboard.tsx text now reflects that backend APIs are connected,
+    while analysis output remains demo data.
+
+    src/pages/VideoProcessing.tsx now treats video ids as strings to match
+    backend UUIDs.
+
+## Settings And Routing Notes
+
+Backend settings now allow the Vite dev server origins:
+
+    http://localhost:5173
+    http://127.0.0.1:5173
+
+The duplicate `django.template.context_processors.request` entry was removed.
+
+In DEBUG mode, the backend serves uploaded media through:
+
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+
+## Migrations To Apply
+
+Run from `no-more-cheaters-backend/nomorecheaters`:
+
+    python manage.py migrate
+
+Current relevant migrations:
+
+    0002_analysisjob_report_alert_snapshot_url_and_more.py
+    0003_userpreferences.py
+    0004_alter_user_role.py
+
+## Verification
+
+Backend:
+
+    python manage.py test apis
+
+Result on 2026-05-22:
+
+    44 tests passing
+
+Frontend:
+
+    npm run build
+
+Result on 2026-05-22:
+
+    TypeScript build and Vite production build completed successfully.
+
+## Remaining Work
+
+Production AI integration is still pending. The current analysis endpoint is a
+deterministic demo workflow that preserves the expected database and API shape.
+
+Expired video cleanup is still pending. `Video.expires_at` exists, but no
+scheduled cleanup command/task has been added yet.
