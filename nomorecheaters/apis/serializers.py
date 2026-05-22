@@ -206,8 +206,11 @@ class VideoReadSerializer(serializers.ModelSerializer):
     """
 
     file_url = serializers.SerializerMethodField()
+    analysis = serializers.SerializerMethodField()
     exam_name = serializers.CharField(source='session.exam.name', read_only=True)
     student_identifier = serializers.CharField(source='session.student_identifier', read_only=True)
+    session_status = serializers.CharField(source='session.status', read_only=True)
+    uploaded_by_email = serializers.EmailField(source='session.exam.instructor.email', read_only=True)
 
     class Meta:
         model = Video
@@ -216,11 +219,14 @@ class VideoReadSerializer(serializers.ModelSerializer):
             'session',
             'exam_name',
             'student_identifier',
+            'session_status',
             'file_url',
+            'analysis',
             'original_filename',
             'content_type',
             'size_bytes',
             'file_hash',
+            'uploaded_by_email',
             'duration_seconds',
             'uploaded_at',
             'expires_at',
@@ -240,6 +246,12 @@ class VideoReadSerializer(serializers.ModelSerializer):
         if request is None:
             return obj.file.url
         return request.build_absolute_uri(obj.file.url)
+
+    def get_analysis(self, obj):
+        """Include the session report when analysis has completed."""
+        if not hasattr(obj.session, 'report'):
+            return None
+        return ReportReadSerializer(obj.session.report).data
 
 
 class VideoUploadSerializer(serializers.ModelSerializer):

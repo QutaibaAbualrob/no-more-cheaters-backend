@@ -77,6 +77,8 @@ MIDDLEWARE = [
 CORS_ORIGIN_WHITELIST = ( 
     "http://localhost:3000", 
     "http://localhost:8000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
 )
 
 
@@ -91,7 +93,6 @@ TEMPLATES = [
             'context_processors': [
                 'django.template.context_processors.request',
                 'django.contrib.auth.context_processors.auth',
-                'django.template.context_processors.request',
                 'django.contrib.messages.context_processors.messages',
             ],
         },

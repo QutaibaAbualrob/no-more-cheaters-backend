@@ -525,6 +525,148 @@ class MyPreferencesAPITests(APITestCase):
         self.assertEqual(UserPreferences.objects.filter(user=other).count(), 0)
 
 
+class VideoWorkflowAPITests(APITestCase):
+    """Integration tests for upload, analysis, history, and dashboard endpoints."""
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+        self.user = make_user(username='workflow', email='workflow@example.com')
+        self.client.force_authenticate(self.user)
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
+
+    def test_upload_without_session_creates_default_domain_records(self):
+        upload = SimpleUploadedFile('student-one.mp4', b'video bytes', content_type='video/mp4')
+
+        response = self.client.post(reverse('videos_upload'), {'file': upload}, format='multipart')
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(Exam.objects.filter(instructor=self.user).count(), 1)
+        self.assertEqual(ExamSession.objects.filter(exam__instructor=self.user).count(), 1)
+        self.assertEqual(Video.objects.count(), 1)
+        self.assertEqual(response.data['session_status'], ExamSession.Status.PENDING)
+        self.assertEqual(AuditLog.objects.filter(action=AuditLog.ActionType.VIDEO_UPLOADED).count(), 1)
+
+    def test_analyze_video_creates_job_alert_report_and_updates_history(self):
+        session = make_session(exam=make_exam(instructor=self.user))
+        upload = SimpleUploadedFile('exam.mp4', b'unique workflow bytes', content_type='video/mp4')
+        serializer = VideoUploadSerializer(
+            data={'session': str(session.id), 'file': upload},
+            context={'request': request_for(self.user)},
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        video = serializer.save()
+
+        response = self.client.post(reverse('videos_analyze', kwargs={'pk': video.id}), {}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        session.refresh_from_db()
+        self.assertEqual(session.status, ExamSession.Status.COMPLETED)
+        self.assertEqual(AnalysisJob.objects.filter(session=session, status=AnalysisJob.Status.COMPLETED).count(), 1)
+        self.assertEqual(Alert.objects.filter(session=session).count(), 1)
+        self.assertEqual(Report.objects.filter(session=session).count(), 1)
+
+        history_response = self.client.get(reverse('videos_history'))
+        self.assertEqual(history_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(history_response.data), 1)
+
+    def test_dashboard_stats_include_owned_workflow_counts(self):
+        session = make_session(exam=make_exam(instructor=self.user))
+        session.status = ExamSession.Status.COMPLETED
+        session.save(update_fields=['status'])
+        Video.objects.create(
+            session=session,
+            file=SimpleUploadedFile('stored.mp4', b'abc', content_type='video/mp4'),
+            original_filename='stored.mp4',
+            content_type='video/mp4',
+            size_bytes=3,
+            file_hash=hashlib.sha256(b'abc').hexdigest(),
+        )
+        AnalysisJob.objects.create(session=session, status=AnalysisJob.Status.COMPLETED)
+        Report.objects.create(
+            session=session,
+            overall_cheating_probability=0.75,
+            total_alerts=1,
+        )
+
+        response = self.client.get(reverse('dashboard_stats'))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['videos_total'], 1)
+        self.assertEqual(response.data['videos_completed'], 1)
+        self.assertEqual(response.data['analyses_total'], 1)
+        self.assertEqual(response.data['cheating_reports_total'], 1)
+
+
+class ThresholdsAndSystemAPITests(APITestCase):
+    """Integration tests for settings-backed thresholds and admin system APIs."""
+
+    def setUp(self):
+        self.instructor = make_user(username='thresholds', email='thresholds@example.com')
+        self.admin_user = make_user(
+            username='systemadmin',
+            email='systemadmin@example.com',
+            role=User.Role.ADMIN,
+        )
+
+    def test_instructor_can_read_and_update_personal_thresholds(self):
+        self.client.force_authenticate(self.instructor)
+
+        read_response = self.client.get(reverse('thresholds'))
+        self.assertEqual(read_response.status_code, status.HTTP_200_OK)
+        self.assertIn('effective', read_response.data)
+
+        update_response = self.client.patch(
+            reverse('my_thresholds'),
+            {'gaze_threshold': 0.55},
+            format='json',
+        )
+
+        self.assertEqual(update_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(update_response.data['gaze_threshold'], 0.55)
+        preferences = UserPreferences.objects.get(user=self.instructor)
+        self.assertEqual(preferences.metadata['thresholds']['gaze_threshold'], 0.55)
+
+    def test_global_threshold_updates_are_admin_only(self):
+        self.client.force_authenticate(self.instructor)
+        forbidden_response = self.client.patch(
+            reverse('global_thresholds'),
+            {'noise_threshold': 0.66},
+            format='json',
+        )
+        self.assertEqual(forbidden_response.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(self.admin_user)
+        response = self.client.patch(
+            reverse('global_thresholds'),
+            {'noise_threshold': 0.66},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(float(SystemSettings.objects.get(setting_key='noise_threshold').setting_value), 0.66)
+
+    def test_admin_can_read_system_metrics_and_logs(self):
+        AuditLog.objects.create(
+            user=self.admin_user,
+            action=AuditLog.ActionType.LOGIN,
+            target_resource='test',
+        )
+        self.client.force_authenticate(self.admin_user)
+
+        metrics_response = self.client.get(reverse('system_metrics'))
+        logs_response = self.client.get(reverse('system_logs'))
+
+        self.assertEqual(metrics_response.status_code, status.HTTP_200_OK)
+        self.assertIn('counts', metrics_response.data)
+        self.assertEqual(logs_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(logs_response.data['count'], 1)
+
+
 class DuplicateVideoHashTests(TestCase):
     """Issue 7 / FR4: duplicate video uploads must be rejected cleanly."""
 
