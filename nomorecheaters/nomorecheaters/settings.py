@@ -47,14 +47,11 @@ INSTALLED_APPS = [
     "corsheaders",
     'rest_framework.authtoken',
     
-    # Allauth packages 
+    # Allauth packages
     'allauth',
     'allauth.account',
     'allauth.socialaccount',
-    
-    # dj-rest-auth packages
-    'dj_rest_auth',
-    'dj_rest_auth.registration',
+    'allauth.headless',
     
     'apis',  
 ]
@@ -73,11 +70,25 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-# To be used by react or any other domain or api
-CORS_ORIGIN_WHITELIST = ( 
-    "http://localhost:3000", 
+# CORS — allow React frontend on localhost:5173
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:5173",
     "http://localhost:8000",
+]
+CORS_ALLOW_CREDENTIALS = True
+
+from corsheaders.defaults import default_headers
+
+CORS_ALLOW_HEADERS = (
+    *default_headers,
+    "x-session-token",
+    "x-email-verification-key",
+    "x-password-reset-key",
 )
+
+CSRF_TRUSTED_ORIGINS = [
+    "http://localhost:5173",
+]
 
 
 ROOT_URLCONF = 'nomorecheaters.urls'
@@ -104,7 +115,23 @@ SITE_ID = 1
 
 # Settings for allauth email login.
 ACCOUNT_LOGIN_METHODS = {'email'}
-ACCOUNT_SIGNUP_FIELDS = ['email*', 'username*', 'password1*', 'password2*']
+ACCOUNT_SIGNUP_FIELDS = ['email*', 'password1*', 'password2*']
+ACCOUNT_UNIQUE_EMAIL = True
+ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+
+# Headless mode — no HTML templates, API-only
+HEADLESS_ONLY = True
+
+# Email displayed in terminal (console backend)
+DEFAULT_FROM_EMAIL = "dev@localhost"
+
+# Where allauth-generated email links point the user
+HEADLESS_FRONTEND_URLS = {
+    "account_confirm_email": "http://localhost:5173/account/verify-email/{key}",
+    "account_reset_password": "http://localhost:5173/account/password/reset",
+    "account_reset_password_from_key": "http://localhost:5173/account/password/reset/key/{key}",
+    "account_signup": "http://localhost:5173/signup",
+}
 
 
 
