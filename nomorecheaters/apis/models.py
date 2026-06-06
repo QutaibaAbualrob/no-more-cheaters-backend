@@ -56,7 +56,7 @@ class User(AbstractUser):
         ADMIN = 'ADMIN', 'Administrator'
         INSTRUCTOR = 'INSTRUCTOR', 'Instructor'
 
-    role = models.CharField(max_length=20, choices=Role.choices, null=False, blank=False)
+    role = models.CharField(max_length=20, choices=Role.choices, default=Role.INSTRUCTOR)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
