@@ -2,7 +2,16 @@
 # Use Python 3.10–3.13. Install when online: pip install -r requirements.txt
 
 djangorestframework
-dj-rest-auth
 django-allauth
 django-cors-headers
 requests
+
+# AI Pipeline — YOLO video analysis
+ultralytics
+opencv-python-headless
+
+# Background job queue (django-rq + Redis)
+# Uncomment when ready to process videos asynchronously:
+# django-rq
+# rq
+# redis

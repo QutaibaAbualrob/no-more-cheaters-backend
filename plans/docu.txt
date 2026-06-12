@@ -1,0 +1,838 @@
+﻿A logo with red and green text
+
+AI-generated content may be incorrect. 
+
+
+
+
+     
+
+
+The Arab American University
+Faculty of Information Technology
+
+
+
+
+
+
+
+
+
+
+No More Cheaters
+
+
+
+
+
+
+
+
+By:
+ Qutaiba Abualrob       CS
+ Mohamed Sbehat         CS
+     Haitham Khalil        CS
+ Mohammed Labadi     CS
+
+
+
+
+
+
+
+
+
+
+Supervisor:
+
+
+Dr.Ala Hamarsheh
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Date:
+2026
+Table of Contents
+Declaration        4
+Abstract        5
+List of Tables        5
+List of Figures        6
+List of Abbreviations        7
+Acknowledgements        8
+Chapter One. Introduction        9
+1.1        Background and Motivation        9
+1.2        Aims and Objectives        10
+1.3        Problem Statement        11
+1.4        Contributions        11
+1.5        Structure of the Report        13
+Chapter Two. Literature Review        14
+2.1        Overview        14
+2.2        Existing Systems        15
+2.3        Summary        17
+Chapter Three: System Analysis        18
+3.1        Introduction        19
+3.2        Analysis of Existing Systems        20
+3.3        System Requirements        23
+3.3.1        Functional Requirements        23
+3.3.2        Non Functional Requirements        24
+3.4        Design Objectives/Requirements(Optional)        24
+3.4.1        User Requirements        25
+3.4.2        System Architecture        26
+3.5        Development Methodology        27
+3.5.1        UMLor DFD        28
+3.5.2        Use Case Diagrams        29
+3.5.3        Use Case Description (Detailed Use Cases)        30
+3.5.4        SequenceDiagram        30
+3.6        Summary        30
+Chapter Four: System Design        32
+4.1        Introduction        32
+4.2        Class Diagram        33
+4.3        Database Design or Algorithms        34
+4.4        Interface Design        35
+4.5        Summary        37
+Chapter Five. Conclusions and Future Work        38
+5.1        Conclusions        38
+5.2        Future Work        40
+References        43
+Appendices        43
+
+
+
+
+
+
+
+
+
+
+
+
+Declaration
+This is to declare that the graduation project entitled No More Cheaters under the supervision of Dr. Ala Hamarasheh is our own work and does not contain any unacknowledged work or material previously published or written by another person, except where due reference is made in the text of the report. 
+
+
+
+
+Date: 20/1/2026
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Abstract
+Cheating in exams is a serious issue in most educational institutions, which is what to be expected when monitoring mostly depends on human supervision. In real exam situations, full attention cannot be maintained all the time by supervisors, which results in some cheating cases to be unnoticed. With this happening repeatedly,  the credibility of institutions will be harmed, It can also lead to a reduced value of their certificates 
+
+
+This project presents an AI-based system that help support exam supervision without replacing humans.
+It focuses on tracking student behavior and pointing out suspicious or unusual actions. This helps human supervisors notice all the potential cheating cases more reliably, especially when a potential cheating case has gone unnoticed by the human supervision. In short, the main goal of the project is to improve consistency and accuracy in exam monitoring, while keeping the final decision to human supervisors, this leads to helping institutions maintain their integrity and credibility
+
+
+
+
+
+
+List of Tables
+
+
+2.1.1 Functional Requirements …………………………………………………. 23
+
+
+        2.1.2 Non-Functional Requirements………………………………………….. 24
+
+
+
+
+List of Figures
+
+
+3.4.2 System Architecture …………………………………………………………………. 26
+3.5.2 Use Case Diagrams……………………………………………………………………. 30
+3.5.4 Sequence Diagram……………………………………………………………………. 31
+4.2 Class Diagram……………………………………………………………………………… 34
+4.3 Database Design or Algorithms…………………………………………………… 35
+4.4 Interface Design…………………………………………………………………………. 36
+
+
+
+
+
+
+
+
+
+
+
+
+List of Abbreviations
+
+
+AI
+	Artificial Intelligence
+	UML
+	Unified Modeling Language
+	API
+	Application Programming Interface
+	FR
+	Functional Requirement
+	NFR
+	Non-Functional Requirement
+	CV
+	Computer Vision
+	DB
+	Database
+	UI
+	User Interface
+	LMS
+	Learning Management System
+	SSO
+	        Single Sign-On
+	YOLO
+	You Only Look Once
+	
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Acknowledgements
+
+
+We would like to express deep appreciation to our supervisor. Dr. Ala Hamarsheh. We would also like to thank the Arab American University, Faculty of Information Technology for giving us this academic opportunity. We would also like to thank our teachers who shared their precious insights and our wonderful .
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Chapter One. Introduction
+   1. Background and Motivation
+Academic integrity and credibility are the things that give our degrees real value. when cheating goes undetected, it weakens the meaning of everyones effort and diminishes the credibility of education we all work toward. Human proctors cannot monitor every student concurrently during the whole exam, while many relevant existing systems often consider usual or normal behavior as cheating while failing to catch genuine violations.
+
+
+This is where our project takes a different approach . we believe that the goal of the use of technology is to support and assist humans, not replace them. By utilizing an AI effectively which takes into consideration the context rather than just rules and conditions, the AI is focused on monitoring behaviors that are actually suspicious rather than the normal activity of an exam proceeding as it will without interfering with it. It is an intelligent assistant rather than a monitoring agent. By utilizing the system as such, the integrity of the student can be ensured without compromising the student’s dignity
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   2. Aims and Objectives
+
+
+Project Aim
+The main idea behind our project is to design an intelligent system that aids in the process of exam proctoring in an efficient manner while promoting academic integrity as well. The project has been designed in such a manner that it aids human proctors instead of disregarding their importance, like many automated systems that do this job, by making the situations that require some more attention highlighted. The use of AI along with clouds serves the purpose of making the process of exam proctoring precise while avoiding an oversensitive approach.
+Project Objectives
+Create an AI module that scans the recorded exam being displayed on the screen to detect certain behaviors that may imply cheating, like a student being caught holding a phone, frequently not having his/her eyes on the screen, and many others. It will also be moderate in a way that it does not mark usual behavior in a student.
+Implement a secure cloud backend to manage the various processes within an examination session, access, videos, as well as AI processes. This cloud backend should be reliable as well as fast to cater to multiple student examination processes without any interruptions or significant delays.
+developers should create a web-based dashboard for the exams that the supervisor can use as follows: the supervisor should be able to use the website to access the already recorded sessions of the exams carried out by the examinees. In addition to this, the website should alert the supervisor only when critical suspicious behaviors are being used. Last but not least, the
+Ensure that there is a commitment to prioritize privacy by only obtaining necessary data to uphold integrity and disclose what the system looks for in detecting suspicious activity.
+test the software using actual exam scenarios with the aim of finding out its effectiveness using scenarios like real exam questions with considerations of its accuracy and speed as well as its convenience and fairness to both students and supervisors.
+System design, implementation process, and ethical issues should be well documented, enabling the project to be easily understandable, assessable, and utilisable within academic settings.
+
+
+
+
+
+
+   3. Problem Statement
+therefore, our main aim in the project is creating a system that can identify exam cheats using artificial intelligent modelling and this is vital because human mistakes form part of the reason why cheats go undetected during exams, leading to the damaging of the organizational reputation of such institutions and certificates being used.
+
+
+   4. Project Contributions
+This project, No More Cheaters, contributes to the area of academic integrity and AI- assisted exam proctoring in several practical and meaningful ways.
+
+
+*  A practical AI and cloud-based proctoring system that can actually be used
+The project also provides a functional proctoring system rather than just a conceptual model, as is presented in this project. the project provides a combination of analyzing a video of an exam session, a backend that operates in a cloud, and a supervisor interface as a single system. It, therefore, proves that a proctoring system based in available technology offers a cost effective alternative .
+
+
+
+
+* technique of detecting cheaters by their behavior rather than by restrictions
+The idea behind this method is to try to detect important cues of cheating instead of responding to each small or negligible change.
+
+
+
+
+
+
+*  A dashboard designed according to supervisor needs
+the project has brought into action a dashboard created keeping in mind the supervisors in the examination processes. This way, the process is simplified as it would otherwise overwhelm them to be constantly alerted. This helps the supervisor make accurate decisions as it avoids information overload for him in the process , allowing him to be fair in his decisions as a result.
+
+
+
+
+
+
+
+
+
+
+* A design that prioritizes fairness and human oversight
+Within this system , fairness is a core component and a priority, and this system will also provide a system of responding, which will allow students to respond, and this will provide a sense of accountability, however, decisions will still remain in the hands of educators, as this project is only a supportive system as discussed earlier.
+
+
+
+
+
+
+* A scalable cloud architecture suitable for real exam environments
+The project demonstrates how cloud services can be used to manage recorded videos, AI processing, and data storage across multiple exams. This shows that the system can scale beyond small tests and adapt to institutions of different sizes and needs.
+
+
+* Clear and ethical documentation to support responsible AI use
+apart from technical work done, the documentation of a ( CSPS ) project includes detailed documentation of the system design, ethical considerations, privacy, evaluation methodologies used during its design, use of privacy aware best practices, such as restricting the retention periods, including explanations of why decisions are being taken  amongst others . enabling AI use in a responsible manner in an academic context.
+
+
+   5. Structure of the Report
+the report consists of five chapters in the following order: a brief introduction related to a particular aspect of project development.
+* Chapter one – introduction:
+this chapter will address , among other things , the project’s background and motivation, aims and objectives, statement of the problem, contributions and overview of structure.
+* Chapter two – literature Review:
+This chapter reviews existing proctoring systems, AI technologies for behavior analysis, and ethical considerations in academic integrity monitoring.
+* Chapter three – system Analysis:
+This chapter will contain an analysis of the existing situation, system, its functional and non-functional requirements, user needs, as well as the development methodology. The chapter will also cover use case diagrams and system architecture.
+* Chapter four – system Design:
+This chapter describes the system design, including system architecture diagrams, database schema, AI model design, and user interface specifications.
+* Chapter five – conclusions and future work:
+This chapter summarizes the key outcomes of the project, discusses its limitations, and outlines potential future enhancements.
+
+
+
+
+
+
+Chapter Two. Literature Review
+   1. Overview
+This literature review examines the ways in which cheating is being managed in examination procedures. Also, the ways in which academic integrity is being promoted by these institutions. Even though the main purpose of these tools is to promote equality, there have also been issues raised with yet another form of inaccuracy.
+The review focuses on three main areas:
+Current proctoring methods:
+This part looks at traditional exams monitored by human supervisors, as well as online systems that rely on automated or AI supported monitoring. It discusses how these approaches are used in practice and where they tend to fail, especially in real exam conditions.
+
+Technologies used in the proctoring systems:
+Ethical and practical concerns:
+This section deals with matters that affect the student directly, such issues may include issues to do with unfair detection, student stress levels, supervisor workload, accessibility, and transparency.
+
+
+   2. Existing Systems
+Before introducing the No More Cheaters system, it is useful to look at how academic integrity is being handled during exams today. Most institutions rely on a small number of well known approaches, especially in online or hybrid settings. These approaches can generally be described as human-supervised exams, automated proctoring software, and systems that use some level of AI support. Each method solves certain problems, but none of them fully addresses the challenges of scalability, fairness, and practicality at the same time.
+
+
+2.2.1 Human Proctored Exams
+
+
+Human supervision is the most traditional and widely accepted form of exam monitoring. In this approach, a supervisor is either physically present in the exam room or watches students through a live video feed during the exam.
+
+
+In practice, the effectiveness of this method depends entirely on the supervisor’s attention. The supervisor is expected to notice suspicious and unusual actions such as looking at notes, using a phone, or communicating with others. One clear advantage is that humans can understand context. For example, a supervisor can usually tell the difference between a student stretching or thinking and a student attempting to cheat. The visible presence of a supervisor can also prevent cheating before it occurs.
+
+
+However, this approach has clear limitations and gaps. A single supervisor can only monitor a limited number of students at once, which makes it difficult to scale. Human attention also decreases over time due to boredom or distraction. In remote exams, the situation becomes even more complicated, because institutions must hire and coordinate online proctors, which is expensive and difficult to manage, especially for large courses.
+
+
+2.2.2 Automated Proctoring Software
+
+
+Automated proctors were the first form of technology used to support the online examination model, which are basically rule-based and require no human supervision.
+
+
+Normally, it comes with a secure or locked browser that locks access to other applications and sites. Further, it records video of what appears on the student’s computer screen, as well as video and audio of the student using their webcam, making it alert when the student leaves their webcam frame or when they open another tab on their browser.
+
+Tools like Lockdown Browser by Respondus and early versions of Proctor U's Record and Review model this. Some of the benefits of these types of tools include, but are not limited to, the fact that such tools can scale, in the sense that the exam supervisor does not need to monitor each person in real time. Lockdown browsers can help eliminate digital cheating, such as web-based searching.
+
+
+
+
+Yet, the essential drawbacks of these systems are also considerable: the detection logic is usually very simple; therefore, there are plenty of wrong-flagged events. Normal events, such as students adjusting their positions or a pet entering a room, can have the system trigger warnings. It can be very time-consuming and stressful to review large numbers of flagged sessions. In addition, continuous recording of video and audio can easily be perceived as invasive and raises privacy concerns, which again raise anxiety for students during exams.
+
+
+
+
+2.2.3 AI-Assisted Proctoring Tools
+
+
+More recent proctoring systems attempt to improve on automation using AI techniques, especially computer vision and machine learning, in analyzing exam behaviors.
+
+
+These systems process webcam video and audio for patterns that may reflect cheating. The common techniques can include tracking where the student is looking, detecting objects like phones or books, identification of multiple faces in the frame, and monitoring audio for conversations. different combinations of these techniques are used in the various platforms such as Proctorio , Examity and Honorlock.
+
+
+AI assisted systems have the added advantage of reducing the quantity of material that has to be reviewed by supervisors because the systems highlight higher-risk moments rather than all rule violations. In certain cases, they can better distinguish between normal behavior versus suspicious behavior such as briefly looking away versus repeatedly looking down at a desk.
+
+
+
+
+In spite of this, there remain a few major problems to resolve and this is where there is potential to better adapt to each institution and environment despite the progress already made. For example, it must first and foremost be noted that despite the various positive changes made, there still remain a number of key areas which introduce potential problems and this would include the unreliability and varying dependency on light and camera type used, as well as how a student looks. Another problem which is noted is the lack of clarification on how a flagged student is justified, which creates a source of inconvenience on part of the students as well as instructors on a larger scale. Furthermore, high-level AI solutions would inevitably cost a great deal and there is a feeling of loss of ownership over information and a potential future dependency on vendors themselves.
+
+
+2.2.4 Summary of Gaps
+
+
+From an examination of these approaches, it is easy to note an identifiable gap . for instance human supervision is fair and equitable, but it is not scalable. Basic automation is scalable but unfair and unaware. there is also advanced intelligent detection, but it is not transparent, affordable, and even engages human control in its implementation. This is why the No More Cheaters project was born out of an identifiable need marked in the gaps above.
+
+
+   3. Summary
+In this chapter, the focus was on how academic integrity is currently maintained in the online environment. Notably,
+examinations and reviewed major systems that are currently relevant to detecting cheaters.
+“The literature has demonstrated that despite increased access thanks to digital learning, there is still an increase in the use of
+Exams monitored with the assistance of the human mind may still be valuable resources owing to their capacity for contextual understanding combined with the ability to apply judgment, but one of the negative aspects is that they cannot be scaled well, do not come cheap, and lack consistency in vast settings. Automated proctors may scale well but heavily rely on rules that frequently produce false alerts, stress the student, together with serious privacy issues that come with the application of the rules. Proctors helped by the application of artificial intelligence may do well in sensing the errors with higher degrees of precision, but this poses problems like transparency, costs, and the lack of control by the institution.
+In conclusion, it is quite obvious from these limitations that there exists a huge gap in the proctoring system that needs filling with all due haste. The need for a system capable of effectively spotting suspicious and unique activity with greater precision, while maintaining human interface in decision-making processes and avoiding interference in the personal environment with undue inconvenience in smaller educational institutions, cannot be understated.
+The ” No More Cheaters “ project is driven by this gap . The following chapters present the design and implementation of a system that uses AI and cloud technologies as supportive tools rather than autonomous decision makers, with the goal of achieving a more balanced, usable, and ethically responsible approach to protecting academic integrity in online examinations.
+
+
+        Chapter Three: System Analysis
+It is necessary to study and analyze the current system to understand the shortcomings and problems of the current system and generate solutions to solve the problems. 
+3.1 Introduction
+
+This chapter is what carries the project into a more concrete shape. After reviewing existing research and identifying the main problems with current exam proctoring systems, the focus now is on how those ideas can be turned into an actual system. Instead of discussing what could be done, this chapter looks at what needs to be built and how it should be organized.
+The chapter describes what the No More Cheaters system is expected to do, along with the conditions it should meet in order to be useful in real exam situations. It also explains how the system operates at a high-level overview, including the overall main parts and how they are interrelated. These are largely based on practical issues and are not neccessarily theory based.
+In order for the system's design to remain uncluttered and easily comprehensible, tools and techniques are employed for the analysis and design as seen with tools like requirement descriptions and UML diagrams. Although their presence may imply formality, they are actually intended for easy explanation of the system with a possibility for implementation and assessment.
+Therefore, overall, the intent behind this chapter has been to create a clear starting ground for development, and we can say that the decisions, by design, aim to specifically counter some of the problems that we identified earlier, such as those of fairness, scalability, over-automation, amongst others, by being suitable yet not replacing a human supervisor, by design.
+
+
+3.2 Analysis of Existing Systems 
+
+
+
+Chapter 2 also discussed the basic means by means exam prodding takes place as a means for ensuring integrity. Yet while this means of exam prodding is commonly employed, upon closer scrutiny, one will observe that this technique suffers common shortcomings. Although this should have been more theoretical, this particular section will seek to summarize said shortcomings and their overall influence upon the creation of No More Cheaters.
+
+
+3.2.1 Limits of Human Supervision at Scale
+
+
+The traditional tests conducted under the supervision of a human require complete and unwavering attention by the supervisor in the traditional setting, as well as in the online setting with the help of live videos. However, it is quite obvious that such an affair is quite practical in settings with a smaller number of people to supervise. But as the number increases, it tends to become extremely unwieldy. In the case of online tests, it is quite impossible as it is extremely costly to supervise a number of proctors. In order to overcome this problem, the developers of No More Cheaters have included the facility in the heart of the server itself.
+
+
+3.2.2 Accuracy and Privacy Trade-offs in Automated Software
+
+
+The systems based purely on rules for automation attempt to solve this scalability issue but create another. Undemanding rules that look for actions like a face moving off a video or a student switching tabs can often misinterpret student behaviors, like turning their gaze to solve a problem or changing how they are sitting. This adds another step for overseers to scan for false positives. Additionally, automated systems are designed to record video or both video and audio streams at all times. This, to many students, can be quite invasive. The need for more clever systems that understand context while keeping everything but absolutely essential data is evident.
+
+
+3.2.3 Lack of Transparency and Diminished Human Control in AI Tools
+
+
+Some third generation advanced AI systems have better alerting capabilities but are also “black boxes,” not providing any real reasons why the alert is being issued. This is not helpful in giving supervisory support confidence in the alert data. In fact, it puts human judgment in the form of a simple “yes/no” to the reasons for an alert. AI, in an academic setting at any rate, is to assist the supervisor, not replace the supervisor. Therefore, the value in this application is the “explainable” alert with interpretive visual aids.
+
+
+
+
+3.2.4 Accessibility and Flexibility Constraints of Commercial Platforms
+
+
+Moreover, most of the modern systems that can be utilized in proctoring can be very costly, as they tend to follow a model of a pricey SaaS based, proprietary solution. However, a more appropriate solution can be envisaged by a more affordable, flexible, and open solution, which does not restrict smaller institutions due to concerns of vendor lock-in.
+
+
+3.2.5 Key Takeaways
+
+
+The existing proctoring solutions are thus creating trade-offs between scalability and cost, accuracy and student privacy, and automation and control. No More Cheaters attempts to minimize the trade-offs between them by appropriate design. The requirements listed in the next section are the proposed solution to this problem, with the intention of creating a balance between them so that supervisors, as well as students, are well protected, while also maintaining academic integrity
+3.3 System Requirements
+
+3.3.1 Functional Requirements
+
+
+
+ Functional Requirements ID
+	 Functional Requirements name
+	FR1
+	Allow instructors and administrators to log in securely.
+	FR2
+	Allow instructors to upload recorded exam videos.
+	FR3
+	Validate video format and integrity.
+	  FR4
+	Prevent duplicate video uploads using hash generation.
+	FR5
+	Process uploaded videos offline.
+	FR6
+	Extract frames from recorded videos.
+	FR7
+	Analyze behavior using AI models.
+	FR8
+	Detect suspicious activities.
+	FR9
+	Calculate cheating probability.
+	FR10
+	Generate alerts when probability exceeds a defined threshold.
+	FR11
+	Generate detailed analysis reports.
+	FR12
+	Allow instructors to review alerts and reports.
+	
+
+FR13
+	Allow administrators to configure system settings.
+	FR14
+	Maintain audit logs of all critical actions.
+	
+3.3.2 Non Functional Requirements
+
+
+        
+Non-Functional Requirements ID
+	Non-Functional Requirements name
+	NFR1
+	Ensure data privacy and confidentiality.
+	NFR2
+	Be scalable to handle multiple video uploads.
+	NFR3
+	Be user friendly and intuitive.
+	NFR4
+	offer explainable AI outputs.
+	
+
+Performance Constraints :
+   * video processing needs to happen within a certain amount of time.
+   * ai analysis should be efficient for long recordings.
+   * storage usage has to be optimized by retaining only necessary data (.e.g reports).
+Resources : 
+   * cloud or local servers for processing
+   * database management system.
+   * framework
+3.4 Design Objectives/Requirements(Optional)
+The system design intends to :
+   * and support human decisions rather than replace them.
+   * reduce false positives by performing context aware analysis..
+   * minimize intrusion into student privacy.
+   * provide transparency and accountability.
+   * ensure modular and maintainable architecture.
+3.4.1 User Requirements :
+Instructor Requirements
+   * Upload recorded exam videos easily.
+   * Receive alerts only when necessary.
+   * Review clear visual evidence.
+   * Generate and export reports.
+   * Maintain control over final decisions.
+Admin Requirements
+   * Manage instructor accounts.
+   * Configure AI sensitivity thresholds.
+   * Monitor system logs.
+   * Ensure system integrity and security.
+
+
+
+
+3.4.2 System Architecture
+
+The system architecture, therefore is a multi layered design where instructors and administrators interact with a web-based frontend. The requests go through the (REST API) and are then processed by the application server. The recorded videos of the exams are stored in cloud storage; alternatively, they can be stored on premises within the institutions infrastructure, depending on organizational policies and privacy requirements. The videos are analyzed offline by AI modules for quality and to protect against bias. The results of this analysis are also added to the central database, along with metadata from the system. Alerts and notifications are handled by using an external service. such flexibility in deployment includes the capability to run the system entirely at the institution or in a hybrid cloud.
+  
+3.5 Development Methodology
+For this project, iterative and incremental development methodology will be used with an Agile approach as the basis. Agile offers flexibility in terms of development cycles as well as regular review and testing of all parts of the system.
+Methodology Used: Agile
+Reasons for Choosing Agile:
+   * Regular evaluation of AI models
+AI modules should be tested, validated and retuned at regular intervals to improve their overall accuracy and quality. By using the Agile iterative development process, it is simple to refine individual AI components with real-time analysis results and performance metrics.
+   * Changing system requirements
+As you test, analyze and receive feedback from end users, system requirements will likely evolve and require changes to be made to your overall design. Since Agile allows you to make adaptations to the development cycles without requiring a major redesign of your entire system, adopting the Agile methodology is a sensible choice.
+   * Incremental development and delivery
+System components such as the ability to upload videos, perform offline AI analysis, generate reporting on individual videos with alerts based on results, can all be developed and delivered in small increments. This allows you to detect any potential issues with your components earlier in the development cycle.
+
+
+   * Regular feedback from stakeholders
+Regular and continuous stakeholder feedback from instructors and administrators leads to improved usability, increased accuracy when making decisions, as well as an overall improvement in system reliability.
+   * Improved risk management
+The use of an Agile approach is also effective at identifying technical and operational risks at early stages of development, particularly for components related to AI performance, data processing and managing system scalability.
+
+
+             3.5.1 UML or DFD 
+        
+
+
+
+
+
+
+             3.5.2 Use Case Diagrams
+  
+3.5.3 Use Case Description (Detailed Use Cases):
+        
+        The use case diagram depicts how instructors , administrators, and the AI system interact. instructors interact with the system by loading videos of the exams taken, while administrators interact with the system by managing users of the system and the AI system. Similarly , the AI system interacts by analyzing the videos, not in real time then computing probability of cheating, and sending alerts. 
+             3.5.4 Sequence Diagram
+  
+
+
+
+3.6 Summary
+
+
+This chapter has transformed the research insights from Chapter 2 into a clear actionable blueprint for the ” No More Cheaters system “.  carefully analyzing existing approaches to exam proctoring showed us their main weaknesses on scalability , accuracy, privacy, and transparency. These observations were then employed to define in great detail a set of functional and nonfunctional requirements that describe what the system is supposed to do and how it is supposed to operate.
+The chapter also set up a modular approach for a post-exam analysis where exams are recorded locally and analyzed by AI once exams are completed. This design choice put a greater emphasis on supporting supervisors rather than replacing them, while focusing on explainable alerts, privacy-aware data handling, and human controlled decision making. With the system requirements, architectural direction  supporting “UML” diagrams, and development methodology now clearly defined, a solid foundation is in place for the detailed technical design presented in Chapter 4.
+________________
+Chapter Four: System Design
+
+
+4.1 Introduction
+
+
+This chapter presents the detailed technical design of the No More Cheaters system. Moving from the "what " and "why " defined in the analysis phase, we now specify the "how " the concrete architecture , data structures ,  algorithms , and interfaces that will bring the system to life.
+
+
+The design is directly influenced by the requirements set out in Chapter 3, with each part of the design addressing particular functional and/or non-functional requirements. Finally, we will break our system into its fundamental structural components: our class diagram, which will allow us to represent software entities and their relationships in general terms, our database schema, which will allow us to implement our concepts of data and its storage, our AI algorithmic components responsible for video analysis in offline mode, and our interface designed to allow supervisors to successfully utilize our software.
+
+
+By formally describing this complete blueprint, we ensure that the implementation phase benefits from a well-defined, strong foundation. all design decisions aim to reinforce our primary philosophy  , i.e., that every decision allows our project to remain an assisting, not replacement type , tool without sacrificing usability or equity in an academic context
+
+
+
+
+4.2 Class Diagram
+  
+
+4.3 Database Design or Algorithms
+  
+
+4.4 Interface Design
+
+  
+
+  
+
+  
+
+  
+4.5 Summary
+
+
+Chapter 4 has all the details about the design of the No More Cheaters system. It talks about the class diagram which's the main structure of the No More Cheaters software. The database schema is also. It tells us how the exam sessions and video data and results from the AI analysis should be stored in a way that is reliable and easy to understand.
+The No More Cheaters system is designed in a way that's easy to maintain and can be scaled up in the future. This is done by keeping the parts of the No More Cheaters system separate. The No More Cheaters system has a React frontend and a REST-based backend and a Python module, for AI processing. The React frontend and the REST-based backend and the Python AI processing module of the No Cheaters system are all separate.
+The interface design is made to work with how people really use the system. The people in charge get a simple and easy to use dashboard to manage exams and look at alerts made by the computer. when we made the system we thought about how to handle things like keeping data safe and showing proof. we made sure these things work with what the system needs to do and what is right. We made these decisions to make sure the interface design and the system work well together and that the system is fair and good for the students and the people in charge and that is why we made the interface design and the system the way we did with the exam management and review of computer made alerts and the simple interface, for instructor.
+The system is hence adequately prepared to enter the implementation phase with such a comprehensive design blueprint in place. This design encourages a realistic, equitable, and efficient solution in modern examination environments to ensure academic integrity.
+Chapter Five. Conclusions and Future Work
+   1. Conclusions
+The No More Cheaters project has also created a fully working prototype of the post-hoc (non-real-time) AI-assisted exam proctoring solution to fill in the major gaps in the exam proctoring solution. In the new solution, the student streams the exam proctoring sessions, uploads the videos in the cloud backend (Firebase Firestore is used in the real-time solution and cloud storage is used in the video solution), and then later the AI solution will handle the videos uploaded in the backend. The AI solution is built in Python with OpenCV and YOLO.
+
+
+
+
+
+
+Key Technical Achievements
+
+
+Modular Post-Hoc Architecture: The modularity was a success since separating the process beforehand and keeping it distinct from the post-process was effective. It avoids a complex and low-latency streaming process, minimizes network loads, and satisfies students as they know there is no “live surveillance” either. The backend facilitates processing from the upload, storage, queue, processing, and then DB storage of the result video itself.
+
+
+Supervisor Focused Dashboard: Finally, the React web dashboard offers a step-by-step workflow for the supervisors, showing scheduled exams, the option to run the AI analysis for completed sessions, and the option to examine flagged incidents, including a timestamp, behavior type (“PHONE_DETECTED,” “MULTIPLE_FACES” etc.), a confidence score, and a short snippet of the incident, providing a form of context, minimizing the concern of the “black box” found in other commercial AI tools.
+
+
+
+
+Privacy Aware Design: Here, the videos are stored for a limited period, say 30 days, after which the videos are deleted from the cloud storage, and the structured alert data is stored for reporting purposes, which implements the principle of the “privacy by design” concept as mentioned in our objectives.
+
+
+Baseline AI Detection Pipeline: Baseline AI Detection Pipeline: The AI module utilizes pre-trained models via PyTorch or TensorFlow. The models used include YOLO for object recognition, OpenCV/MediaPipe for simple face and gaze recognition. The videos will then be processed at a specific frame rate to produce a report written to JSON format showing event to timestamp mappings. The system successfully detects phones, extra faces, long looks away from the screen utilizing specific sample data.
+
+
+
+
+Limitations and Constraints
+AI Model Scope and Accuracy: The existing AI is only capable of identifying a number of actions within a range. It is unable to locate the correct gaze vector, detect certain forbidden items such as certain books, and listen to sounds from its environment. The accuracy might depend on the light it is under, its viewing perspective, and the video quality; this results in a number of false readings.
+
+
+Scalability of Prototype: The cloud backend has a fixed setup in operation. Even though it’s designed to be scalable, it hasn't been tested with hundreds of concurrent uploads or AI jobs. The time taken to process will be linearly scalable based on the video length, but other optimizations like parallel processing or quantization have not been done yet.
+
+Integration: The application is running as standalone. Exams are managed manually. Integration with full SSO and/or LMS solutions such as Moodle has not been performed in this step.
+Thus, “the project has successfully demonstrated proof of concept of such a working system, helping supervisors by presenting them with a much smaller list of reviewable video from what would have taken them an hour or so of video review.” As such, it has proved that “a fair, transparent, and cost effective AI-based proctoring system is indeed feasible,” providing it is used “as an academic endeavor rather than an attempt at something commercially presentable.”
+
+
+
+
+   2. Future Work
+AI Improvements
+   * More varied data can be added for the model and efforts can also be made by adjusting the lighting, poses, and scenes.
+
+   * Add gaze tracking to better monitor eye movement and reduce false alerts from normal head turns.
+
+   * Introduce basic audio checks to detect sustained conversation or help seeking during silent exams.
+
+   * Optimize the AI model with a reduced model weight and dynamic frame sampling to reduce the time taken for computation.
+
+System Performance and Scalability
+      * Process videos in parallel by splitting them into segments to speed up analysis.
+
+      * Deploy and test the backend on a scalable cloud platform to ensure it can handle large numbers of concurrent uploads.
+
+
+Integration and Fairness
+         * Integrate with LMS platforms and university login systems for seamless access.
+
+         * Audit the AI for bias and ensure it performs fairly across all student demographics.
+
+         * Enable context aware alerts so exam specific rules can adjust detector sensitivity.
+
+         * Provide clear explanations for AI alerts, helping supervisors understand why events were flagged.
+
+Architecture and System Evolution
+            * The back-end will be refactored into modular micro-services that are easier to maintain and also easily scalable..
+
+
+
+
+
+Overall Goal
+               * Make the system ‘smarter, faster, fairer, and more practical’ while at the same time providing a ‘supervising, protecting, and stress-free examination sphere.
+
+
+
+
+
+
+
+
+
+
+References
+
+
+Beck, K., et al. (2001). Manifesto for Agile Software Development. Retrieved from https://agilemanifesto.org
+
+
+
+
+Bradski, G. (2000). OpenCV (Open Source Computer Vision Library). Retrieved from https://opencv.org
+
+
+Google. (2024). Firestore: NoSQL cloud database. Retrieved from https://firebase.google.com/docs/firestore
+
+
+
+
+Google. (2024). MediaPipe: Cross-platform ML solutions for live and streaming media. Retrieved from  https://mediapipe.dev
+
+
+
+
+Object Management Group. (2017). Unified Modeling Language (UML). Retrieved from https://www.uml.org
+
+
+
+
+ProctorU. (2021). Record+ Review Proctoring Methodology. Retrieved from https://www.proctoru.com/record-and-review
+
+
+
+
+React. (2025). JavaScript Library for Building User Interfaces. Retrieved from https://reactjs.org/docs
+
+
+
+
+Redmon, J., et al. (2016). You Only Look Once: Unified, Real-Time Object Detection. Retrieved from https://pjreddie.com/darknet/yolo/
+
+
+
+
+
+
+Appendices
+Any supportive documents (e.g. questionnaires, interview documentations) should be presented in this section.
