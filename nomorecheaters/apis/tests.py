@@ -20,6 +20,7 @@ import shutil
 import tempfile
 import uuid
 from types import SimpleNamespace
+from unittest import mock
 
 from django.contrib import admin
 from django.contrib.auth import get_user_model
@@ -46,6 +47,7 @@ from .serializers import (
     UserPreferencesUpdateSerializer,
     VideoUploadSerializer,
 )
+from .tasks import run_analysis
 
 
 User = get_user_model()
@@ -832,3 +834,99 @@ class ReportCreateSerializerTests(TestCase):
 
         self.assertFalse(serializer.is_valid())
         self.assertIn('session', serializer.errors)
+
+
+class AsyncQueueWiringTests(APITestCase):
+    """Task 2: analysis is dispatched through the django-rq queue.
+
+    Two paths are exercised without any external Redis:
+    * **eager** (``RQ_ASYNC`` off, the default) — the worker runs in-process so
+      the endpoint returns the finished report with ``200 OK``;
+    * **async** (queue reports ``is_async``) — the job is handed to the queue
+      and the endpoint answers ``202 Accepted`` while it is still ``QUEUED``.
+    """
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+        self.user = make_user(username='queue', email='queue@example.com')
+        self.client.force_authenticate(self.user)
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
+
+    def _make_video(self, content=b'queue-wiring bytes'):
+        session = make_session(exam=make_exam(instructor=self.user))
+        upload = SimpleUploadedFile('queue.mp4', content, content_type='video/mp4')
+        serializer = VideoUploadSerializer(
+            data={'session': str(session.id), 'file': upload},
+            context={'request': request_for(self.user)},
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        return serializer.save()
+
+    def test_eager_analyze_completes_job_and_returns_report(self):
+        video = self._make_video()
+
+        response = self.client.post(reverse('videos_analyze', kwargs={'pk': video.id}), {}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['status'], AnalysisJob.Status.COMPLETED)
+        self.assertIn('job_id', response.data)
+        self.assertIn('analysis', response.data)
+        self.assertEqual(len(response.data['alerts']), 1)
+
+        job = AnalysisJob.objects.get(session=video.session)
+        self.assertEqual(job.status, AnalysisJob.Status.COMPLETED)
+        self.assertIsNotNone(job.started_at)
+        self.assertIsNotNone(job.completed_at)
+        # The worker records the completion audit trail with no HTTP request.
+        for action in (AuditLog.ActionType.ANALYSIS_STARTED,
+                       AuditLog.ActionType.ANALYSIS_COMPLETED,
+                       AuditLog.ActionType.REPORT_GENERATED):
+            self.assertTrue(
+                AuditLog.objects.filter(action=action).exists(),
+                f'missing audit entry for {action}',
+            )
+
+    def test_async_analyze_enqueues_job_and_returns_202(self):
+        video = self._make_video()
+        fake_queue = mock.Mock()
+        fake_queue.is_async = True
+
+        with mock.patch('django_rq.get_queue', return_value=fake_queue):
+            response = self.client.post(reverse('videos_analyze', kwargs={'pk': video.id}), {}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertEqual(response.data['status'], AnalysisJob.Status.QUEUED)
+        self.assertIn('job_id', response.data)
+        self.assertNotIn('analysis', response.data)
+        fake_queue.enqueue.assert_called_once()
+        self.assertIs(fake_queue.enqueue.call_args.args[0], run_analysis)
+
+        # The job is persisted as QUEUED and no report exists until a worker runs.
+        job = AnalysisJob.objects.get(session=video.session)
+        self.assertEqual(job.status, AnalysisJob.Status.QUEUED)
+        self.assertFalse(Report.objects.filter(session=video.session).exists())
+        self.assertEqual(
+            ExamSession.objects.get(id=video.session.id).status,
+            ExamSession.Status.PROCESSING,
+        )
+
+    def test_worker_marks_job_failed_on_error(self):
+        video = self._make_video()
+        job = AnalysisJob.objects.create(session=video.session, status=AnalysisJob.Status.QUEUED)
+
+        with mock.patch('apis.tasks.build_demo_report', side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                run_analysis(str(job.id), actor_id=str(self.user.id))
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, AnalysisJob.Status.FAILED)
+        self.assertIn('boom', job.error_message)
+        self.assertEqual(
+            ExamSession.objects.get(id=video.session.id).status,
+            ExamSession.Status.FAILED,
+        )

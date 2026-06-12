@@ -98,8 +98,11 @@ INSTALLED_APPS = [
     # dj-rest-auth packages
     'dj_rest_auth',
     'dj_rest_auth.registration',
-    
-    'apis',  
+
+    # Background job queue (analysis worker)
+    'django_rq',
+
+    'apis',
 ]
 
 MIDDLEWARE = [
@@ -181,6 +184,30 @@ DATABASES = {
         'PORT': env('DB_PORT', ''),
     }
 }
+
+# Background job queue (django-rq + Redis)
+# https://github.com/rq/django-rq
+#
+# Analysis runs through this queue (see apis/tasks.run_analysis). By default
+# `RQ_ASYNC` is False, so `queue.enqueue(...)` executes the job synchronously
+# in-process — no Redis or worker is required for local dev or the test suite.
+# In production, run Redis + `python manage.py rqworker default` and set
+# RQ_ASYNC=true so uploads return immediately while videos process in the
+# background.
+REDIS_URL = env('REDIS_URL', 'redis://127.0.0.1:6379/0')
+RQ_ASYNC = env_bool('RQ_ASYNC', False)
+RQ_QUEUES = {
+    'default': {
+        'URL': REDIS_URL,
+        'DEFAULT_TIMEOUT': env('RQ_DEFAULT_TIMEOUT', 900),
+        'ASYNC': RQ_ASYNC,
+    },
+}
+# Async enqueue happens immediately instead of deferring to
+# `transaction.on_commit`. `enqueue_analysis` already commits the AnalysisJob
+# row before enqueuing (the view runs in autocommit, no wrapping transaction),
+# so the worker can never race ahead of the row it needs to read.
+RQ = {'COMMIT_MODE': 'auto'}
 
 REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [

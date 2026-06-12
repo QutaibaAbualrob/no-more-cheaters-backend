@@ -37,15 +37,32 @@ def get_client_ip(request):
     return request.META.get('REMOTE_ADDR')
 
 
-def write_audit_log(request, action, target_resource='', metadata=None):
-    """Create an immutable audit entry for security-relevant actions."""
+def record_audit_log(action, *, user=None, target_resource='', metadata=None,
+                     ip_address=None, user_agent=''):
+    """Create an immutable audit entry without requiring an HTTP request.
+
+    Used by background workers (which have no request object) and by
+    :func:`write_audit_log`, which adapts a DRF request into these fields.
+    """
     return AuditLog.objects.create(
-        user=request.user if request.user.is_authenticated else None,
+        user=user,
         action=action,
         target_resource=target_resource,
+        ip_address=ip_address,
+        user_agent=user_agent or '',
+        metadata=metadata or {},
+    )
+
+
+def write_audit_log(request, action, target_resource='', metadata=None):
+    """Create an immutable audit entry for security-relevant actions."""
+    return record_audit_log(
+        action,
+        user=request.user if request.user.is_authenticated else None,
+        target_resource=target_resource,
+        metadata=metadata,
         ip_address=get_client_ip(request),
         user_agent=request.META.get('HTTP_USER_AGENT', ''),
-        metadata=metadata or {},
     )
 
 
@@ -180,33 +197,67 @@ def get_available_upload_session(instructor, upload, exam_name='', student_ident
         candidate = f'{base_identifier}-{suffix}'
 
 
-@transaction.atomic
-def run_demo_analysis(request, video):
-    """Create deterministic demo analysis output for an uploaded video.
+def enqueue_analysis(request, video):
+    """Queue a background analysis job for an uploaded video.
 
-    This is intentionally isolated behind a service boundary so a future AI
-    worker can replace it without changing views, serializers, or frontend
-    API calls.
+    Creates (or resets) the session's :class:`AnalysisJob` in the ``QUEUED``
+    state, flips the session to ``PROCESSING``, records an ``ANALYSIS_STARTED``
+    audit entry, and hands the job off to the django-rq ``default`` queue.
+
+    The heavy work runs in :func:`apis.tasks.run_analysis`. When the ``default``
+    queue is asynchronous (``RQ_ASYNC=true`` with Redis + an ``rqworker``) the
+    job is handed off and this returns immediately while it is still ``QUEUED``.
+    Otherwise (the dev/test default) the worker runs inline before this returns,
+    so the job is already ``COMPLETED``. Callers should re-read the returned job
+    to decide which case they are in.
     """
-    session = video.session
-    now = timezone.now()
+    # Local imports keep django-rq out of the import graph until it is used and
+    # avoid a circular import with apis.tasks (which imports this module).
+    import django_rq
 
-    session.status = ExamSession.Status.PROCESSING
-    session.save(update_fields=['status', 'updated_at'])
+    from .tasks import run_analysis
+
+    session = video.session
     job, _created = AnalysisJob.objects.update_or_create(
         session=session,
         defaults={
-            'status': AnalysisJob.Status.PROCESSING,
+            'status': AnalysisJob.Status.QUEUED,
             'ai_model_version': request.data.get('ai_model_version', 'demo-rules-v1'),
             'frame_sample_rate': request.data.get('frame_sample_rate', 1),
-            'started_at': now,
+            'started_at': None,
             'completed_at': None,
             'error_message': '',
             'metadata': {'source': 'api-demo-analysis'},
         },
     )
+    session.status = ExamSession.Status.PROCESSING
+    session.save(update_fields=['status', 'updated_at'])
     write_audit_log(request, AuditLog.ActionType.ANALYSIS_STARTED, target_resource=str(video.id))
 
+    job_id = str(job.id)
+    actor_id = str(request.user.id)
+    queue = django_rq.get_queue('default')
+    if queue.is_async:
+        # Real worker + Redis: hand off and return; the job stays QUEUED here.
+        queue.enqueue(run_analysis, job_id, actor_id=actor_id)
+    else:
+        # Eager fallback: run in-process so no Redis/worker is needed. rq's own
+        # synchronous mode still persists job state to Redis, so we bypass it.
+        run_analysis(job_id, actor_id=actor_id)
+
+    job.refresh_from_db()
+    return job
+
+
+@transaction.atomic
+def build_demo_report(session):
+    """Produce deterministic demo Alerts + a Report for a session.
+
+    This is intentionally isolated behind a service boundary so a future AI
+    worker can replace it without changing the queue, views, serializers, or
+    frontend API calls. It does not touch job status or audit logs — the
+    caller (:func:`apis.tasks.run_analysis`) owns the job lifecycle.
+    """
     alert, _alert_created = Alert.objects.get_or_create(
         session=session,
         timestamp_sec=30,
@@ -232,14 +283,6 @@ def run_demo_analysis(request, video):
             'summary': 'Demo analysis completed. Replace this workflow with the production AI pipeline.',
         },
     )
-
-    job.status = AnalysisJob.Status.COMPLETED
-    job.completed_at = timezone.now()
-    job.save(update_fields=['status', 'completed_at'])
-    session.status = ExamSession.Status.COMPLETED
-    session.save(update_fields=['status', 'updated_at'])
-    write_audit_log(request, AuditLog.ActionType.ANALYSIS_COMPLETED, target_resource=str(video.id))
-    write_audit_log(request, AuditLog.ActionType.REPORT_GENERATED, target_resource=str(report.id))
     return report
 
 

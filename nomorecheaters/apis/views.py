@@ -21,8 +21,8 @@ from .services import (
     activity_series_for,
     build_thresholds_response,
     dashboard_stats_for,
+    enqueue_analysis,
     get_available_upload_session,
-    run_demo_analysis,
     system_metrics,
     update_global_thresholds,
     update_user_thresholds,
@@ -163,16 +163,30 @@ class VideoUploadView(APIView):
 
 
 class AnalyzeVideoView(APIView):
-    """Trigger the current analysis workflow for an uploaded video."""
+    """Queue background analysis for an uploaded video.
+
+    The analysis runs on the django-rq ``default`` queue. When the queue is
+    synchronous (``RQ_ASYNC`` off — the dev default) the job finishes before
+    this returns, so the full report is included with ``200 OK``. With a real
+    Redis-backed worker the job is still ``QUEUED`` on return, so we answer
+    ``202 Accepted`` and the client polls the video/report endpoints for
+    completion.
+    """
 
     def post(self, request, pk):
         video = get_object_or_404(owned_videos(request.user), pk=pk)
-        report = run_demo_analysis(request, video)
+        job = enqueue_analysis(request, video)
         video.refresh_from_db()
-        return Response({
+        session = video.session
+
+        payload = {
+            'job_id': str(job.id),
+            'status': job.status,
             'video': VideoReadSerializer(video, context={'request': request}).data,
-            'analysis': ReportReadSerializer(report).data,
-            'alerts': list(video.session.alerts.values(
+        }
+        if job.status == AnalysisJob.Status.COMPLETED and hasattr(session, 'report'):
+            payload['analysis'] = ReportReadSerializer(session.report).data
+            payload['alerts'] = list(session.alerts.values(
                 'id',
                 'timestamp_sec',
                 'behavior_type',
@@ -180,8 +194,9 @@ class AnalyzeVideoView(APIView):
                 'confidence_score',
                 'metadata',
                 'created_at',
-            )),
-        })
+            ))
+            return Response(payload)
+        return Response(payload, status=status.HTTP_202_ACCEPTED)
 
 
 class VideoHistoryView(APIView):
