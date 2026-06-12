@@ -14,7 +14,9 @@ ultralytics
 opencv-python-headless
 
 # Background job queue (django-rq + Redis)
-# Uncomment when ready to process videos asynchronously:
-# django-rq
-# rq
-# redis
+# Analysis runs through this queue. Jobs execute synchronously in-process by
+# default (no Redis needed for local dev/tests); set RQ_ASYNC=true with a
+# running `rqworker` and Redis to process videos in the background.
+django-rq
+rq
+redis

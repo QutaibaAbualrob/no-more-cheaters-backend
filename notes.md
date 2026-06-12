@@ -258,10 +258,47 @@ Result on 2026-05-22:
 
     TypeScript build and Vite production build completed successfully.
 
+## Async Analysis Queue (django-rq)
+
+Analysis is dispatched through a django-rq `default` queue instead of running
+inline in the request:
+
+    apis/tasks.run_analysis(job_id, actor_id)   # the worker function
+    apis/services.enqueue_analysis(request, video)  # creates the QUEUED job + dispatches
+    apis/services.build_demo_report(session)    # request-free analysis core
+
+`AnalyzeVideoView` now enqueues rather than blocking. Behaviour depends on the
+`RQ_ASYNC` setting:
+
+    RQ_ASYNC off (default): the worker runs in-process before the response, so
+        the endpoint returns 200 with the finished report (alerts + analysis).
+        No Redis or worker process is required — this keeps local dev and the
+        test suite dependency-free.
+
+    RQ_ASYNC=true: the job is handed to Redis and the endpoint returns 202
+        Accepted with `{job_id, status: QUEUED}`; a worker processes it in the
+        background and the client polls the video/report endpoints.
+
+The analysis core never depends on the HTTP request: audit entries are written
+via `services.record_audit_log` (the worker has no request object).
+`services.write_audit_log` now delegates to it for the request-backed path.
+
+Settings (env-driven, see `nomorecheaters/settings.py`):
+
+    REDIS_URL          default redis://127.0.0.1:6379/0
+    RQ_ASYNC           default False (synchronous/eager)
+    RQ_DEFAULT_TIMEOUT default 900 (seconds)
+
+Running the worker in production (Redis must be reachable):
+
+    # set RQ_ASYNC=true, then from no-more-cheaters-backend/nomorecheaters
+    python manage.py rqworker default
+
 ## Remaining Work
 
-Production AI integration is still pending. The current analysis endpoint is a
-deterministic demo workflow that preserves the expected database and API shape.
+Production AI integration is still pending. `run_analysis` currently calls the
+deterministic `build_demo_report` placeholder; replacing it with the real
+YOLO/OpenCV worker is the remaining step and needs no queue/API changes.
 
 Expired video cleanup is still pending. `Video.expires_at` exists, but no
 scheduled cleanup command/task has been added yet.
