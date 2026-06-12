@@ -6,6 +6,9 @@ django-allauth
 django-cors-headers
 requests
 
+# Loads a local .env file for environment-driven settings (optional in prod)
+python-dotenv
+
 # AI Pipeline — YOLO video analysis
 ultralytics
 opencv-python-headless

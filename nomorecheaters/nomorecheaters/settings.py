@@ -10,22 +10,65 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Load variables from a local .env file when python-dotenv is available.
+# This is optional: in production, real environment variables are used and the
+# import simply no-ops if the package isn't installed.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(BASE_DIR / '.env')
+except ImportError:
+    pass
+
+
+def env(key, default=None):
+    """Return an environment variable, or `default` if unset/empty."""
+    value = os.environ.get(key)
+    return value if value not in (None, '') else default
+
+
+def env_bool(key, default=False):
+    """Return an environment variable coerced to a bool."""
+    value = os.environ.get(key)
+    if value is None:
+        return default
+    return value.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def env_list(key, default=None):
+    """Return a comma-separated environment variable as a list of strings."""
+    value = os.environ.get(key)
+    if not value:
+        return list(default or [])
+    return [item.strip() for item in value.split(',') if item.strip()]
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-e!*k^6@gyp))lvmg47d4sgb-ea5u5art#8^_!ak1)#1jjz%oh^'
+# Read from the environment; the insecure literal is only a development fallback.
+SECRET_KEY = env(
+    'DJANGO_SECRET_KEY',
+    'django-insecure-e!*k^6@gyp))lvmg47d4sgb-ea5u5art#8^_!ak1)#1jjz%oh^',
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# Defaults to False (safe for production); set DJANGO_DEBUG=true for local dev.
+DEBUG = env_bool('DJANGO_DEBUG', False)
 
-ALLOWED_HOSTS = []
+# Comma-separated hosts, e.g. "example.com,api.example.com".
+# In DEBUG we default to the usual local hosts so dev works with no config.
+ALLOWED_HOSTS = env_list(
+    'DJANGO_ALLOWED_HOSTS',
+    ['localhost', '127.0.0.1'] if DEBUG else [],
+)
 
 
 # Application definition
@@ -73,12 +116,17 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-# To be used by react or any other domain or api
-CORS_ORIGIN_WHITELIST = ( 
-    "http://localhost:3000", 
-    "http://localhost:8000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
+# To be used by react or any other domain or api.
+# NOTE: django-cors-headers reads CORS_ALLOWED_ORIGINS (the legacy
+# CORS_ORIGIN_WHITELIST name was effectively a no-op). Override via env in prod.
+CORS_ALLOWED_ORIGINS = env_list(
+    'CORS_ALLOWED_ORIGINS',
+    [
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
 )
 
 
@@ -107,6 +155,12 @@ SITE_ID = 1
 ACCOUNT_LOGIN_METHODS = {'email'}
 ACCOUNT_SIGNUP_FIELDS = ['email*', 'username*', 'password1*', 'password2*']
 
+# allauth requires its backend alongside Django's default ModelBackend.
+AUTHENTICATION_BACKENDS = [
+    'django.contrib.auth.backends.ModelBackend',
+    'allauth.account.auth_backends.AuthenticationBackend',
+]
+
 
 
 WSGI_APPLICATION = 'nomorecheaters.wsgi.application'
@@ -115,10 +169,16 @@ WSGI_APPLICATION = 'nomorecheaters.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
+# Defaults to local SQLite (zero-config dev); override via env for production
+# (e.g. ENGINE=django.db.backends.postgresql + the DB_* vars below).
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': env('DB_ENGINE', 'django.db.backends.sqlite3'),
+        'NAME': env('DB_NAME', str(BASE_DIR / 'db.sqlite3')),
+        'USER': env('DB_USER', ''),
+        'PASSWORD': env('DB_PASSWORD', ''),
+        'HOST': env('DB_HOST', ''),
+        'PORT': env('DB_PORT', ''),
     }
 }
 
