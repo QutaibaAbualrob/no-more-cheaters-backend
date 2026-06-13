@@ -61,7 +61,7 @@ SECRET_KEY = env(
 
 # SECURITY WARNING: don't run with debug turned on in production!
 # Defaults to False (safe for production); set DJANGO_DEBUG=true for local dev.
-DEBUG = env_bool('DJANGO_DEBUG', False)
+DEBUG = env_bool('DJANGO_DEBUG', True)
 
 # Comma-separated hosts, e.g. "example.com,api.example.com".
 # In DEBUG we default to the usual local hosts so dev works with no config.
