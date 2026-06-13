@@ -1,15 +1,26 @@
+# Virtual Environment
 venv/
-.env
-db.sqlite3
+.venv/
+env/
+
+# Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+*.cpython-*.pyc
 *.pyo
 *.pyd
-.Python
-*.py[cod]
+
+# Database
+db.sqlite3
+db.sqlite3.bak*
+
+# Environment variables
+.env
 
 # VS Code
 .vscode/
 
-# Compiled Python files
-*.cpython-*.pyc
+# Build
+build/
+dist/
+*.egg-info/
