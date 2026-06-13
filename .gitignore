@@ -1,5 +1,15 @@
+venv/
+.env
+db.sqlite3
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.py[cod]
 
-.venv/
-__pycache__/            *.pt
-*.mp4
-nomorecheaters/__pycache__/
+# VS Code
+.vscode/
+
+# Compiled Python files
+*.cpython-*.pyc
