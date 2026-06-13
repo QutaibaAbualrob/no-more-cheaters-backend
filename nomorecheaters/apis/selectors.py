@@ -18,6 +18,22 @@ def is_admin(user):
     )
 
 
+def is_dean(user):
+    """Return True when the user has dean-level oversight access.
+
+    Deans get read-only visibility across all instructors and exam halls.
+    Admins/superusers implicitly satisfy this check as well.
+    """
+    return bool(
+        user
+        and user.is_authenticated
+        and (
+            user.is_superuser
+            or getattr(user, 'role', '') in {User.Role.ADMIN, User.Role.DEAN}
+        )
+    )
+
+
 def users_visible_to(user):
     """Scope user records to admins, while ordinary users only see themselves."""
     queryset = User.objects.all().order_by('-created_at')

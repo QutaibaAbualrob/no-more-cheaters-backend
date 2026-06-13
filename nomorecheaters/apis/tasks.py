@@ -4,8 +4,9 @@ These callables are enqueued onto the django-rq ``default`` queue and executed
 by an ``rqworker`` process (or synchronously in-process when ``RQ_ASYNC`` is
 off — the dev/test default). They own the :class:`~apis.models.AnalysisJob`
 lifecycle (``QUEUED → PROCESSING → COMPLETED / FAILED``) and delegate the
-actual detection work to the service layer so the demo analysis can later be
-swapped for the real YOLO/OpenCV worker without touching this orchestration.
+actual detection work to the service layer (the YOLO/OpenCV pipeline behind
+:func:`apis.services.build_ai_report`) so the orchestration here stays the same
+regardless of how the analysis itself is implemented.
 """
 
 from django.contrib.auth import get_user_model
@@ -13,7 +14,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from .models import AnalysisJob, AuditLog, ExamSession
-from .services import build_demo_report, record_audit_log
+from .services import build_ai_report, record_audit_log
 
 
 User = get_user_model()
@@ -22,11 +23,12 @@ User = get_user_model()
 def run_analysis(job_id, actor_id=None):
     """Run analysis for a queued :class:`AnalysisJob`.
 
-    Marks the job ``PROCESSING``, builds the Alerts/Report, then marks the job
-    and its session ``COMPLETED`` and writes the completion audit entries. On
-    any failure the job and session are flipped to ``FAILED`` with the error
-    recorded, and the exception is re-raised so the worker registers the
-    failure.
+    Marks the job ``PROCESSING``, runs the YOLO/OpenCV pipeline via
+    :func:`apis.services.build_ai_report` to produce the Alerts/Report, then
+    marks the job and its session ``COMPLETED`` and writes the completion audit
+    entries. On any failure the job and session are flipped to ``FAILED`` with
+    the error recorded, and the exception is re-raised so the worker registers
+    the failure.
 
     Parameters
     ----------
@@ -51,7 +53,7 @@ def run_analysis(job_id, actor_id=None):
 
     try:
         with transaction.atomic():
-            report = build_demo_report(session)
+            report = build_ai_report(session, job=job)
             job.status = AnalysisJob.Status.COMPLETED
             job.completed_at = timezone.now()
             job.save(update_fields=['status', 'completed_at'])

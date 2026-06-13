@@ -222,12 +222,12 @@ def enqueue_analysis(request, video):
         session=session,
         defaults={
             'status': AnalysisJob.Status.QUEUED,
-            'ai_model_version': request.data.get('ai_model_version', 'demo-rules-v1'),
+            'ai_model_version': request.data.get('ai_model_version', 'yolo11x'),
             'frame_sample_rate': request.data.get('frame_sample_rate', 1),
             'started_at': None,
             'completed_at': None,
             'error_message': '',
-            'metadata': {'source': 'api-demo-analysis'},
+            'metadata': {'source': 'api-ai-analysis'},
         },
     )
     session.status = ExamSession.Status.PROCESSING
@@ -283,6 +283,127 @@ def build_demo_report(session):
             'summary': 'Demo analysis completed. Replace this workflow with the production AI pipeline.',
         },
     )
+    return report
+
+
+# Relative importance of each behaviour when combining detections into an
+# overall cheating probability. Direct-evidence objects (a phone in hand)
+# weigh more than soft cues (a turned head).
+_BEHAVIOR_RISK_WEIGHTS = {
+    Alert.BehaviorType.PHONE_DETECTED: 1.0,
+    Alert.BehaviorType.LAPTOPS: 0.9,
+    Alert.BehaviorType.MULTIPLE_FACES: 0.8,
+    Alert.BehaviorType.OTHER_PERSON: 0.8,
+    Alert.BehaviorType.OBJECT_DETECTED: 0.6,
+    Alert.BehaviorType.LOOKING_AWAY: 0.4,
+}
+
+
+def _severity_for(confidence):
+    """Bucket a detection confidence into an :class:`Alert.Severity`."""
+    if confidence >= 0.8:
+        return Alert.Severity.HIGH
+    if confidence >= 0.5:
+        return Alert.Severity.MEDIUM
+    return Alert.Severity.LOW
+
+
+def _cheating_probability(events):
+    """Combine event confidences into an overall 0–1 cheating probability.
+
+    Treats each event as an independent piece of (weighted) evidence and
+    returns the probability that *at least one* is genuine:
+    ``1 - ∏(1 - confidence·weight)``. More/stronger detections push the score
+    up while a single soft cue keeps it modest. Capped at 0.99.
+    """
+    surviving_risk = 1.0
+    for event in events:
+        weight = _BEHAVIOR_RISK_WEIGHTS.get(event.behavior_type, 0.5)
+        surviving_risk *= 1.0 - min(1.0, max(0.0, event.confidence) * weight)
+    return round(min(0.99, 1.0 - surviving_risk), 2)
+
+
+@transaction.atomic
+def build_ai_report(session, job=None):
+    """Run the real YOLO/OpenCV pipeline for *session* and persist findings.
+
+    Drop-in replacement for :func:`build_demo_report`: same contract (takes a
+    session, returns a :class:`Report`, leaves job status and audit logging to
+    the caller) but backed by :func:`apis.ai.analyze_video`. Each consolidated
+    detection event becomes an :class:`Alert`; the aggregate becomes the
+    session's :class:`Report`. When *job* is supplied, the annotated-video path
+    and analysis metadata are stored on it.
+
+    Re-running replaces any prior alerts for the session so the report always
+    reflects the latest analysis. Heavy dependencies (OpenCV, ultralytics) are
+    imported lazily here so the service module stays cheap to import.
+    """
+    from apis.ai import analyze_video
+
+    video = getattr(session, 'video', None)
+    if video is None or not video.file:
+        raise ValueError('Session has no video file to analyze.')
+
+    result = analyze_video(video.file.path)
+
+    # Replace prior detections so a re-analysis is not double-counted.
+    session.alerts.all().delete()
+    alerts = [
+        Alert(
+            session=session,
+            timestamp_sec=event.timestamp_sec,
+            behavior_type=event.behavior_type,
+            severity=_severity_for(event.confidence),
+            confidence_score=round(min(1.0, max(0.0, event.confidence)), 4),
+            metadata={
+                'source': 'ai-pipeline',
+                'start_sec': round(event.start_sec, 3),
+                'end_sec': round(event.end_sec, 3),
+                'duration_sec': round(event.duration_sec, 3),
+                'frame_count': event.frame_count,
+            },
+        )
+        for event in result.events
+    ]
+    Alert.objects.bulk_create(alerts)
+
+    alerts_by_type = dict(result.metadata.get('events_by_type', {}))
+    total_alerts = len(alerts)
+    probability = _cheating_probability(result.events)
+    processing_time = result.metadata.get('processing_time_seconds')
+
+    if total_alerts:
+        summary = (
+            f'AI analysis flagged {total_alerts} event(s) across '
+            f'{result.metadata.get("frames_analyzed", 0)} sampled frame(s). '
+            f'Overall cheating probability: {probability:.0%}.'
+        )
+    else:
+        summary = (
+            'AI analysis completed with no suspicious behaviour detected '
+            f'across {result.metadata.get("frames_analyzed", 0)} sampled frame(s).'
+        )
+
+    report, _created = Report.objects.update_or_create(
+        session=session,
+        defaults={
+            'overall_cheating_probability': probability,
+            'total_alerts': total_alerts,
+            'alerts_by_type': alerts_by_type,
+            'processing_time_seconds': processing_time,
+            'summary': summary,
+        },
+    )
+
+    if job is not None:
+        job_metadata = dict(job.metadata or {})
+        job_metadata.update({
+            'analysis': result.metadata,
+            'annotated_video_path': result.annotated_video_path,
+        })
+        job.metadata = job_metadata
+        job.save(update_fields=['metadata'])
+
     return report
 
 

@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, status
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -6,8 +7,8 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import AnalysisJob, AuditLog, ExamSession, UserPreferences
-from .selectors import is_admin, owned_videos, recent_day_window, users_visible_to
+from .models import AnalysisJob, AuditLog, Exam, ExamSession, UserPreferences
+from .selectors import is_admin, is_dean, owned_videos, recent_day_window, users_visible_to
 from .serializers import (
     ReportReadSerializer,
     UserPreferencesReadSerializer,
@@ -283,3 +284,88 @@ class SystemMetricsView(APIView):
         if not is_admin(request.user):
             raise PermissionDenied('Only administrators can view system metrics.')
         return Response(system_metrics())
+
+
+class InstructorOversightView(APIView):
+    """Dean-level oversight of every instructor and their activity.
+
+    Returns one row per instructor with aggregate exam/session counts so a
+    dean can monitor proctoring activity across the whole platform. Restricted
+    to deans (and admins/superusers, who implicitly satisfy the dean check).
+    """
+
+    def get(self, request):
+        if not is_dean(request.user):
+            raise PermissionDenied('Only deans can view instructor oversight.')
+
+        instructors = (
+            User.objects.filter(role=User.Role.INSTRUCTOR)
+            .annotate(
+                exam_count=Count('exams', distinct=True),
+                session_count=Count('exams__sessions', distinct=True),
+                flagged_sessions=Count(
+                    'exams__sessions',
+                    filter=Q(exams__sessions__alerts__isnull=False),
+                    distinct=True,
+                ),
+            )
+            .order_by('email')
+        )
+        results = [
+            {
+                'id': str(instructor.id),
+                'email': instructor.email,
+                'username': instructor.username,
+                'is_active': instructor.is_active,
+                'exam_count': instructor.exam_count,
+                'session_count': instructor.session_count,
+                'flagged_sessions': instructor.flagged_sessions,
+            }
+            for instructor in instructors
+        ]
+        return Response(results)
+
+
+class HallManagementView(APIView):
+    """Dean-level view of exam 'halls' across all instructors.
+
+    Each exam is surfaced as a hall with its owning instructor and a breakdown
+    of session progress, giving deans a single place to review where exams are
+    being run. Restricted to deans (and admins/superusers).
+    """
+
+    def get(self, request):
+        if not is_dean(request.user):
+            raise PermissionDenied('Only deans can manage halls.')
+
+        exams = (
+            Exam.objects.select_related('instructor')
+            .annotate(
+                session_count=Count('sessions', distinct=True),
+                completed_count=Count(
+                    'sessions',
+                    filter=Q(sessions__status=ExamSession.Status.COMPLETED),
+                    distinct=True,
+                ),
+                pending_count=Count(
+                    'sessions',
+                    filter=Q(sessions__status=ExamSession.Status.PENDING),
+                    distinct=True,
+                ),
+            )
+            .order_by('-created_at')
+        )
+        results = [
+            {
+                'id': str(exam.id),
+                'name': exam.name,
+                'description': exam.description,
+                'instructor_email': exam.instructor.email if exam.instructor else None,
+                'session_count': exam.session_count,
+                'completed_count': exam.completed_count,
+                'pending_count': exam.pending_count,
+                'created_at': exam.created_at,
+            }
+            for exam in exams
+        ]
+        return Response(results)
