@@ -19,6 +19,7 @@ import hashlib
 import shutil
 import tempfile
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -26,6 +27,7 @@ from django.contrib import admin
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
 from django.db import IntegrityError
 from django.test import TestCase, override_settings
 from django.urls import reverse
@@ -51,6 +53,34 @@ from .tasks import run_analysis
 
 
 User = get_user_model()
+
+
+def fake_analysis_result(behavior_type=Alert.BehaviorType.LOOKING_AWAY):
+    """Build a deterministic stand-in for :func:`apis.ai.analyze_video`.
+
+    Lets the queue/lifecycle tests exercise the real ``build_ai_report`` path
+    without OpenCV, model weights, or a genuine video file. Shaped to duck-type
+    an ``AnalysisResult`` with a single consolidated event.
+    """
+    event = SimpleNamespace(
+        behavior_type=behavior_type,
+        confidence=0.72,
+        start_sec=30.0,
+        end_sec=33.0,
+        duration_sec=3.0,
+        frame_count=3,
+        timestamp_sec=30,
+    )
+    return SimpleNamespace(
+        events=[event],
+        annotated_video_path=None,
+        metadata={
+            'events_by_type': {str(behavior_type): 1},
+            'total_events': 1,
+            'frames_analyzed': 10,
+            'processing_time_seconds': 0.5,
+        },
+    )
 
 
 def make_user(*, email='instructor@example.com', username='instructor', role=None):
@@ -563,7 +593,8 @@ class VideoWorkflowAPITests(APITestCase):
         self.assertTrue(serializer.is_valid(), serializer.errors)
         video = serializer.save()
 
-        response = self.client.post(reverse('videos_analyze', kwargs={'pk': video.id}), {}, format='json')
+        with mock.patch('apis.ai.analyze_video', return_value=fake_analysis_result()):
+            response = self.client.post(reverse('videos_analyze', kwargs={'pk': video.id}), {}, format='json')
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         session.refresh_from_db()
@@ -870,7 +901,8 @@ class AsyncQueueWiringTests(APITestCase):
     def test_eager_analyze_completes_job_and_returns_report(self):
         video = self._make_video()
 
-        response = self.client.post(reverse('videos_analyze', kwargs={'pk': video.id}), {}, format='json')
+        with mock.patch('apis.ai.analyze_video', return_value=fake_analysis_result()):
+            response = self.client.post(reverse('videos_analyze', kwargs={'pk': video.id}), {}, format='json')
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['status'], AnalysisJob.Status.COMPLETED)
@@ -919,7 +951,7 @@ class AsyncQueueWiringTests(APITestCase):
         video = self._make_video()
         job = AnalysisJob.objects.create(session=video.session, status=AnalysisJob.Status.QUEUED)
 
-        with mock.patch('apis.tasks.build_demo_report', side_effect=RuntimeError('boom')):
+        with mock.patch('apis.tasks.build_ai_report', side_effect=RuntimeError('boom')):
             with self.assertRaises(RuntimeError):
                 run_analysis(str(job.id), actor_id=str(self.user.id))
 
@@ -930,3 +962,83 @@ class AsyncQueueWiringTests(APITestCase):
             ExamSession.objects.get(id=video.session.id).status,
             ExamSession.Status.FAILED,
         )
+
+
+class PreanalyzeDemosCommandTests(TestCase):
+    """Task 1.5: the ``preanalyze_demos`` management command.
+
+    Exercises both the import-only path (``--no-analyze``) and the full
+    analyze path with the AI pipeline mocked, so no model weights or real
+    video decoding are required.
+    """
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.clips_dir = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
+        shutil.rmtree(self.clips_dir, ignore_errors=True)
+
+    def _write_clip(self, name='demo-one.mp4', content=b'demo clip bytes'):
+        path = Path(self.clips_dir) / name
+        path.write_bytes(content)
+        return str(path)
+
+    def test_no_analyze_imports_video_and_queues_job(self):
+        clip = self._write_clip()
+
+        call_command(
+            'preanalyze_demos', clip, '--no-analyze',
+            '--instructor', 'demo@example.com', '--exam', 'Demo Exam',
+            verbosity=0,
+        )
+
+        exam = Exam.objects.get(name='Demo Exam')
+        self.assertEqual(exam.instructor.email, 'demo@example.com')
+        self.assertEqual(exam.instructor.role, User.Role.INSTRUCTOR)
+        session = ExamSession.objects.get(exam=exam)
+        self.assertEqual(session.student_identifier, 'demo-one')
+        self.assertTrue(hasattr(session, 'video'))
+        job = AnalysisJob.objects.get(session=session)
+        self.assertEqual(job.status, AnalysisJob.Status.QUEUED)
+        # No analysis ran, so no report yet.
+        self.assertFalse(Report.objects.filter(session=session).exists())
+
+    def test_analyze_path_seeds_alerts_and_report(self):
+        clip = self._write_clip(name='cheater.mp4')
+
+        with mock.patch('apis.ai.analyze_video', return_value=fake_analysis_result()):
+            call_command(
+                'preanalyze_demos', '--dir', self.clips_dir,
+                '--instructor', 'demo@example.com', verbosity=0,
+            )
+
+        session = ExamSession.objects.get(student_identifier='cheater')
+        job = AnalysisJob.objects.get(session=session)
+        self.assertEqual(job.status, AnalysisJob.Status.COMPLETED)
+        self.assertEqual(session.status, ExamSession.Status.COMPLETED)
+        self.assertEqual(Alert.objects.filter(session=session).count(), 1)
+        report = Report.objects.get(session=session)
+        self.assertEqual(report.total_alerts, 1)
+        # Full audit trail recorded by the command + worker.
+        for action in (AuditLog.ActionType.ANALYSIS_STARTED,
+                       AuditLog.ActionType.ANALYSIS_COMPLETED,
+                       AuditLog.ActionType.REPORT_GENERATED):
+            self.assertTrue(
+                AuditLog.objects.filter(action=action).exists(),
+                f'missing audit entry for {action}',
+            )
+
+    def test_duplicate_clip_is_skipped_without_force(self):
+        clip = self._write_clip()
+        with mock.patch('apis.ai.analyze_video', return_value=fake_analysis_result()):
+            call_command('preanalyze_demos', clip, '--instructor', 'demo@example.com', verbosity=0)
+            # Second run with identical content imports nothing new.
+            call_command('preanalyze_demos', clip, '--instructor', 'demo@example.com', verbosity=0)
+
+        self.assertEqual(Video.objects.count(), 1)
+        self.assertEqual(ExamSession.objects.count(), 1)

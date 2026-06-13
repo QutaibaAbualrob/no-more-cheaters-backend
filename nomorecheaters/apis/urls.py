@@ -7,6 +7,8 @@ from .views import (
     DashboardStatsView,
     DeleteUserView,
     GlobalThresholdsView,
+    HallManagementView,
+    InstructorOversightView,
     MyPreferencesView,
     MyThresholdsView,
     SystemLogsView,
@@ -35,6 +37,8 @@ urlpatterns = [
     path('thresholds/global/', GlobalThresholdsView.as_view(), name='global_thresholds'),
     path('system/logs/', SystemLogsView.as_view(), name='system_logs'),
     path('system/metrics/', SystemMetricsView.as_view(), name='system_metrics'),
+    path('dean/instructors/', InstructorOversightView.as_view(), name='dean_instructor_oversight'),
+    path('dean/halls/', HallManagementView.as_view(), name='dean_hall_management'),
     path('<uuid:pk>/activity/', UserActivityView.as_view(), name='user_activity'),
     path('<uuid:pk>/', DeleteUserView.as_view(), name='delete_user'),
 ]

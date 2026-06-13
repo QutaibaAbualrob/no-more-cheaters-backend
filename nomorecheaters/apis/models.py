@@ -54,6 +54,7 @@ class User(AbstractUser):
 
     class Role(models.TextChoices):
         ADMIN = 'ADMIN', 'Administrator'
+        DEAN = 'DEAN', 'Dean'
         INSTRUCTOR = 'INSTRUCTOR', 'Instructor'
 
     role = models.CharField(
@@ -240,6 +241,7 @@ class Alert(models.Model):
         LOOKING_AWAY = 'LOOKING_AWAY', 'Looking Away'
         OTHER_PERSON = 'OTHER_PERSON', 'Other Person Detected'
         OBJECT_DETECTED = 'OBJECT_DETECTED', 'Unauthorized Object Detected'
+        LAPTOPS = 'LAPTOPS', 'Laptop Detected'
 
     class Severity(models.TextChoices):
         LOW = 'LOW', 'Low'
