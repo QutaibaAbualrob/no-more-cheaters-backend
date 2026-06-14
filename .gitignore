@@ -28,3 +28,17 @@ dist/
 
 echo "*.pt" >> .gitignore
 echo "*.pth" >> .gitignore
+
+
+# Media files
+media/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# ML Models
+*.pt
+*.pth
+*.onnx
