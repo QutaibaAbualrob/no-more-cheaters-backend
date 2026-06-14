@@ -23,4 +23,8 @@ db.sqlite3.bak*
 # Build
 build/
 dist/
-*.egg-info/
+*.egg-info/*.pt
+*.pth
+
+echo "*.pt" >> .gitignore
+echo "*.pth" >> .gitignore
