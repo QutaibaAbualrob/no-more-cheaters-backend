@@ -3,7 +3,7 @@ from datetime import timedelta
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 
-from .models import ExamSession, Report, Video
+from .models import ExamSession, Report, Student, Video
 
 
 User = get_user_model()
@@ -40,6 +40,14 @@ def users_visible_to(user):
     if is_admin(user):
         return queryset
     return queryset.filter(pk=user.pk)
+
+
+def owned_students(user):
+    """Scope roster students to their owner; admins see every roster."""
+    queryset = Student.objects.select_related('owner')
+    if is_admin(user):
+        return queryset
+    return queryset.filter(owner=user)
 
 
 def owned_sessions(user):

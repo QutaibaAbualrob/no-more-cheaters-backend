@@ -24,7 +24,7 @@ from rest_framework import serializers
 
 from .models import (
     Alert, AnalysisJob, AuditLog, Exam, ExamSession, Report,
-    SystemSettings, UserPreferences, Video,
+    Student, SystemSettings, UserPreferences, Video,
 )
 
 
@@ -112,6 +112,43 @@ class UserPreferencesUpdateSerializer(serializers.ModelSerializer):
             'theme',
             'metadata',
         ]
+
+
+class StudentSerializer(serializers.ModelSerializer):
+    """Read/write serializer for an instructor's roster entry.
+
+    ``owner`` is taken from the request, never the client. The per-owner
+    uniqueness of ``student_id`` is enforced in :meth:`validate_student_id`
+    so the API returns a friendly field error instead of a database 500.
+    """
+
+    class Meta:
+        model = Student
+        fields = [
+            'id',
+            'student_id',
+            'full_name',
+            'faculty',
+            'major',
+            'academic_year',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate_student_id(self, value):
+        """Reject a duplicate student_id within the same owner's roster."""
+        request = self.context['request']
+        queryset = Student.objects.filter(owner=request.user, student_id=value)
+        if self.instance is not None:
+            queryset = queryset.exclude(pk=self.instance.pk)
+        if queryset.exists():
+            raise serializers.ValidationError('A student with this ID already exists.')
+        return value
+
+    def create(self, validated_data):
+        request = self.context['request']
+        return Student.objects.create(owner=request.user, **validated_data)
 
 
 class ExamReadSerializer(serializers.ModelSerializer):
@@ -272,6 +309,12 @@ class VideoUploadSerializer(serializers.ModelSerializer):
         model = Video
         fields = ['session', 'file', 'duration_seconds']
         extra_kwargs = {
+            # `session` is optional at the data layer: the view resolves (or
+            # auto-creates) one and passes it to ``save(session=...)``. This lets
+            # the view hand ``request.data`` straight to the serializer without
+            # copying the QueryDict — copying deep-copies the uploaded file and
+            # raises "cannot pickle 'BufferedRandom' instances".
+            'session': {'required': False, 'allow_null': True},
             'duration_seconds': {'required': False, 'allow_null': True},
         }
 

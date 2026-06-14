@@ -3,7 +3,7 @@ from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 
 from .models import (
     Alert, AnalysisJob, AuditLog, Exam, ExamSession, Report,
-    SystemSettings, User, UserPreferences, Video,
+    Student, SystemSettings, User, UserPreferences, Video,
 )
 
 
@@ -21,6 +21,17 @@ class UserAdmin(DjangoUserAdmin):
     add_fieldsets = DjangoUserAdmin.add_fieldsets + (
         ('No More Cheaters profile', {'fields': ('email', 'role')}),
     )
+
+
+@admin.register(Student)
+class StudentAdmin(admin.ModelAdmin):
+    list_display = ['full_name', 'student_id', 'owner', 'faculty', 'major', 'academic_year', 'created_at']
+    list_filter = ['faculty', 'academic_year', 'created_at']
+    search_fields = ['full_name', 'student_id', 'owner__email', 'major']
+    autocomplete_fields = ['owner']
+    readonly_fields = ['id', 'created_at', 'updated_at']
+    list_select_related = ['owner']
+    date_hierarchy = 'created_at'
 
 
 @admin.register(Exam)

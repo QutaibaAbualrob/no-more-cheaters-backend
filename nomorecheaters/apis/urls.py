@@ -11,6 +11,8 @@ from .views import (
     InstructorOversightView,
     MyPreferencesView,
     MyThresholdsView,
+    StudentDetailView,
+    StudentListCreateView,
     SystemLogsView,
     SystemMetricsView,
     ThresholdsView,
@@ -25,6 +27,8 @@ from .views import (
 urlpatterns = [
     path('', UsersListView.as_view(), name='users_list'),
     path('me/preferences/', MyPreferencesView.as_view(), name='my_preferences'),
+    path('students/', StudentListCreateView.as_view(), name='students_list'),
+    path('students/<uuid:pk>/', StudentDetailView.as_view(), name='students_detail'),
     path('videos/', VideoListView.as_view(), name='videos_list'),
     path('videos/upload/', VideoUploadView.as_view(), name='videos_upload'),
     path('videos/<uuid:pk>/', VideoDetailView.as_view(), name='videos_detail'),

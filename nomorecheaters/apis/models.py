@@ -108,6 +108,49 @@ class UserPreferences(models.Model):
         return f"Preferences for {self.user.email}"
 
 
+class Student(models.Model):
+    """A student record in an instructor's roster.
+
+    Distinct from :class:`User` (which models authenticated instructors/admins):
+    students never log in. The roster exists so instructors can manage the
+    people whose exams they proctor, and the ``student_id`` is the identifier the
+    AI pipeline uses to match a person inside a recording (see ``ExamSession``).
+
+    Scoped per owner so each instructor maintains an independent roster; the
+    ``(owner, student_id)`` pair is unique to prevent duplicate IDs per account.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='students',
+    )
+    student_id = models.CharField(max_length=64, null=False, blank=False)
+    full_name = models.CharField(max_length=255, null=False, blank=False)
+    faculty = models.CharField(max_length=120, blank=True)
+    major = models.CharField(max_length=120, blank=True)
+    academic_year = models.CharField(max_length=40, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['owner', 'created_at']),
+            models.Index(fields=['student_id']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['owner', 'student_id'],
+                name='unique_student_id_per_owner',
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.full_name} ({self.student_id})"
+
+
 class Exam(models.Model):
     """An exam created by an instructor.
 

@@ -8,9 +8,12 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import AnalysisJob, AuditLog, Exam, ExamSession, UserPreferences
-from .selectors import is_admin, is_dean, owned_videos, recent_day_window, users_visible_to
+from .selectors import (
+    is_admin, is_dean, owned_students, owned_videos, recent_day_window, users_visible_to,
+)
 from .serializers import (
     ReportReadSerializer,
+    StudentSerializer,
     UserPreferencesReadSerializer,
     UserPreferencesUpdateSerializer,
     UserReadSerializer,
@@ -74,6 +77,34 @@ class DeleteUserView(generics.RetrieveUpdateDestroyAPIView):
             metadata={'email': instance.email},
         )
         instance.delete()
+
+
+class StudentListCreateView(generics.ListCreateAPIView):
+    """List the current user's roster students, or add a new one.
+
+    The serializer reads ``owner`` from the request, so creates are always
+    scoped to the authenticated instructor.
+    """
+
+    serializer_class = StudentSerializer
+
+    def get_queryset(self):
+        return owned_students(self.request.user)
+
+    def get_serializer_context(self):
+        return {**super().get_serializer_context(), 'request': self.request}
+
+
+class StudentDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """Retrieve, update, or delete a single roster student (owner/admin only)."""
+
+    serializer_class = StudentSerializer
+
+    def get_queryset(self):
+        return owned_students(self.request.user)
+
+    def get_serializer_context(self):
+        return {**super().get_serializer_context(), 'request': self.request}
 
 
 class UserActivityView(APIView):
@@ -141,19 +172,28 @@ class VideoUploadView(APIView):
         if upload is None:
             raise ValidationError({'file': 'This field is required.'})
 
-        data = request.data.copy()
-        if not data.get('session'):
+        # Pass request.data straight through — never copy it. Copying a
+        # multipart QueryDict deep-copies the uploaded file handle and raises
+        # "TypeError: cannot pickle 'BufferedRandom' instances".
+        serializer = VideoUploadSerializer(
+            data=request.data,
+            context={'request': request},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        # Resolve the target session. When the client supplies one it is already
+        # validated (ownership) by the serializer; otherwise auto-create/reuse a
+        # direct-upload session for this instructor.
+        session = serializer.validated_data.get('session')
+        if session is None:
             session = get_available_upload_session(
                 instructor=request.user,
                 upload=upload,
-                exam_name=data.get('exam_name', ''),
-                student_identifier=data.get('student_identifier', ''),
+                exam_name=request.data.get('exam_name', ''),
+                student_identifier=request.data.get('student_identifier', ''),
             )
-            data['session'] = str(session.id)
 
-        serializer = VideoUploadSerializer(data=data, context={'request': request})
-        serializer.is_valid(raise_exception=True)
-        video = serializer.save()
+        video = serializer.save(session=session)
         write_audit_log(
             request,
             AuditLog.ActionType.VIDEO_UPLOADED,

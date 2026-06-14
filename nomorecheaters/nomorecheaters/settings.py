@@ -132,6 +132,10 @@ CORS_ALLOWED_ORIGINS = env_list(
     ],
 )
 
+# Base URL of the React SPA. Used to build the email-confirmation link so it
+# lands on the frontend's /account/verify-email/<key> page instead of the API.
+FRONTEND_URL = env('FRONTEND_URL', 'http://localhost:5173')
+
 
 ROOT_URLCONF = 'nomorecheaters.urls'
 
