@@ -156,7 +156,7 @@ TEMPLATES = [
 
 # ── Email (workspace invites, verification, password resets) ──────────────────
 # When EMAIL_HOST_PASSWORD is set → Resend SMTP. Otherwise → console (dev).
-_EMAIL_PASSWORD = env('EMAIL_HOST_PASSWORD', '')
+_EMAIL_PASSWORD=env('E...RD', 're_93kfTXxH_DuggCpxZLdiJ9h5u44KKvxFc')
 if _EMAIL_PASSWORD:
     EMAIL_BACKEND = env('EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend')
     EMAIL_HOST = env('EMAIL_HOST', 'smtp.resend.com')
@@ -170,10 +170,17 @@ DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', 'noreply@nomorecheater.online')
 
 SITE_ID = 1
 
-# Settings for allauth email login.
+# ── Allauth — email behaviour ────────────────────────────────────────────
 ACCOUNT_LOGIN_METHODS = {'email'}
 ACCOUNT_SIGNUP_FIELDS = ['email*', 'password1*', 'password2*']
 ACCOUNT_EMAIL_VERIFICATION = env('ACCOUNT_EMAIL_VERIFICATION', 'optional')
+ACCOUNT_EMAIL_SUBJECT_PREFIX = env('ACCOUNT_EMAIL_SUBJECT_PREFIX', '[No More Cheaters] ')
+# How long verification / password-reset links remain valid (days).
+ACCOUNT_EMAIL_CONFIRMATION_EXPIRE_DAYS = 3
+# Prevent enumeration: always say "email sent" even if the account doesn't exist.
+ACCOUNT_PREVENT_ENUMERATION = True
+# Allow login immediately after signup (unless verification is mandatory).
+ACCOUNT_LOGIN_ON_EMAIL_CONFIRMATION = True
 
 # allauth requires its backend alongside Django's default ModelBackend.
 AUTHENTICATION_BACKENDS = [
