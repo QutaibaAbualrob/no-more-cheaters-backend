@@ -3,7 +3,7 @@ venv/
 .venv/
 env/
 
-# Python cache
+# Python cache (NOT tracked — remove from index if already committed)
 __pycache__/
 *.py[cod]
 *.cpython-*.pyc
