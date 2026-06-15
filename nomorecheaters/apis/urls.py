@@ -2,12 +2,15 @@
 from django.urls import path
 
 from .views import (
+    AllWorkspaceMembersView,
     AnalyzeVideoView,
     AutoSessionDetailView,
     AutoSessionListCreateView,
     DashboardActivityView,
     DashboardStatsView,
     DeleteUserView,
+    DismissAllNotificationsView,
+    DismissNotificationView,
     ExamListView,
     ExamResolveView,
     GlobalThresholdsView,
@@ -18,6 +21,7 @@ from .views import (
     MyPreferencesView,
     MyThresholdsView,
     NotificationListView,
+    SessionReportView,
     SessionVideoStatusView,
     StudentDetailView,
     StudentListCreateView,
@@ -32,7 +36,11 @@ from .views import (
     VideoHistoryView,
     VideoListView,
     VideoUploadView,
+    WorkspaceDetailView,
     WorkspaceInviteView,
+    WorkspaceListCreateView,
+    WorkspaceMemberDetailView,
+    WorkspaceMembersView,
 )
 
 urlpatterns = [
@@ -58,6 +66,13 @@ urlpatterns = [
     path('notifications/', NotificationListView.as_view(), name='notifications_list'),
     path('notifications/unread/', UnreadNotificationsView.as_view(), name='notifications_unread'),
     path('notifications/mark-read/', MarkNotificationsReadView.as_view(), name='notifications_mark_read'),
+    path('notifications/dismiss-all/', DismissAllNotificationsView.as_view(), name='notifications_dismiss_all'),
+    path('notifications/<uuid:pk>/dismiss/', DismissNotificationView.as_view(), name='notifications_dismiss'),
+    path('workspaces/', WorkspaceListCreateView.as_view(), name='workspaces_list'),
+    path('workspaces/members/all/', AllWorkspaceMembersView.as_view(), name='workspace_members_all'),
+    path('workspaces/<uuid:pk>/', WorkspaceDetailView.as_view(), name='workspace_detail'),
+    path('workspaces/<uuid:workspace_id>/members/', WorkspaceMembersView.as_view(), name='workspace_members'),
+    path('workspaces/<uuid:workspace_id>/members/<uuid:user_id>/', WorkspaceMemberDetailView.as_view(), name='workspace_member_detail'),
     path('workspace/invite/', WorkspaceInviteView.as_view(), name='workspace_invite'),
     path('invite/<uuid:token>/accept/', InviteRespondView.as_view(accepted=True), name='invite_accept'),
     path('invite/<uuid:token>/decline/', InviteRespondView.as_view(accepted=False), name='invite_decline'),
@@ -66,6 +81,7 @@ urlpatterns = [
     path('exams/', ExamListView.as_view(), name='exams_list'),
     path('exams/resolve/', ExamResolveView.as_view(), name='exams_resolve'),
     path('sessions/<uuid:exam_id>/video-status/', SessionVideoStatusView.as_view(), name='session_video_status'),
+    path('sessions/<uuid:session_id>/report/', SessionReportView.as_view(), name='session_report'),
     path('<uuid:pk>/activity/', UserActivityView.as_view(), name='user_activity'),
     path('<uuid:pk>/', DeleteUserView.as_view(), name='delete_user'),
 ]

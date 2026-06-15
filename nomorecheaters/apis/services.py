@@ -12,7 +12,8 @@ from rest_framework.exceptions import ValidationError
 
 from .models import (
     Alert, AnalysisJob, AuditLog, Exam, ExamSession, Notification, Report,
-    SystemSettings, UserPreferences, Video, WorkspaceInvite,
+    SystemSettings, UserPreferences, Video, Workspace, WorkspaceInvite,
+    WorkspaceMembership,
 )
 from .selectors import is_admin, owned_reports, owned_sessions, owned_videos, recent_day_window
 
@@ -84,49 +85,63 @@ def create_notification(recipient, notif_type, title, body='', metadata=None):
     )
 
 
-def send_workspace_invite(dean, instructor, exam):
-    """Create a workspace invite, email the instructor, and notify them in-app.
+def send_workspace_invite(dean, instructor, exam=None, workspace=None):
+    """Create an invite, email the instructor, and notify them in-app.
 
-    The email contains accept/decline links that point at the frontend
-    (``FRONTEND_URL``); the instructor does not need to be logged in to respond.
-    Returns the created :class:`WorkspaceInvite`.
+    Targets a *workspace* (joining it on accept) and/or an *exam* (legacy
+    supervisor assignment); at least one should be supplied. The email contains
+    accept/decline links pointing at the frontend (``FRONTEND_URL``); the
+    instructor does not need to be logged in to respond. Returns the created
+    :class:`WorkspaceInvite`.
     """
-    invite = WorkspaceInvite.objects.create(dean=dean, instructor=instructor, exam=exam)
+    invite = WorkspaceInvite.objects.create(
+        dean=dean, instructor=instructor, exam=exam, workspace=workspace,
+    )
+    target = invite.target_name
 
     frontend = settings.FRONTEND_URL.rstrip('/')
     accept_url = f'{frontend}/invite/{invite.token}/accept'
     decline_url = f'{frontend}/invite/{invite.token}/decline'
+    if workspace is not None:
+        action_line = f'{dean.email} has invited you to join the workspace "{target}"'
+    else:
+        action_line = f'{dean.email} has assigned you to supervise the exam "{target}"'
     message = (
         'Hello,\n\n'
-        f'{dean.email} has assigned you to supervise the exam "{exam.name}" '
-        'on the No More Cheaters platform.\n\n'
+        f'{action_line} on the No More Cheaters platform.\n\n'
         f'Accept:  {accept_url}\n'
         f'Decline: {decline_url}\n\n'
         'If you did not expect this invitation you can safely ignore this email.\n'
     )
     send_mail(
-        subject=f'Invitation to supervise "{exam.name}"',
+        subject=f'Invitation to join "{target}"',
         message=message,
         from_email=settings.DEFAULT_FROM_EMAIL,
         recipient_list=[instructor.email],
         fail_silently=False,
     )
 
+    metadata = {'invite_id': str(invite.id)}
+    if workspace is not None:
+        metadata['workspace_id'] = str(workspace.id)
+    if exam is not None:
+        metadata['exam_id'] = str(exam.id)
     create_notification(
         instructor,
         Notification.NotifType.EXAM_ASSIGNED,
-        f'Assigned to {exam.name}',
-        f'{dean.email} invited you to supervise "{exam.name}".',
-        metadata={'invite_id': str(invite.id), 'exam_id': str(exam.id)},
+        f'Invited to {target}',
+        f'{dean.email} invited you to "{target}".',
+        metadata=metadata,
     )
     return invite
 
 
 def respond_to_workspace_invite(invite, accepted):
-    """Record an accept/decline response and notify the dean.
+    """Record an accept/decline response, join the workspace, and notify the dean.
 
     Idempotent: once an invite has been responded to, repeat calls leave it
-    unchanged and send no further notifications.
+    unchanged and send no further notifications. Accepting a workspace invite
+    creates a :class:`WorkspaceMembership` (no-op if one already exists).
     """
     if invite.status != WorkspaceInvite.Status.PENDING:
         return invite
@@ -137,18 +152,28 @@ def respond_to_workspace_invite(invite, accepted):
     invite.responded_at = timezone.now()
     invite.save(update_fields=['status', 'responded_at'])
 
+    if accepted and invite.workspace_id:
+        WorkspaceMembership.objects.get_or_create(
+            workspace=invite.workspace, instructor=invite.instructor,
+        )
+
     verb = 'accepted' if accepted else 'declined'
     notif_type = (
         Notification.NotifType.INVITE_ACCEPTED
         if accepted
         else Notification.NotifType.INVITE_DECLINED
     )
+    metadata = {'invite_id': str(invite.id)}
+    if invite.workspace_id:
+        metadata['workspace_id'] = str(invite.workspace_id)
+    if invite.exam_id:
+        metadata['exam_id'] = str(invite.exam_id)
     create_notification(
         invite.dean,
         notif_type,
         f'Invite {verb}',
-        f'{invite.instructor.email} {verb} the invite to "{invite.exam.name}".',
-        metadata={'invite_id': str(invite.id), 'exam_id': str(invite.exam_id)},
+        f'{invite.instructor.email} {verb} your invite to "{invite.target_name}".',
+        metadata=metadata,
     )
     return invite
 
@@ -454,6 +479,61 @@ def _cheating_probability(events):
     return round(min(0.99, 1.0 - surviving_risk), 2)
 
 
+def _attach_alert_evidence(video, session, alerts):
+    """Attach per-alert visual evidence: face crop, 3-second clip, person id.
+
+    Tracks faces across the recording once (see :mod:`apis.ai.face_tracker`),
+    then for each alert resolves the flagged person near its timestamp, crops
+    their face, and cuts a short clip. Best-effort and fully isolated: any
+    OpenCV/IO failure simply leaves that artifact empty and never aborts the
+    analysis. URLs are stored as ``/media/...`` web paths (served by Django in
+    DEBUG); the report serializer turns them into absolute URLs for the client.
+    """
+    if not alerts or not getattr(video, 'file', None):
+        return
+
+    try:
+        from apis.ai.face_tracker import extract_clip, extract_face_crop, track_persons
+    except Exception:  # noqa: BLE001 — OpenCV missing → skip evidence entirely
+        return
+
+    video_path = video.file.path
+    media_root = Path(settings.MEDIA_ROOT)
+    media_url = '/' + settings.MEDIA_URL.strip('/')
+
+    try:
+        index = track_persons(video_path)
+    except Exception:  # noqa: BLE001
+        index = None
+
+    for alert in alerts:
+        person_id, bbox = 'person_1', None
+        if index is not None:
+            try:
+                person_id, bbox = index.query(alert.timestamp_sec)
+            except Exception:  # noqa: BLE001
+                person_id, bbox = 'person_1', None
+
+        metadata = dict(alert.metadata or {})
+        metadata['person_id'] = person_id
+        alert.metadata = metadata
+
+        snapshot_rel = f'snapshots/{session.id}/{alert.id}.jpg'
+        clip_rel = f'clips/{session.id}/{alert.id}.mp4'
+        try:
+            if extract_face_crop(video_path, alert.timestamp_sec, bbox, str(media_root / snapshot_rel)):
+                alert.snapshot_url = f'{media_url}/{snapshot_rel}'
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if extract_clip(video_path, alert.timestamp_sec, str(media_root / clip_rel)):
+                alert.clip_url = f'{media_url}/{clip_rel}'
+        except Exception:  # noqa: BLE001
+            pass
+
+    Alert.objects.bulk_update(alerts, ['snapshot_url', 'clip_url', 'metadata'])
+
+
 @transaction.atomic
 def build_ai_report(session, job=None):
     """Run the real YOLO/OpenCV pipeline for *session* and persist findings.
@@ -497,6 +577,9 @@ def build_ai_report(session, job=None):
         for event in result.events
     ]
     Alert.objects.bulk_create(alerts)
+
+    # Enrich each alert with a face crop, a 3-second clip, and a person id.
+    _attach_alert_evidence(video, session, alerts)
 
     alerts_by_type = dict(result.metadata.get('events_by_type', {}))
     total_alerts = len(alerts)

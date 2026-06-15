@@ -10,11 +10,12 @@ from rest_framework.views import APIView
 
 from .models import (
     AnalysisJob, AuditLog, AutoExamSession, Exam, ExamSession, Notification,
-    UserPreferences, Video, WorkspaceInvite,
+    UserPreferences, Video, Workspace, WorkspaceInvite, WorkspaceMembership,
 )
 from .selectors import (
     actionable_exams, assigned_supervisor_ids, can_supervise_exam,
-    is_admin, is_dean, owned_students, owned_videos, recent_day_window, users_visible_to,
+    is_admin, is_dean, owned_sessions, owned_students, owned_videos,
+    recent_day_window, users_visible_to,
 )
 from .serializers import (
     AutoExamSessionCreateSerializer,
@@ -30,6 +31,9 @@ from .serializers import (
     VideoReadSerializer,
     VideoUploadSerializer,
     WorkspaceInviteSerializer,
+    WorkspaceMemberSerializer,
+    WorkspaceSerializer,
+    WorkspaceWriteSerializer,
 )
 from .services import (
     activity_series_for,
@@ -297,6 +301,86 @@ class VideoHistoryView(APIView):
         return Response(serializer.data)
 
 
+def _person_sort_key(person_id):
+    """Sort ``person_1``, ``person_2`` … numerically (non-numeric ids last)."""
+    try:
+        return (0, int(str(person_id).rsplit('_', 1)[-1]))
+    except (ValueError, IndexError):
+        return (1, 0)
+
+
+class SessionReportView(APIView):
+    """Detailed analysis report for one session, grouped by detected person.
+
+    Feeds the Analysis Reports page (deep-linked from History). Each alert
+    carries its face crop, 3-second clip, behaviour label, severity, confidence
+    and timestamp; alerts are grouped under the person they were attributed to
+    so multi-student recordings get one section per student.
+    """
+
+    def get(self, request, session_id):
+        session = get_object_or_404(
+            owned_sessions(request.user), pk=session_id,
+        )
+        report = getattr(session, 'report', None)
+        if report is None:
+            return Response(
+                {'detail': 'No analysis report exists for this session yet.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        def absolute(url):
+            return request.build_absolute_uri(url) if url else None
+
+        video = getattr(session, 'video', None)
+
+        groups = {}
+        for alert in session.alerts.all().order_by('timestamp_sec', 'created_at'):
+            person_id = (alert.metadata or {}).get('person_id') or 'person_1'
+            payload = {
+                'id': str(alert.id),
+                'behavior_type': alert.behavior_type,
+                'behavior_label': alert.get_behavior_type_display(),
+                'severity': alert.severity,
+                'confidence_score': alert.confidence_score,
+                'timestamp_sec': alert.timestamp_sec,
+                'snapshot_url': absolute(alert.snapshot_url),
+                'clip_url': absolute(alert.clip_url),
+                'metadata': alert.metadata,
+            }
+            group = groups.setdefault(person_id, [])
+            group.append((alert.confidence_score, payload))
+
+        persons = []
+        for person_id in sorted(groups, key=_person_sort_key):
+            scored = groups[person_id]
+            # Section face = the snapshot of this person's highest-confidence alert.
+            face_url = None
+            for _conf, payload in sorted(scored, key=lambda item: item[0], reverse=True):
+                if payload['snapshot_url']:
+                    face_url = payload['snapshot_url']
+                    break
+            label = 'Person ' + str(person_id).rsplit('_', 1)[-1]
+            persons.append({
+                'person_id': person_id,
+                'label': label,
+                'face_url': face_url,
+                'alert_count': len(scored),
+                'alerts': [payload for _conf, payload in scored],
+            })
+
+        return Response({
+            'session_id': str(session.id),
+            'exam_name': session.exam.name,
+            'student_identifier': session.student_identifier,
+            'status': session.status,
+            'video_url': absolute(video.file.url) if video and video.file else None,
+            'report': ReportReadSerializer(report).data,
+            'person_count': len(persons),
+            'persons': persons,
+        })
+
+
 class DashboardStatsView(APIView):
     """Aggregate counts used by the dashboard cards."""
 
@@ -374,44 +458,85 @@ class SystemMetricsView(APIView):
         return Response(system_metrics())
 
 
-class InstructorOversightView(APIView):
-    """Dean-level oversight of every instructor and their activity.
+def accepted_instructor_rows(user):
+    """Rows for instructors with an ACCEPTED workspace membership.
 
-    Returns one row per instructor with aggregate exam/session counts so a
-    dean can monitor proctoring activity across the whole platform. Restricted
-    to deans (and admins/superusers, who implicitly satisfy the dean check).
+    A membership only exists once an invite has been accepted (and is deleted on
+    removal / never created on decline), so this is the single source of truth
+    for "which instructors a dean may use" — every picker and the oversight
+    roster read from it, ensuring a declined or removed instructor disappears
+    everywhere. Scoped to the dean's own workspaces; admins see members across
+    all workspaces. Each row carries the picker fields plus oversight stats.
+    """
+    memberships = WorkspaceMembership.objects.all()
+    if not is_admin(user):
+        memberships = memberships.filter(workspace__owner=user)
+
+    earliest_joined = {}
+    for instructor_id, joined_at in memberships.values_list('instructor_id', 'joined_at'):
+        if instructor_id not in earliest_joined or joined_at < earliest_joined[instructor_id]:
+            earliest_joined[instructor_id] = joined_at
+
+    if not earliest_joined:
+        return []
+
+    users = (
+        User.objects.filter(id__in=earliest_joined.keys())
+        .annotate(
+            exam_count=Count('exams', distinct=True),
+            session_count=Count('exams__sessions', distinct=True),
+            flagged_sessions=Count(
+                'exams__sessions',
+                filter=Q(exams__sessions__alerts__isnull=False),
+                distinct=True,
+            ),
+        )
+        .order_by('email')
+    )
+    rows = []
+    for instructor in users:
+        display_name = (instructor.get_full_name() or '').strip() or instructor.username
+        rows.append({
+            'id': str(instructor.id),
+            'user_id': str(instructor.id),
+            'email': instructor.email,
+            'username': instructor.username,
+            'display_name': display_name,
+            'role': instructor.role,
+            'is_active': instructor.is_active,
+            'joined_at': earliest_joined[instructor.id],
+            'exam_count': instructor.exam_count,
+            'session_count': instructor.session_count,
+            'flagged_sessions': instructor.flagged_sessions,
+        })
+    return rows
+
+
+class InstructorOversightView(APIView):
+    """Dean-level oversight of the dean's accepted-member instructors.
+
+    Returns one row per instructor — but only instructors who have ACCEPTED a
+    workspace invite from this dean (admins see all workspace members). It never
+    exposes unaffiliated accounts.
     """
 
     def get(self, request):
         if not is_dean(request.user):
             raise PermissionDenied('Only deans can view instructor oversight.')
+        return Response(accepted_instructor_rows(request.user))
 
-        instructors = (
-            User.objects.filter(role=User.Role.INSTRUCTOR)
-            .annotate(
-                exam_count=Count('exams', distinct=True),
-                session_count=Count('exams__sessions', distinct=True),
-                flagged_sessions=Count(
-                    'exams__sessions',
-                    filter=Q(exams__sessions__alerts__isnull=False),
-                    distinct=True,
-                ),
-            )
-            .order_by('email')
-        )
-        results = [
-            {
-                'id': str(instructor.id),
-                'email': instructor.email,
-                'username': instructor.username,
-                'is_active': instructor.is_active,
-                'exam_count': instructor.exam_count,
-                'session_count': instructor.session_count,
-                'flagged_sessions': instructor.flagged_sessions,
-            }
-            for instructor in instructors
-        ]
-        return Response(results)
+
+class AllWorkspaceMembersView(APIView):
+    """Every unique instructor accepted into any of the dean's workspaces.
+
+    The global instructor picker (exam assignment, calendar supervisors, etc.)
+    reads from here so it can only ever offer real, accepted members.
+    """
+
+    def get(self, request):
+        if not is_dean(request.user):
+            raise PermissionDenied('Only deans can list workspace members.')
+        return Response(accepted_instructor_rows(request.user))
 
 
 class HallManagementView(APIView):
@@ -460,39 +585,161 @@ class HallManagementView(APIView):
 
 
 class NotificationListView(generics.ListAPIView):
-    """List the authenticated user's notifications (most recent first)."""
+    """List the authenticated user's notifications (most recent first).
+
+    Dismissed notifications are excluded — they stay in the database for audit
+    but never appear in the bell dropdown again.
+    """
 
     serializer_class = NotificationSerializer
 
     def get_queryset(self):
-        return self.request.user.notifications.all()
+        return self.request.user.notifications.filter(is_dismissed=False)
 
 
 class UnreadNotificationsView(APIView):
-    """Return the count of unread notifications for the current user."""
+    """Return the count of unread (and not-dismissed) notifications."""
 
     def get(self, request):
-        count = request.user.notifications.filter(is_read=False).count()
+        count = request.user.notifications.filter(
+            is_read=False, is_dismissed=False,
+        ).count()
         return Response({'unread': count})
 
 
 class MarkNotificationsReadView(APIView):
-    """Mark every unread notification for the current user as read."""
+    """Mark every unread notification for the current user as read.
+
+    Read state is independent of dismissal: this only clears the unread dot and
+    never hides a notification from the list.
+    """
 
     def patch(self, request):
         updated = request.user.notifications.filter(is_read=False).update(is_read=True)
         return Response({'updated': updated})
 
 
+class DismissNotificationView(APIView):
+    """Dismiss a single notification (hide it from the list permanently)."""
+
+    def patch(self, request, pk):
+        notification = get_object_or_404(
+            request.user.notifications, pk=pk,
+        )
+        if not notification.is_dismissed:
+            notification.is_dismissed = True
+            notification.save(update_fields=['is_dismissed'])
+        return Response({'id': str(notification.id), 'is_dismissed': True})
+
+
+class DismissAllNotificationsView(APIView):
+    """Dismiss all *read* notifications for the current user ("Clear all").
+
+    Unread notifications are left untouched so the user never loses something
+    they have not seen yet.
+    """
+
+    def patch(self, request):
+        updated = request.user.notifications.filter(
+            is_read=True, is_dismissed=False,
+        ).update(is_dismissed=True)
+        return Response({'updated': updated})
+
+
+def _owned_workspaces(user):
+    """Scope workspaces to their owning dean; admins see every workspace."""
+    queryset = Workspace.objects.select_related('owner').prefetch_related(
+        'memberships__instructor',
+    )
+    if is_admin(user):
+        return queryset
+    return queryset.filter(owner=user)
+
+
+class WorkspaceListCreateView(APIView):
+    """List the dean's named workspaces, or create a new one."""
+
+    def get(self, request):
+        if not is_dean(request.user):
+            raise PermissionDenied('Only deans can manage workspaces.')
+        workspaces = _owned_workspaces(request.user)
+        return Response(WorkspaceSerializer(workspaces, many=True).data)
+
+    def post(self, request):
+        if not is_dean(request.user):
+            raise PermissionDenied('Only deans can create workspaces.')
+        serializer = WorkspaceWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        workspace = Workspace.objects.create(
+            owner=request.user, name=serializer.validated_data['name'],
+        )
+        return Response(
+            WorkspaceSerializer(workspace).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class WorkspaceDetailView(APIView):
+    """Rename or delete one of the dean's workspaces."""
+
+    def _get(self, request, pk):
+        if not is_dean(request.user):
+            raise PermissionDenied('Only deans can manage workspaces.')
+        return get_object_or_404(_owned_workspaces(request.user), pk=pk)
+
+    def patch(self, request, pk):
+        workspace = self._get(request, pk)
+        serializer = WorkspaceWriteSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        workspace.name = serializer.validated_data['name']
+        workspace.save(update_fields=['name'])
+        return Response(WorkspaceSerializer(workspace).data)
+
+    def delete(self, request, pk):
+        workspace = self._get(request, pk)
+        workspace.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class WorkspaceMembersView(APIView):
+    """List members of a workspace."""
+
+    def get(self, request, workspace_id):
+        if not is_dean(request.user):
+            raise PermissionDenied('Only deans can view workspace members.')
+        workspace = get_object_or_404(_owned_workspaces(request.user), pk=workspace_id)
+        memberships = workspace.memberships.select_related('instructor').all()
+        return Response(WorkspaceMemberSerializer(memberships, many=True).data)
+
+
+class WorkspaceMemberDetailView(APIView):
+    """Remove an instructor from a workspace."""
+
+    def delete(self, request, workspace_id, user_id):
+        if not is_dean(request.user):
+            raise PermissionDenied('Only deans can manage workspace members.')
+        workspace = get_object_or_404(_owned_workspaces(request.user), pk=workspace_id)
+        membership = get_object_or_404(
+            WorkspaceMembership, workspace=workspace, instructor_id=user_id,
+        )
+        membership.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 class WorkspaceInviteView(APIView):
-    """Dean workspace invites: list the ones you've sent, or send a new one."""
+    """Dean invites: list the ones you've sent, or send a new one.
+
+    An invite targets a ``workspace_id`` (modern flow — accepting joins the
+    workspace) and/or an ``exam_id`` (legacy supervisor assignment). At least
+    one of the two is required.
+    """
 
     def get(self, request):
         if not is_dean(request.user):
             raise PermissionDenied('Only deans can manage workspace invites.')
         invites = (
             WorkspaceInvite.objects
-            .select_related('instructor', 'dean', 'exam')
+            .select_related('instructor', 'dean', 'exam', 'workspace')
             .filter(dean=request.user)
         )
         return Response(WorkspaceInviteSerializer(invites, many=True).data)
@@ -502,18 +749,27 @@ class WorkspaceInviteView(APIView):
             raise PermissionDenied('Only deans can send workspace invites.')
 
         instructor_email = (request.data.get('instructor_email') or '').strip()
+        workspace_id = request.data.get('workspace_id')
         exam_id = request.data.get('exam_id')
         if not instructor_email:
             raise ValidationError({'instructor_email': 'This field is required.'})
-        if not exam_id:
-            raise ValidationError({'exam_id': 'This field is required.'})
+        if not workspace_id and not exam_id:
+            raise ValidationError(
+                {'workspace_id': 'Provide a workspace_id (or an exam_id).'}
+            )
 
         instructor = User.objects.filter(email__iexact=instructor_email).first()
         if instructor is None:
             raise ValidationError({'instructor_email': 'No user found with that email.'})
 
-        exam = get_object_or_404(Exam, pk=exam_id)
-        invite = send_workspace_invite(request.user, instructor, exam)
+        workspace = None
+        if workspace_id:
+            workspace = get_object_or_404(_owned_workspaces(request.user), pk=workspace_id)
+        exam = get_object_or_404(Exam, pk=exam_id) if exam_id else None
+
+        invite = send_workspace_invite(
+            request.user, instructor, exam=exam, workspace=workspace,
+        )
         return Response(
             WorkspaceInviteSerializer(invite).data,
             status=status.HTTP_201_CREATED,
@@ -533,7 +789,7 @@ class InviteRespondView(APIView):
 
     def get(self, request, token):
         invite = get_object_or_404(
-            WorkspaceInvite.objects.select_related('instructor', 'dean', 'exam'),
+            WorkspaceInvite.objects.select_related('instructor', 'dean', 'exam', 'workspace'),
             token=token,
         )
         already_responded = invite.status != WorkspaceInvite.Status.PENDING
@@ -541,7 +797,9 @@ class InviteRespondView(APIView):
         return Response({
             'status': invite.status,
             'already_responded': already_responded,
-            'exam_name': invite.exam.name,
+            'target_name': invite.target_name,
+            'workspace_name': invite.workspace.name if invite.workspace_id else None,
+            'exam_name': invite.exam.name if invite.exam_id else None,
             'instructor_email': invite.instructor.email,
         })
 

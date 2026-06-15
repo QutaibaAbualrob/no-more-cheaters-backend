@@ -319,7 +319,11 @@ class Alert(models.Model):
     metadata = models.JSONField(default=dict, blank=True)
     snapshot_url = models.URLField(
         max_length=500, blank=True,
-        help_text='URL to the frame snapshot showing visual evidence.',
+        help_text='URL to the cropped face image of the flagged person at this alert.',
+    )
+    clip_url = models.CharField(
+        max_length=500, blank=True,
+        help_text='URL to the 3-second video clip centred on this alert.',
     )
     is_reviewed = models.BooleanField(default=False)
     reviewed_at = models.DateTimeField(null=True, blank=True)
@@ -533,6 +537,10 @@ class Notification(models.Model):
     title = models.CharField(max_length=255)
     body = models.TextField(blank=True)
     is_read = models.BooleanField(default=False)
+    # Dismissal is independent of read state: marking a notification read only
+    # clears the unread dot, while dismissal hides it from the list. The GET
+    # endpoint excludes dismissed rows; nothing auto-dismisses on mark-read.
+    is_dismissed = models.BooleanField(default=False)
     metadata = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -540,19 +548,86 @@ class Notification(models.Model):
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['recipient', 'is_read', 'created_at']),
+            models.Index(fields=['recipient', 'is_dismissed', 'created_at']),
         ]
 
     def __str__(self):
         return f"{self.notif_type} -> {self.recipient.email}"
 
 
+class Workspace(models.Model):
+    """A named team space created and owned by a dean.
+
+    A dean can create multiple workspaces (e.g. "Physics Department",
+    "CS Faculty 2026") and invite instructors into each. Instructors join via
+    :class:`WorkspaceMembership` and may belong to any number of workspaces.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=255, null=False, blank=False)
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='owned_workspaces',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['owner', 'created_at']),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class WorkspaceMembership(models.Model):
+    """Membership linking an instructor to a :class:`Workspace`.
+
+    The ``(workspace, instructor)`` pair is unique, so an instructor cannot be
+    added to the same workspace twice — but the same instructor may join many
+    different workspaces.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workspace = models.ForeignKey(
+        Workspace, on_delete=models.CASCADE, related_name='memberships',
+    )
+    instructor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='workspace_memberships',
+    )
+    joined_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['joined_at']
+        indexes = [
+            models.Index(fields=['workspace', 'joined_at']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['workspace', 'instructor'],
+                name='unique_instructor_per_workspace',
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.instructor.email} in {self.workspace.name}"
+
+
 class WorkspaceInvite(models.Model):
-    """A dean's invitation for an instructor to supervise a specific exam.
+    """A dean's invitation for an instructor to join a workspace (and/or exam).
 
     The dean creates the invite; the instructor accepts or declines it via a
     secret ``token`` embedded in an emailed link (no login required). The token
     — not the primary key — is what the public accept/decline endpoints look up,
     so the row id never has to be exposed in a URL.
+
+    Both ``workspace`` and ``exam`` are optional: a modern invite targets a
+    ``workspace`` (accepting creates a :class:`WorkspaceMembership`), while the
+    legacy exam-assignment flow targets an ``exam``. At least one is always set.
     """
 
     class Status(models.TextChoices):
@@ -571,7 +646,16 @@ class WorkspaceInvite(models.Model):
         on_delete=models.CASCADE,
         related_name='received_invites',
     )
-    exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name='invites')
+    workspace = models.ForeignKey(
+        Workspace,
+        on_delete=models.CASCADE,
+        related_name='invites',
+        null=True, blank=True,
+    )
+    exam = models.ForeignKey(
+        Exam, on_delete=models.CASCADE, related_name='invites',
+        null=True, blank=True,
+    )
     token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -582,10 +666,20 @@ class WorkspaceInvite(models.Model):
         indexes = [
             models.Index(fields=['dean', 'created_at']),
             models.Index(fields=['instructor', 'status']),
+            models.Index(fields=['workspace', 'status']),
         ]
 
+    @property
+    def target_name(self):
+        """A human label for what the invite is for (workspace or exam)."""
+        if self.workspace_id:
+            return self.workspace.name
+        if self.exam_id:
+            return self.exam.name
+        return 'workspace'
+
     def __str__(self):
-        return f"Invite {self.instructor.email} -> {self.exam.name} ({self.status})"
+        return f"Invite {self.instructor.email} -> {self.target_name} ({self.status})"
 
 
 class AutoExamSession(models.Model):

@@ -26,7 +26,8 @@ from rest_framework import serializers
 
 from .models import (
     Alert, AnalysisJob, AuditLog, AutoExamSession, Exam, ExamSession, Notification,
-    Report, Student, SystemSettings, UserPreferences, Video, WorkspaceInvite,
+    Report, Student, SystemSettings, UserPreferences, Video, Workspace,
+    WorkspaceInvite, WorkspaceMembership,
 )
 
 
@@ -116,7 +117,15 @@ class UserUpdateSerializer(serializers.ModelSerializer):
 
 
 class NotificationSerializer(serializers.ModelSerializer):
-    """Read-only representation of an in-app notification for the bell icon."""
+    """Read-only representation of an in-app notification for the bell icon.
+
+    For invite-related notifications (those whose ``metadata`` carries an
+    ``invite_id``) the *current* :class:`WorkspaceInvite` status is resolved and
+    exposed as ``invite_status`` so the bell can show a PENDING / ACCEPTED /
+    DECLINED badge that stays accurate even after the invite is responded to.
+    """
+
+    invite_status = serializers.SerializerMethodField()
 
     class Meta:
         model = Notification
@@ -126,10 +135,19 @@ class NotificationSerializer(serializers.ModelSerializer):
             'title',
             'body',
             'is_read',
+            'is_dismissed',
+            'invite_status',
             'metadata',
             'created_at',
         ]
         read_only_fields = fields
+
+    def get_invite_status(self, obj):
+        invite_id = (obj.metadata or {}).get('invite_id')
+        if not invite_id:
+            return None
+        invite = WorkspaceInvite.objects.filter(pk=invite_id).only('status').first()
+        return invite.status if invite else None
 
 
 class WorkspaceInviteSerializer(serializers.ModelSerializer):
@@ -137,7 +155,9 @@ class WorkspaceInviteSerializer(serializers.ModelSerializer):
 
     instructor_email = serializers.EmailField(source='instructor.email', read_only=True)
     dean_email = serializers.EmailField(source='dean.email', read_only=True)
-    exam_name = serializers.CharField(source='exam.name', read_only=True)
+    exam_name = serializers.CharField(source='exam.name', read_only=True, default=None)
+    workspace_name = serializers.CharField(source='workspace.name', read_only=True, default=None)
+    target_name = serializers.CharField(read_only=True)
 
     class Meta:
         model = WorkspaceInvite
@@ -149,12 +169,85 @@ class WorkspaceInviteSerializer(serializers.ModelSerializer):
             'instructor_email',
             'dean',
             'dean_email',
+            'workspace',
+            'workspace_name',
             'exam',
             'exam_name',
+            'target_name',
             'created_at',
             'responded_at',
         ]
         read_only_fields = fields
+
+
+class WorkspaceMemberSerializer(serializers.ModelSerializer):
+    """A single workspace member, denormalised from the membership row."""
+
+    user_id = serializers.UUIDField(source='instructor.id', read_only=True)
+    email = serializers.EmailField(source='instructor.email', read_only=True)
+    username = serializers.CharField(source='instructor.username', read_only=True)
+    display_name = serializers.SerializerMethodField()
+    role = serializers.CharField(source='instructor.role', read_only=True)
+
+    class Meta:
+        model = WorkspaceMembership
+        fields = [
+            'id',
+            'user_id',
+            'email',
+            'username',
+            'display_name',
+            'role',
+            'joined_at',
+        ]
+        read_only_fields = fields
+
+    def get_display_name(self, obj):
+        instructor = obj.instructor
+        return (instructor.get_full_name() or '').strip() or instructor.username
+
+
+class WorkspaceSerializer(serializers.ModelSerializer):
+    """Read-only workspace with its owner, member count, and member list."""
+
+    owner_email = serializers.EmailField(source='owner.email', read_only=True)
+    member_count = serializers.SerializerMethodField()
+    members = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Workspace
+        fields = [
+            'id',
+            'name',
+            'owner',
+            'owner_email',
+            'member_count',
+            'members',
+            'created_at',
+        ]
+        read_only_fields = fields
+
+    def get_member_count(self, obj):
+        memberships = getattr(obj, 'memberships', None)
+        return memberships.count() if memberships is not None else 0
+
+    def get_members(self, obj):
+        memberships = obj.memberships.select_related('instructor').all()
+        return WorkspaceMemberSerializer(memberships, many=True).data
+
+
+class WorkspaceWriteSerializer(serializers.ModelSerializer):
+    """Create or rename a workspace — only the name is client-writable."""
+
+    class Meta:
+        model = Workspace
+        fields = ['name']
+
+    def validate_name(self, value):
+        cleaned = (value or '').strip()
+        if not cleaned:
+            raise serializers.ValidationError('Workspace name is required.')
+        return cleaned
 
 
 class AutoExamSessionReadSerializer(serializers.ModelSerializer):
@@ -575,6 +668,7 @@ class AlertReadSerializer(serializers.ModelSerializer):
             'confidence_score',
             'metadata',
             'snapshot_url',
+            'clip_url',
             'is_reviewed',
             'reviewed_at',
             'reviewed_by',
