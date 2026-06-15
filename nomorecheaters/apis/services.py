@@ -553,20 +553,31 @@ def _cheating_probability(events):
 
 
 def _attach_alert_evidence(video, session, alerts):
-    """Attach per-alert visual evidence: face crop, 3-second clip, person id.
+    """Attach per-alert visual evidence with a green-boxed flagged person.
 
     Tracks faces across the recording once (see :mod:`apis.ai.face_tracker`),
-    then for each alert resolves the flagged person near its timestamp, crops
-    their face, and cuts a short clip. Best-effort and fully isolated: any
-    OpenCV/IO failure simply leaves that artifact empty and never aborts the
-    analysis. URLs are stored as ``/media/...`` web paths (served by Django in
-    DEBUG); the report serializer turns them into absolute URLs for the client.
+    then for each alert resolves the flagged person near its timestamp and saves
+    three artifacts:
+
+    * **crop** (``metadata['crop_url']``) — the flagged face only, no overlay;
+      used as the per-person avatar in the report header.
+    * **annotated frame** (``snapshot_url``) — the FULL frame with a green box +
+      behaviour label on the flagged person and gray boxes on anyone else; the
+      main evidence image so the flagged student is visible in context.
+    * **clip** (``clip_url``) — a 3-second clip with the same green/gray overlay
+      baked onto every frame.
+
+    Best-effort and fully isolated: any OpenCV/IO failure simply leaves that
+    artifact empty and never aborts the analysis. URLs are stored as
+    ``/media/...`` web paths; the report view turns them into absolute URLs.
     """
     if not alerts or not getattr(video, 'file', None):
         return
 
     try:
-        from .ai.face_tracker import extract_clip, extract_face_crop, track_persons
+        from .ai.face_tracker import (
+            extract_annotated_frame, extract_clip, extract_face_crop, track_persons,
+        )
     except Exception:  # noqa: BLE001 — OpenCV missing → skip evidence entirely
         return
 
@@ -580,12 +591,22 @@ def _attach_alert_evidence(video, session, alerts):
         index = None
 
     for alert in alerts:
-        person_id, bbox = 'person_1', None
+        person_id, bbox, others = 'person_1', None, {}
         if index is not None:
             try:
                 person_id, bbox = index.query(alert.timestamp_sec)
+                others = index.persons_at(alert.timestamp_sec)
             except Exception:  # noqa: BLE001
-                person_id, bbox = 'person_1', None
+                person_id, bbox, others = 'person_1', None, {}
+
+        # Human-readable behaviour ("Phone Detected", "Looking Away", …).
+        behavior_label = alert.get_behavior_type_display()
+
+        # All people in the frame, with the flagged person's precise bbox.
+        boxes = dict(others)
+        if bbox is not None:
+            boxes[person_id] = bbox
+        boxes_list = list(boxes.items())
 
         metadata = dict(alert.metadata or {})
         metadata['person_id'] = person_id
@@ -595,20 +616,37 @@ def _attach_alert_evidence(video, session, alerts):
                 int(round(x1)), int(round(y1)),
                 int(round(x2 - x1)), int(round(y2 - y1)),
             ]
-        alert.metadata = metadata
 
-        snapshot_rel = f'snapshots/{session.id}/{alert.id}.jpg'
+        crop_rel = f'snapshots/{session.id}/{alert.id}_crop.jpg'
+        frame_rel = f'snapshots/{session.id}/{alert.id}_frame.jpg'
         clip_rel = f'clips/{session.id}/{alert.id}.mp4'
+
+        # 1. Clean face crop → avatar (stored in metadata).
         try:
-            if extract_face_crop(video_path, alert.timestamp_sec, bbox, str(media_root / snapshot_rel)):
-                alert.snapshot_url = f'{media_url}/{snapshot_rel}'
+            if extract_face_crop(video_path, alert.timestamp_sec, bbox, str(media_root / crop_rel)):
+                metadata['crop_url'] = f'{media_url}/{crop_rel}'
         except Exception:  # noqa: BLE001
             pass
+        # 2. Full annotated frame → main evidence image (snapshot_url).
         try:
-            if extract_clip(video_path, alert.timestamp_sec, str(media_root / clip_rel)):
+            if extract_annotated_frame(
+                video_path, alert.timestamp_sec, boxes_list, person_id,
+                behavior_label, str(media_root / frame_rel),
+            ):
+                alert.snapshot_url = f'{media_url}/{frame_rel}'
+        except Exception:  # noqa: BLE001
+            pass
+        # 3. 3-second clip with the overlay on every frame (clip_url).
+        try:
+            if extract_clip(
+                video_path, alert.timestamp_sec, str(media_root / clip_rel),
+                boxes=boxes_list, flagged_person_id=person_id, behavior_label=behavior_label,
+            ):
                 alert.clip_url = f'{media_url}/{clip_rel}'
         except Exception:  # noqa: BLE001
             pass
+
+        alert.metadata = metadata
 
     Alert.objects.bulk_update(alerts, ['snapshot_url', 'clip_url', 'metadata'])
 

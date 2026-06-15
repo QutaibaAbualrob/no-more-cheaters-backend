@@ -89,6 +89,26 @@ class PersonIndex:
             return 'person_1', None
         return best[2], best[3]
 
+    def persons_at(self, timestamp_sec: float, max_gap_sec: float = 2.0):
+        """Return ``{person_id: bbox_xyxy}`` for every person sighted near *timestamp_sec*.
+
+        For each tracked person the sighting closest in time (within
+        *max_gap_sec*) is used. Lets the evidence drawer box *all* people in a
+        frame — the flagged one in green, the rest in gray.
+        """
+        result = {}
+        for person_id, samples in self.tracks.items():
+            best = None  # (gap, bbox)
+            for ts, bbox in samples:
+                gap = abs(ts - timestamp_sec)
+                if gap > max_gap_sec:
+                    continue
+                if best is None or gap < best[0]:
+                    best = (gap, bbox)
+            if best is not None:
+                result[person_id] = best[1]
+        return result
+
 
 def _cascade():
     """Load the bundled frontal-face Haar cascade, or ``None`` if unavailable."""
@@ -197,12 +217,90 @@ def _read_frame_at(capture, timestamp_sec: float, fps: float):
     return frame if grabbed else None
 
 
+def _fallback_bbox(width: int, height: int):
+    """A centred head-region box used when no face was tracked at an alert."""
+    cw, ch = int(width * 0.34), int(height * 0.46)
+    x1 = (width - cw) // 2
+    y1 = int(height * 0.16)
+    return (x1, y1, x1 + cw, y1 + ch)
+
+
+def person_label(person_id) -> str:
+    """``'person_1' -> 'Person 1'`` (falls back to a title-cased id)."""
+    text = str(person_id or 'person_1')
+    suffix = text.rsplit('_', 1)[-1]
+    if suffix.isdigit():
+        return f'Person {int(suffix)}'
+    return text.replace('_', ' ').title()
+
+
+# BGR colours for the evidence overlay.
+_FLAGGED_COLOR = (0, 255, 0)      # green — the person who triggered the alert
+_OTHER_COLOR = (128, 128, 128)    # gray — everyone else in frame
+
+
+def _draw_box_with_label(cv2, frame, bbox, color, label: str) -> None:
+    """Draw a rectangle (2px) plus a label above it, clamped to the frame.
+
+    The label sits on a filled dark strip so coloured text stays legible over
+    any background. Drops below the top edge when there is no room above.
+    """
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = (int(round(v)) for v in bbox)
+    x1 = max(0, min(x1, w - 1))
+    x2 = max(0, min(x2, w - 1))
+    y1 = max(0, min(y1, h - 1))
+    y2 = max(0, min(y2, h - 1))
+    if x2 <= x1 or y2 <= y1:
+        return
+
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    if not label:
+        return
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.6
+    thickness = 2
+    (tw, th), baseline = cv2.getTextSize(label, font, scale, thickness)
+    ty = y1 - 8
+    if ty - th - baseline < 0:        # no room above → place just inside the box
+        ty = min(h - baseline - 1, y1 + th + 8)
+    tx = max(0, min(x1, w - tw - 1))
+    cv2.rectangle(
+        frame,
+        (tx, ty - th - baseline),
+        (min(w - 1, tx + tw), min(h - 1, ty + baseline)),
+        (0, 0, 0),
+        -1,
+    )
+    cv2.putText(frame, label, (tx, ty), font, scale, color, thickness, cv2.LINE_AA)
+
+
+def _draw_person_boxes(cv2, frame, boxes, flagged_person_id, behavior_label: str) -> None:
+    """Annotate *frame* in place: green box+behaviour on the flagged person,
+    gray boxes with just the person id on everyone else.
+
+    *boxes* is an iterable of ``(person_id, bbox_xyxy)``.
+    """
+    for person_id, bbox in boxes:
+        if bbox is None:
+            continue
+        if person_id == flagged_person_id:
+            label = person_label(person_id)
+            if behavior_label:
+                label = f'{label} — {behavior_label}'
+            _draw_box_with_label(cv2, frame, bbox, _FLAGGED_COLOR, label)
+        else:
+            _draw_box_with_label(cv2, frame, bbox, _OTHER_COLOR, person_label(person_id))
+
+
 def extract_face_crop(video_path: str, timestamp_sec: float, bbox, out_path: str,
                       pad: float = 0.3) -> bool:
-    """Save a cropped face JPEG at *timestamp_sec* to *out_path*.
+    """Save a cropped face JPEG at *timestamp_sec* to *out_path* (no overlay).
 
     *bbox* is an ``(x1, y1, x2, y2)`` face box (typically from :func:`track_persons`);
     when ``None`` a centred crop of the frame is used as a best-effort fallback.
+    The crop is taken from the unmodified frame so the avatar shows a clean face.
     Returns ``True`` on success.
     """
     import cv2
@@ -227,11 +325,7 @@ def extract_face_crop(video_path: str, timestamp_sec: float, bbox, out_path: str
             x2 = int(min(w, x2 + bw * pad))
             y2 = int(min(h, y2 + bh * pad))
         else:
-            # Centred head-region fallback when no face was tracked.
-            cw, ch = int(w * 0.34), int(h * 0.46)
-            x1 = (w - cw) // 2
-            y1 = int(h * 0.16)
-            x2, y2 = x1 + cw, y1 + ch
+            x1, y1, x2, y2 = _fallback_bbox(w, h)
         if x2 <= x1 or y2 <= y1:
             return False
         crop = frame[y1:y2, x1:x2]
@@ -239,6 +333,45 @@ def extract_face_crop(video_path: str, timestamp_sec: float, bbox, out_path: str
             return False
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         return bool(cv2.imwrite(out_path, crop))
+    finally:
+        capture.release()
+
+
+def extract_annotated_frame(video_path: str, timestamp_sec: float, boxes,
+                            flagged_person_id, behavior_label: str, out_path: str) -> bool:
+    """Save the FULL frame at *timestamp_sec* with person boxes drawn, to *out_path*.
+
+    The flagged person gets a green box labelled ``"Person N — <Behaviour>"``;
+    any other tracked people get gray boxes labelled ``"Person N"``. When no
+    boxes are available a centred green fallback box is drawn so the report still
+    shows where to look. Drawing happens on a copy so the source frame is never
+    mutated. Returns ``True`` on success.
+    """
+    import cv2
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        capture.release()
+        return False
+    fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+    if fps <= 0:
+        fps = 30.0
+    try:
+        frame = _read_frame_at(capture, timestamp_sec, fps)
+        if frame is None:
+            return False
+        annotated = frame.copy()
+        drawable = [(pid, bb) for pid, bb in (boxes or []) if bb is not None]
+        if drawable:
+            _draw_person_boxes(cv2, annotated, drawable, flagged_person_id, behavior_label)
+        else:
+            h, w = annotated.shape[:2]
+            label = person_label(flagged_person_id)
+            if behavior_label:
+                label = f'{label} — {behavior_label}'
+            _draw_box_with_label(cv2, annotated, _fallback_bbox(w, h), _FLAGGED_COLOR, label)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        return bool(cv2.imwrite(out_path, annotated))
     finally:
         capture.release()
 
@@ -293,8 +426,16 @@ def _reencode_h264(src_path: str, dst_path: str) -> bool:
 
 
 def extract_clip(video_path: str, timestamp_sec: float, out_path: str,
-                 before: float = 1.0, after: float = 2.0) -> bool:
+                 before: float = 1.0, after: float = 2.0,
+                 boxes=None, flagged_person_id=None, behavior_label: str = '') -> bool:
     """Save a clip spanning ``[t-before, t+after]`` to *out_path* (mp4).
+
+    When *boxes* (an iterable of ``(person_id, bbox_xyxy)``) is supplied, the
+    same overlay drawn on the snapshot is baked onto EVERY clip frame — a green
+    box+behaviour label on the flagged person and gray boxes on others — so the
+    instructor watching the clip sees exactly who was flagged. The bbox is held
+    static across the clip (re-detecting per frame is too slow); with a centred
+    fallback box when nobody was tracked.
 
     The frames are first written with OpenCV; the result is then re-encoded to
     browser-friendly H.264 with ffmpeg when that binary is installed (see
@@ -319,6 +460,15 @@ def extract_clip(video_path: str, timestamp_sec: float, out_path: str,
     start_frame = max(0, int((timestamp_sec - before) * fps))
     end_frame = int((timestamp_sec + after) * fps)
 
+    # Static overlay reused on every clip frame.
+    drawable = [(pid, bb) for pid, bb in (boxes or []) if bb is not None]
+    fallback = None
+    if not drawable and (boxes is not None or flagged_person_id is not None):
+        label = person_label(flagged_person_id)
+        if behavior_label:
+            label = f'{label} — {behavior_label}'
+        fallback = (_fallback_bbox(width, height), label)
+
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     # OpenCV writes to a temp file; ffmpeg then transcodes it to the final
     # H.264 path. If ffmpeg is missing we just promote the temp file as-is.
@@ -336,6 +486,10 @@ def extract_clip(video_path: str, timestamp_sec: float, out_path: str,
             grabbed, frame = capture.read()
             if not grabbed:
                 break
+            if drawable:
+                _draw_person_boxes(cv2, frame, drawable, flagged_person_id, behavior_label)
+            elif fallback is not None:
+                _draw_box_with_label(cv2, frame, fallback[0], _FLAGGED_COLOR, fallback[1])
             writer.write(frame)
             written += 1
             current += 1

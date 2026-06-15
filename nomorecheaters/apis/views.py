@@ -322,7 +322,13 @@ def _alert_payload(alert, request):
     def absolute(url):
         return request.build_absolute_uri(url) if url else None
 
-    metadata = alert.metadata or {}
+    # Copy metadata so we can hand back an absolute crop_url without mutating
+    # the stored (relative) value. crop_url is the clean face avatar; snapshot_url
+    # is the full frame with the green box drawn on the flagged person.
+    metadata = dict(alert.metadata or {})
+    crop_url = absolute(metadata.get('crop_url'))
+    if metadata.get('crop_url'):
+        metadata['crop_url'] = crop_url
     return {
         'id': str(alert.id),
         'behavior_type': alert.behavior_type,
@@ -332,6 +338,7 @@ def _alert_payload(alert, request):
         'timestamp_sec': alert.timestamp_sec,
         'snapshot_url': absolute(alert.snapshot_url),
         'clip_url': absolute(alert.clip_url),
+        'crop_url': crop_url,
         'metadata': metadata,
         'is_reviewed': alert.is_reviewed,
         'reviewed_at': alert.reviewed_at,
@@ -401,12 +408,19 @@ class SessionReportView(APIView):
         persons = []
         for person_id in sorted(groups, key=_person_sort_key):
             payloads = groups[person_id]
-            # Section face = the snapshot of this person's highest-confidence alert.
+            # Section avatar = this person's highest-confidence face crop (clean,
+            # no box); fall back to the boxed full-frame snapshot if no crop.
+            ranked = sorted(payloads, key=lambda p: p['confidence_score'], reverse=True)
             face_url = None
-            for payload in sorted(payloads, key=lambda p: p['confidence_score'], reverse=True):
-                if payload['snapshot_url']:
-                    face_url = payload['snapshot_url']
+            for payload in ranked:
+                if payload.get('crop_url'):
+                    face_url = payload['crop_url']
                     break
+            if face_url is None:
+                for payload in ranked:
+                    if payload['snapshot_url']:
+                        face_url = payload['snapshot_url']
+                        break
             label = 'Person ' + str(person_id).rsplit('_', 1)[-1]
             persons.append({
                 'person_id': person_id,
