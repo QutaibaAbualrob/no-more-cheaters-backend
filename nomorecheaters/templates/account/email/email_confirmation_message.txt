@@ -1,0 +1,12 @@
+Hello {{ user.email }},
+
+Thank you for creating a No More Cheaters account. Please confirm your email address by clicking the link below:
+
+{{ activate_url }}
+
+This link expires in {{ expiration_days }} days.
+
+If you did not create this account, you can safely ignore this email.
+
+— The No More Cheaters Team
+https://nomorecheater.online
