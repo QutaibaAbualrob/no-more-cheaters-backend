@@ -23,11 +23,12 @@ from django.views.generic import RedirectView
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    # allauth builds the confirmation link from the URL named
-    # `account_confirm_email`. dj-rest-auth does not register it by default, so
-    # we declare it here BEFORE the registration include and redirect the user
-    # to the SPA's verify-email page (which POSTs the key to verify-email/).
-    # Without this the emailed link 404s on the backend.
+    # ── Email link redirects ───────────────────────────────────────────────
+    # allauth generates confirmation/reset URLs from these named patterns.
+    # We redirect them to the React SPA so the user never sees a Django page.
+    #
+    # Email verification: the link in the signup email lands on the frontend's
+    # /account/verify-email/<key> page, which POSTs the key to verify-email/.
     path(
         'api/auth/registration/account-confirm-email/<str:key>/',
         RedirectView.as_view(
@@ -36,6 +37,24 @@ urlpatterns = [
         ),
         name='account_confirm_email',
     ),
+    # Password reset: the link in the reset email lands on the frontend's
+    # /account/password/reset/key/<uid>/<token>/ page.
+    # ⚠ The frontend route uses :key (single segment) but the URL has two
+    # segments (uid/token). The frontend route needs to be changed to a splat
+    # (*) — tracked as FE-BUG-01.
+    #
+    # dj-rest-auth reverses 'password_reset_confirm' to build the reset link.
+    # We redirect that to the React SPA so the user lands on the frontend form.
+    path(
+        'api/auth/password/reset/confirm/<str:uid>/<str:token>/',
+        RedirectView.as_view(
+            url=settings.FRONTEND_URL.rstrip('/')
+            + '/account/password/reset/key/%(uid)s/%(token)s/',
+            permanent=False,
+        ),
+        name='password_reset_confirm',
+    ),
+    # ── Auth API ───────────────────────────────────────────────────────────
     # dj-rest-auth is mounted under /api/auth/ to match the frontend
     # (src/api/auth.ts). These MUST come before the catch-all apis.urls
     # include so /api/auth/... never falls through to the <uuid:pk> routes.

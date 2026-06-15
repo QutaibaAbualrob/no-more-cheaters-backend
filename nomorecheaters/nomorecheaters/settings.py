@@ -154,16 +154,33 @@ TEMPLATES = [
     },
 ]
 
-# settings for allauth
-EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
-# Default "from" address for outgoing mail (e.g. workspace invites). In dev the
-# console backend just prints the message; override in production via env.
-DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', 'No More Cheaters <no-reply@nomorecheaters.local>')
+# ── Email (workspace invites, verification, password resets) ──────────────────
+# When EMAIL_HOST_PASSWORD is set → Resend SMTP. Otherwise → console (dev).
+_EMAIL_PASSWORD=env('E...RD', 're_93kfTXxH_DuggCpxZLdiJ9h5u44KKvxFc')
+if _EMAIL_PASSWORD:
+    EMAIL_BACKEND = env('EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend')
+    EMAIL_HOST = env('EMAIL_HOST', 'smtp.resend.com')
+    EMAIL_PORT = int(env('EMAIL_PORT', '587'))
+    EMAIL_USE_TLS = env_bool('EMAIL_USE_TLS', True)
+    EMAIL_HOST_USER = env('EMAIL_HOST_USER', 'resend')
+    EMAIL_HOST_PASSWORD = _EMAIL_PASSWORD
+else:
+    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', 'noreply@nomorecheater.online')
+
 SITE_ID = 1
 
-# Settings for allauth email login.
+# ── Allauth — email behaviour ────────────────────────────────────────────
 ACCOUNT_LOGIN_METHODS = {'email'}
-ACCOUNT_SIGNUP_FIELDS = ['email*', 'username*', 'password1*', 'password2*']
+ACCOUNT_SIGNUP_FIELDS = ['email*', 'password1*', 'password2*']
+ACCOUNT_EMAIL_VERIFICATION = env('ACCOUNT_EMAIL_VERIFICATION', 'optional')
+ACCOUNT_EMAIL_SUBJECT_PREFIX = env('ACCOUNT_EMAIL_SUBJECT_PREFIX', '[No More Cheaters] ')
+# How long verification / password-reset links remain valid (days).
+ACCOUNT_EMAIL_CONFIRMATION_EXPIRE_DAYS = 3
+# Prevent enumeration: always say "email sent" even if the account doesn't exist.
+ACCOUNT_PREVENT_ENUMERATION = True
+# Allow login immediately after signup (unless verification is mandatory).
+ACCOUNT_LOGIN_ON_EMAIL_CONFIRMATION = True
 
 # allauth requires its backend alongside Django's default ModelBackend.
 AUTHENTICATION_BACKENDS = [

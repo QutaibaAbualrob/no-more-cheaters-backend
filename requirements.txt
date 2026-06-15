@@ -12,7 +12,7 @@ python-dotenv
 # AI Pipeline — YOLO video analysis
 ultralytics
 opencv-python-headless
-
+dj-rest-auth
 # Background job queue (django-rq + Redis)
 # Analysis runs through this queue. Jobs execute synchronously in-process by
 # default (no Redis needed for local dev/tests); set RQ_ASYNC=true with a
