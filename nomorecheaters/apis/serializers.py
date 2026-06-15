@@ -20,15 +20,59 @@ from pathlib import Path
 
 from django.contrib.auth import get_user_model
 from django.utils import timezone
+from dj_rest_auth.registration.serializers import RegisterSerializer
+from dj_rest_auth.serializers import UserDetailsSerializer
 from rest_framework import serializers
 
 from .models import (
-    Alert, AnalysisJob, AuditLog, Exam, ExamSession, Report,
-    Student, SystemSettings, UserPreferences, Video,
+    Alert, AnalysisJob, AuditLog, AutoExamSession, Exam, ExamSession, Notification,
+    Report, Student, SystemSettings, UserPreferences, Video, WorkspaceInvite,
 )
 
 
 User = get_user_model()
+
+
+class CustomUserDetailsSerializer(UserDetailsSerializer):
+    """User details for dj-rest-auth's ``/api/auth/user/`` endpoint.
+
+    The library default omits our custom ``role`` field, which the frontend
+    needs to route ADMIN / DEAN / INSTRUCTOR correctly. We extend the default
+    field set with a read-only ``role`` so the SPA never has to guess the role
+    (and can never downgrade a DEAN to INSTRUCTOR).
+    """
+
+    class Meta(UserDetailsSerializer.Meta):
+        fields = tuple(UserDetailsSerializer.Meta.fields) + ('role',)
+        read_only_fields = tuple(UserDetailsSerializer.Meta.read_only_fields) + ('role',)
+
+
+class CustomRegisterSerializer(RegisterSerializer):
+    """Registration serializer that also persists the chosen role.
+
+    Fixes the bug where a user who picks "Dean" at signup was always created as
+    INSTRUCTOR (the base serializer ignored the role). Only DEAN or INSTRUCTOR
+    can be self-selected — ADMIN is never grantable through public registration.
+    """
+
+    role = serializers.ChoiceField(
+        choices=[User.Role.DEAN, User.Role.INSTRUCTOR],
+        default=User.Role.INSTRUCTOR,
+        required=False,
+    )
+
+    def get_cleaned_data(self):
+        data = super().get_cleaned_data()
+        data['role'] = self.validated_data.get('role', User.Role.INSTRUCTOR)
+        return data
+
+    def custom_signup(self, request, user):
+        role = self.validated_data.get('role') or User.Role.INSTRUCTOR
+        if role not in (User.Role.DEAN, User.Role.INSTRUCTOR):
+            role = User.Role.INSTRUCTOR
+        if user.role != role:
+            user.role = role
+            user.save(update_fields=['role'])
 
 
 class UserReadSerializer(serializers.ModelSerializer):
@@ -69,6 +113,131 @@ class UserUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ['email', 'username', 'role', 'is_active']
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    """Read-only representation of an in-app notification for the bell icon."""
+
+    class Meta:
+        model = Notification
+        fields = [
+            'id',
+            'notif_type',
+            'title',
+            'body',
+            'is_read',
+            'metadata',
+            'created_at',
+        ]
+        read_only_fields = fields
+
+
+class WorkspaceInviteSerializer(serializers.ModelSerializer):
+    """Read-only representation of a workspace invite for the dean's list view."""
+
+    instructor_email = serializers.EmailField(source='instructor.email', read_only=True)
+    dean_email = serializers.EmailField(source='dean.email', read_only=True)
+    exam_name = serializers.CharField(source='exam.name', read_only=True)
+
+    class Meta:
+        model = WorkspaceInvite
+        fields = [
+            'id',
+            'token',
+            'status',
+            'instructor',
+            'instructor_email',
+            'dean',
+            'dean_email',
+            'exam',
+            'exam_name',
+            'created_at',
+            'responded_at',
+        ]
+        read_only_fields = fields
+
+
+class AutoExamSessionReadSerializer(serializers.ModelSerializer):
+    """Read-only representation of a scheduled auto recording session."""
+
+    exam_name = serializers.CharField(source='exam.name', read_only=True)
+    instructor_email = serializers.EmailField(source='instructor.email', read_only=True)
+
+    class Meta:
+        model = AutoExamSession
+        fields = [
+            'id',
+            'exam',
+            'exam_name',
+            'instructor',
+            'instructor_email',
+            'scheduled_start',
+            'scheduled_end',
+            'is_auto',
+            'created_at',
+        ]
+        read_only_fields = fields
+
+
+class AutoExamSessionCreateSerializer(serializers.ModelSerializer):
+    """Create an auto recording session for the requesting instructor.
+
+    ``scheduled_start`` must be in the future and ``scheduled_end`` must be after
+    it. An exam is auto-created (or reused) from ``exam_name`` so the captured
+    video later groups under the same exam on upload.
+    """
+
+    exam_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    exam_id = serializers.UUIDField(write_only=True, required=False)
+
+    class Meta:
+        model = AutoExamSession
+        fields = ['exam_id', 'exam_name', 'scheduled_start', 'scheduled_end']
+
+    def validate_scheduled_start(self, value):
+        if value <= timezone.now():
+            raise serializers.ValidationError('Scheduled start must be in the future.')
+        return value
+
+    def validate(self, attrs):
+        start = attrs.get('scheduled_start')
+        end = attrs.get('scheduled_end')
+        if start and end and end <= start:
+            raise serializers.ValidationError(
+                {'scheduled_end': 'End time must be after the start time.'}
+            )
+        return attrs
+
+    def create(self, validated_data):
+        # Local import avoids a circular import (selectors imports models only).
+        from .selectors import can_supervise_exam
+
+        request = self.context['request']
+        exam_id = validated_data.pop('exam_id', None)
+        exam_name = (validated_data.pop('exam_name', '') or '').strip()
+
+        if exam_id:
+            # Calendar flow: attach to the existing exam and enforce permission.
+            exam = Exam.objects.filter(pk=exam_id).first()
+            if exam is None:
+                raise serializers.ValidationError({'exam_id': 'Exam not found.'})
+            if not can_supervise_exam(request.user, exam):
+                raise serializers.ValidationError(
+                    {'exam_id': 'Only assigned supervisors or the dean can schedule recording for this exam.'}
+                )
+        else:
+            exam, _created = Exam.objects.get_or_create(
+                instructor=request.user,
+                name=exam_name or 'Auto Recording',
+                defaults={'description': 'Auto-created for a scheduled auto recording.'},
+            )
+
+        return AutoExamSession.objects.create(
+            exam=exam,
+            instructor=request.user,
+            scheduled_start=validated_data['scheduled_start'],
+            scheduled_end=validated_data['scheduled_end'],
+        )
 
 
 class UserPreferencesReadSerializer(serializers.ModelSerializer):
@@ -247,7 +416,7 @@ class VideoReadSerializer(serializers.ModelSerializer):
     exam_name = serializers.CharField(source='session.exam.name', read_only=True)
     student_identifier = serializers.CharField(source='session.student_identifier', read_only=True)
     session_status = serializers.CharField(source='session.status', read_only=True)
-    uploaded_by_email = serializers.EmailField(source='session.exam.instructor.email', read_only=True)
+    uploaded_by_email = serializers.SerializerMethodField()
 
     class Meta:
         model = Video
@@ -289,6 +458,13 @@ class VideoReadSerializer(serializers.ModelSerializer):
         if not hasattr(obj.session, 'report'):
             return None
         return ReportReadSerializer(obj.session.report).data
+
+    def get_uploaded_by_email(self, obj):
+        """Prefer the real uploader; fall back to the exam owner for older rows."""
+        if obj.uploaded_by_id:
+            return obj.uploaded_by.email
+        instructor = obj.session.exam.instructor
+        return instructor.email if instructor else None
 
 
 class VideoUploadSerializer(serializers.ModelSerializer):
@@ -345,10 +521,10 @@ class VideoUploadSerializer(serializers.ModelSerializer):
         return file
 
     def create(self, validated_data):
-        """Compute file hash, check for duplicates, then persist the Video.
+        """Compute the file hash, reject a per-session duplicate, then persist.
 
-        Raises :class:`~rest_framework.serializers.ValidationError` if a
-        video with identical content has already been uploaded (FR4).
+        The same file may be uploaded for *different* sessions, but never twice
+        for the *same* session (FR4 + the per-session rule).
         """
         file = validated_data['file']
         digest = hashlib.sha256()
@@ -357,17 +533,20 @@ class VideoUploadSerializer(serializers.ModelSerializer):
         file.seek(0)
 
         file_hash = digest.hexdigest()
-        if Video.objects.filter(file_hash=file_hash).exists():
+        session = validated_data['session']
+        if Video.objects.filter(session=session, file_hash=file_hash).exists():
             raise serializers.ValidationError(
-                {'file': 'This video has already been uploaded (duplicate content).'}
+                {'file': 'This video has already been uploaded for this session.'}
             )
 
+        request = self.context.get('request')
         return Video.objects.create(
             **validated_data,
             original_filename=getattr(file, 'name', '') or 'upload',
             content_type=getattr(file, 'content_type', '') or '',
             size_bytes=getattr(file, 'size', 0) or 0,
             file_hash=file_hash,
+            uploaded_by=request.user if request is not None else None,
             expires_at=timezone.now() + timedelta(days=30),
         )
 

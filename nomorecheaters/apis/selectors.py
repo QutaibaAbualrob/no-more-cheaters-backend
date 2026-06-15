@@ -1,9 +1,10 @@
 from datetime import timedelta
 
 from django.contrib.auth import get_user_model
+from django.db.models import Q
 from django.utils import timezone
 
-from .models import ExamSession, Report, Student, Video
+from .models import Exam, ExamSession, Report, Student, Video, WorkspaceInvite
 
 
 User = get_user_model()
@@ -84,3 +85,38 @@ def recent_day_window(days_count=7):
     days = [today - timedelta(days=offset) for offset in range(days_count - 1, -1, -1)]
     labels = [day.strftime('%a') for day in days]
     return days, labels
+
+
+def assigned_supervisor_ids(exam):
+    """Return the set of user ids allowed to supervise an exam.
+
+    That is the exam's owner plus every instructor who has ACCEPTED a workspace
+    invite for it.
+    """
+    ids = {exam.instructor_id}
+    ids.update(
+        WorkspaceInvite.objects
+        .filter(exam=exam, status=WorkspaceInvite.Status.ACCEPTED)
+        .values_list('instructor_id', flat=True)
+    )
+    return ids
+
+
+def can_supervise_exam(user, exam):
+    """True when *user* may upload/record for *exam* (assigned supervisor or dean/admin)."""
+    if is_dean(user):
+        return True
+    return user.id in assigned_supervisor_ids(exam)
+
+
+def actionable_exams(user):
+    """Exams a user can act on: owned + accepted-invite (every exam for dean/admin)."""
+    queryset = Exam.objects.select_related('instructor')
+    if is_dean(user):
+        return queryset
+    invited_exam_ids = (
+        WorkspaceInvite.objects
+        .filter(instructor=user, status=WorkspaceInvite.Status.ACCEPTED)
+        .values_list('exam_id', flat=True)
+    )
+    return queryset.filter(Q(instructor=user) | Q(id__in=invited_exam_ids)).distinct()

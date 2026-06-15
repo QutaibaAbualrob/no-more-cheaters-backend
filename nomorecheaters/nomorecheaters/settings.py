@@ -156,6 +156,9 @@ TEMPLATES = [
 
 # settings for allauth
 EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+# Default "from" address for outgoing mail (e.g. workspace invites). In dev the
+# console backend just prints the message; override in production via env.
+DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', 'No More Cheaters <no-reply@nomorecheaters.local>')
 SITE_ID = 1
 
 # Settings for allauth email login.
@@ -222,6 +225,15 @@ REST_FRAMEWORK = {
         'rest_framework.authentication.SessionAuthentication',
         'rest_framework.authentication.TokenAuthentication',
     ],
+}
+
+# dj-rest-auth: expose the custom `role` field on /api/auth/user/ so the
+# frontend can route ADMIN / DEAN / INSTRUCTOR without guessing or relying on
+# any client-side fallback.
+REST_AUTH = {
+    'USER_DETAILS_SERIALIZER': 'apis.serializers.CustomUserDetailsSerializer',
+    # Persist the DEAN/INSTRUCTOR role chosen at signup (see CustomRegisterSerializer).
+    'REGISTER_SERIALIZER': 'apis.serializers.CustomRegisterSerializer',
 }
 
 

@@ -244,8 +244,18 @@ class Video(models.Model):
     original_filename = models.CharField(max_length=255)
     content_type = models.CharField(max_length=100, blank=True)
     size_bytes = models.BigIntegerField(default=0)
-    file_hash = models.CharField(max_length=64, unique=True, null=False, blank=False)
+    # NOTE: file_hash is unique *per session* (see Meta.constraints), not
+    # globally — the same recording may legitimately be uploaded for different
+    # exam sessions, but never twice for the same session.
+    file_hash = models.CharField(max_length=64, null=False, blank=False)
     duration_seconds = models.PositiveIntegerField(null=True, blank=True)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='uploaded_videos',
+        help_text='The user who actually uploaded or recorded this video.',
+    )
     uploaded_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField(
         null=True, blank=True,
@@ -258,6 +268,12 @@ class Video(models.Model):
             models.Index(fields=['uploaded_at']),
             models.Index(fields=['file_hash']),
             models.Index(fields=['expires_at']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['session', 'file_hash'],
+                name='unique_video_hash_per_session',
+            ),
         ]
 
     def __str__(self):
@@ -490,3 +506,114 @@ class Report(models.Model):
 
     def __str__(self):
         return f"Report for {self.session} (prob: {self.overall_cheating_probability})"
+
+
+class Notification(models.Model):
+    """An in-app notification delivered to a single user.
+
+    Surfaced by the frontend bell icon. Notifications are persisted in the
+    database (never client storage) and are created by backend flows such as a
+    dean assigning an instructor to an exam, or an instructor responding to a
+    workspace invite.
+    """
+
+    class NotifType(models.TextChoices):
+        EXAM_ASSIGNED = 'EXAM_ASSIGNED', 'Exam Assigned'
+        EXAM_UPDATED = 'EXAM_UPDATED', 'Exam Updated'
+        INVITE_ACCEPTED = 'INVITE_ACCEPTED', 'Invite Accepted'
+        INVITE_DECLINED = 'INVITE_DECLINED', 'Invite Declined'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    recipient = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='notifications',
+    )
+    notif_type = models.CharField(max_length=32, choices=NotifType.choices)
+    title = models.CharField(max_length=255)
+    body = models.TextField(blank=True)
+    is_read = models.BooleanField(default=False)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['recipient', 'is_read', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.notif_type} -> {self.recipient.email}"
+
+
+class WorkspaceInvite(models.Model):
+    """A dean's invitation for an instructor to supervise a specific exam.
+
+    The dean creates the invite; the instructor accepts or declines it via a
+    secret ``token`` embedded in an emailed link (no login required). The token
+    — not the primary key — is what the public accept/decline endpoints look up,
+    so the row id never has to be exposed in a URL.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = 'PENDING', 'Pending'
+        ACCEPTED = 'ACCEPTED', 'Accepted'
+        DECLINED = 'DECLINED', 'Declined'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    dean = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='sent_invites',
+    )
+    instructor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='received_invites',
+    )
+    exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name='invites')
+    token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    created_at = models.DateTimeField(auto_now_add=True)
+    responded_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['dean', 'created_at']),
+            models.Index(fields=['instructor', 'status']),
+        ]
+
+    def __str__(self):
+        return f"Invite {self.instructor.email} -> {self.exam.name} ({self.status})"
+
+
+class AutoExamSession(models.Model):
+    """A scheduled automatic camera-recording session for an exam.
+
+    The browser starts recording at ``scheduled_start`` and uploads the captured
+    video at ``scheduled_end``; the backend only stores the schedule. The start
+    time must always be in the future — never the past — which the create
+    serializer enforces.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name='auto_sessions')
+    instructor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='auto_sessions',
+    )
+    scheduled_start = models.DateTimeField()
+    scheduled_end = models.DateTimeField()
+    is_auto = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['scheduled_start']
+        indexes = [
+            models.Index(fields=['instructor', 'scheduled_start']),
+        ]
+
+    def __str__(self):
+        return f"Auto session {self.exam.name} @ {self.scheduled_start:%Y-%m-%d %H:%M}"

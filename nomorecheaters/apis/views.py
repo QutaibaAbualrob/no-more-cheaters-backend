@@ -4,14 +4,23 @@ from django.shortcuts import get_object_or_404
 from rest_framework import generics, status
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import AnalysisJob, AuditLog, Exam, ExamSession, UserPreferences
+from .models import (
+    AnalysisJob, AuditLog, AutoExamSession, Exam, ExamSession, Notification,
+    UserPreferences, Video, WorkspaceInvite,
+)
 from .selectors import (
+    actionable_exams, assigned_supervisor_ids, can_supervise_exam,
     is_admin, is_dean, owned_students, owned_videos, recent_day_window, users_visible_to,
 )
 from .serializers import (
+    AutoExamSessionCreateSerializer,
+    AutoExamSessionReadSerializer,
+    ExamReadSerializer,
+    NotificationSerializer,
     ReportReadSerializer,
     StudentSerializer,
     UserPreferencesReadSerializer,
@@ -20,6 +29,7 @@ from .serializers import (
     UserUpdateSerializer,
     VideoReadSerializer,
     VideoUploadSerializer,
+    WorkspaceInviteSerializer,
 )
 from .services import (
     activity_series_for,
@@ -27,6 +37,10 @@ from .services import (
     dashboard_stats_for,
     enqueue_analysis,
     get_available_upload_session,
+    recording_session_for,
+    resolve_calendar_exam,
+    respond_to_workspace_invite,
+    send_workspace_invite,
     system_metrics,
     update_global_thresholds,
     update_user_thresholds,
@@ -155,11 +169,29 @@ class VideoListView(APIView):
 
 
 class VideoDetailView(APIView):
-    """Retrieve a single uploaded video."""
+    """Retrieve or delete a single uploaded video."""
 
     def get(self, request, pk):
         video = get_object_or_404(owned_videos(request.user), pk=pk)
         return Response(VideoReadSerializer(video, context={'request': request}).data)
+
+    def delete(self, request, pk):
+        # Uploader or dean/admin only — looked up broadly (not just owned_videos)
+        # so an invited supervisor who uploaded, or a dean, can remove it. This
+        # frees the session so a new video can be uploaded again.
+        video = get_object_or_404(
+            Video.objects.select_related('uploaded_by', 'session__exam__instructor'),
+            pk=pk,
+        )
+        if not (is_dean(request.user) or video.uploaded_by_id == request.user.id):
+            raise PermissionDenied('Only the uploader or the dean can delete this video.')
+        write_audit_log(
+            request,
+            AuditLog.ActionType.VIDEO_DELETED,
+            target_resource=str(video.id),
+        )
+        video.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class VideoUploadView(APIView):
@@ -181,11 +213,27 @@ class VideoUploadView(APIView):
         )
         serializer.is_valid(raise_exception=True)
 
-        # Resolve the target session. When the client supplies one it is already
-        # validated (ownership) by the serializer; otherwise auto-create/reuse a
-        # direct-upload session for this instructor.
+        # Resolve the target session.
+        # 1. Calendar flow (exam_id): use the exam's single canonical recording
+        #    session, enforce supervisor permission, and reject a second upload
+        #    with 409 so the "already uploaded" button stays disabled.
+        # 2. Explicit session: already ownership-validated by the serializer.
+        # 3. Otherwise: auto-create/reuse a direct-upload session.
+        exam_id = request.data.get('exam_id')
         session = serializer.validated_data.get('session')
-        if session is None:
+        if exam_id:
+            exam = get_object_or_404(Exam, pk=exam_id)
+            if not can_supervise_exam(request.user, exam):
+                raise PermissionDenied(
+                    'Only assigned supervisors or the dean can upload for this exam.'
+                )
+            session = recording_session_for(exam)
+            if hasattr(session, 'video'):
+                return Response(
+                    {'detail': 'A video has already been uploaded for this session.'},
+                    status=status.HTTP_409_CONFLICT,
+                )
+        elif session is None:
             session = get_available_upload_session(
                 instructor=request.user,
                 upload=upload,
@@ -409,3 +457,236 @@ class HallManagementView(APIView):
             for exam in exams
         ]
         return Response(results)
+
+
+class NotificationListView(generics.ListAPIView):
+    """List the authenticated user's notifications (most recent first)."""
+
+    serializer_class = NotificationSerializer
+
+    def get_queryset(self):
+        return self.request.user.notifications.all()
+
+
+class UnreadNotificationsView(APIView):
+    """Return the count of unread notifications for the current user."""
+
+    def get(self, request):
+        count = request.user.notifications.filter(is_read=False).count()
+        return Response({'unread': count})
+
+
+class MarkNotificationsReadView(APIView):
+    """Mark every unread notification for the current user as read."""
+
+    def patch(self, request):
+        updated = request.user.notifications.filter(is_read=False).update(is_read=True)
+        return Response({'updated': updated})
+
+
+class WorkspaceInviteView(APIView):
+    """Dean workspace invites: list the ones you've sent, or send a new one."""
+
+    def get(self, request):
+        if not is_dean(request.user):
+            raise PermissionDenied('Only deans can manage workspace invites.')
+        invites = (
+            WorkspaceInvite.objects
+            .select_related('instructor', 'dean', 'exam')
+            .filter(dean=request.user)
+        )
+        return Response(WorkspaceInviteSerializer(invites, many=True).data)
+
+    def post(self, request):
+        if not is_dean(request.user):
+            raise PermissionDenied('Only deans can send workspace invites.')
+
+        instructor_email = (request.data.get('instructor_email') or '').strip()
+        exam_id = request.data.get('exam_id')
+        if not instructor_email:
+            raise ValidationError({'instructor_email': 'This field is required.'})
+        if not exam_id:
+            raise ValidationError({'exam_id': 'This field is required.'})
+
+        instructor = User.objects.filter(email__iexact=instructor_email).first()
+        if instructor is None:
+            raise ValidationError({'instructor_email': 'No user found with that email.'})
+
+        exam = get_object_or_404(Exam, pk=exam_id)
+        invite = send_workspace_invite(request.user, instructor, exam)
+        return Response(
+            WorkspaceInviteSerializer(invite).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class InviteRespondView(APIView):
+    """Public accept/decline endpoint reached from the invite email link.
+
+    Authentication is intentionally disabled: possession of the secret invite
+    token authorises the response, so the instructor never has to log in.
+    """
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    accepted = True  # overridden per-URL via .as_view(accepted=...)
+
+    def get(self, request, token):
+        invite = get_object_or_404(
+            WorkspaceInvite.objects.select_related('instructor', 'dean', 'exam'),
+            token=token,
+        )
+        already_responded = invite.status != WorkspaceInvite.Status.PENDING
+        respond_to_workspace_invite(invite, self.accepted)
+        return Response({
+            'status': invite.status,
+            'already_responded': already_responded,
+            'exam_name': invite.exam.name,
+            'instructor_email': invite.instructor.email,
+        })
+
+
+class AutoSessionListCreateView(generics.ListCreateAPIView):
+    """List the current user's auto recording sessions, or schedule a new one."""
+
+    def get_queryset(self):
+        queryset = AutoExamSession.objects.select_related('exam', 'instructor')
+        if is_admin(self.request.user):
+            return queryset
+        return queryset.filter(instructor=self.request.user)
+
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return AutoExamSessionCreateSerializer
+        return AutoExamSessionReadSerializer
+
+    def get_serializer_context(self):
+        return {**super().get_serializer_context(), 'request': self.request}
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        read = AutoExamSessionReadSerializer(instance, context={'request': request})
+        return Response(read.data, status=status.HTTP_201_CREATED)
+
+
+class AutoSessionDetailView(generics.DestroyAPIView):
+    """Cancel (delete) one of the current user's auto recording sessions."""
+
+    serializer_class = AutoExamSessionReadSerializer
+
+    def get_queryset(self):
+        queryset = AutoExamSession.objects.all()
+        if is_admin(self.request.user):
+            return queryset
+        return queryset.filter(instructor=self.request.user)
+
+
+def _exam_action_payload(request, exam):
+    """Build the calendar action/status payload for an exam's recording session.
+
+    Reports who (if anyone) has uploaded a video, the assigned supervisors, and
+    what the requesting user is allowed to do (manage / delete).
+    """
+    session = recording_session_for(exam)
+    video = getattr(session, 'video', None)
+    supervisor_emails = list(
+        User.objects.filter(id__in=assigned_supervisor_ids(exam))
+        .order_by('email')
+        .values_list('email', flat=True)
+    )
+    uploaded_by = None
+    can_delete = False
+    video_id = None
+    if video is not None:
+        video_id = str(video.id)
+        if video.uploaded_by_id:
+            uploaded_by = video.uploaded_by.email
+        elif exam.instructor_id:
+            uploaded_by = exam.instructor.email
+        can_delete = is_dean(request.user) or video.uploaded_by_id == request.user.id
+    return {
+        'exam_id': str(exam.id),
+        'session_id': str(session.id),
+        'name': exam.name,
+        'owner_email': exam.instructor.email if exam.instructor_id else None,
+        'supervisor_emails': supervisor_emails,
+        'can_manage': can_supervise_exam(request.user, exam),
+        'has_video': video is not None,
+        'uploaded_by': uploaded_by,
+        'video_id': video_id,
+        'can_delete': can_delete,
+    }
+
+
+class ExamResolveView(APIView):
+    """Resolve a calendar entry's name to a real shared Exam + its recording status.
+
+    The frontend calls this when an exam's modal opens so the Manual Analysis /
+    Auto Recording buttons can act on real backend records.
+    """
+
+    def post(self, request):
+        name = (request.data.get('name') or '').strip()
+        if not name:
+            raise ValidationError({'name': 'This field is required.'})
+        exam = resolve_calendar_exam(request.user, name)
+        return Response(_exam_action_payload(request, exam))
+
+
+class SessionVideoStatusView(APIView):
+    """Video status for an exam's canonical recording session (calendar buttons)."""
+
+    def get(self, request, exam_id):
+        exam = get_object_or_404(actionable_exams(request.user), pk=exam_id)
+        return Response(_exam_action_payload(request, exam))
+
+
+class UserLookupView(APIView):
+    """Look up a registered user by email — dean/admin only.
+
+    Powers the dean's "invite instructor" modal: the dean types only an email,
+    and this confirms it belongs to a real account and returns the person's
+    display name / username so they can be shown (read-only) before the invite
+    is sent. The frontend decides what to do with non-instructor roles, so this
+    endpoint returns the account regardless of role and only 404s when no
+    account has that email at all.
+    """
+
+    def get(self, request):
+        if not is_dean(request.user):
+            raise PermissionDenied('Only deans can look up instructors.')
+
+        email = (request.query_params.get('email') or '').strip()
+        if not email:
+            raise ValidationError({'email': 'This query parameter is required.'})
+
+        user = User.objects.filter(email__iexact=email).first()
+        if user is None:
+            return Response(
+                {'detail': 'No user found with this email address.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        display_name = (user.get_full_name() or '').strip() or user.username
+        return Response({
+            'id': str(user.id),
+            'email': user.email,
+            'username': user.username,
+            'display_name': display_name,
+            'role': user.role,
+        })
+
+
+class ExamListView(APIView):
+    """List exams the requesting user can assign instructors to.
+
+    Deans/admins see every exam; any other user sees the exams they own or have
+    accepted an invite to supervise. Used to populate the invite modal's exam
+    picker entirely from the backend (no mock data, no client storage).
+    """
+
+    def get(self, request):
+        exams = actionable_exams(request.user).order_by('-created_at')
+        return Response(ExamReadSerializer(exams, many=True).data)

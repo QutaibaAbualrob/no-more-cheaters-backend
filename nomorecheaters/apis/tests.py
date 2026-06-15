@@ -712,7 +712,7 @@ class DuplicateVideoHashTests(TestCase):
         self.settings_override.disable()
         shutil.rmtree(self.media_root, ignore_errors=True)
 
-    def test_duplicate_video_content_is_rejected(self):
+    def test_same_file_allowed_for_different_sessions_but_not_same_session(self):
         instructor = make_user()
         exam = make_exam(instructor=instructor)
         session1 = make_session(exam=exam, student_identifier='s1')
@@ -727,17 +727,24 @@ class DuplicateVideoHashTests(TestCase):
         self.assertTrue(ser1.is_valid(), ser1.errors)
         ser1.save()
 
+        # Same file, DIFFERENT session → now allowed (per-session uniqueness).
         upload2 = SimpleUploadedFile('exam2.mp4', content, content_type='video/mp4')
         ser2 = VideoUploadSerializer(
             data={'session': str(session2.id), 'file': upload2},
             context={'request': request_for(instructor)},
         )
         self.assertTrue(ser2.is_valid(), ser2.errors)
+        ser2.save()  # no exception — different session
 
-        with self.assertRaises(Exception) as ctx:
-            ser2.save()
-
-        self.assertIn('already been uploaded', str(ctx.exception))
+        # Same session that already has a video → rejected at validation time
+        # (the OneToOne session guard fires before any save).
+        upload3 = SimpleUploadedFile('exam1-again.mp4', content, content_type='video/mp4')
+        ser3 = VideoUploadSerializer(
+            data={'session': str(session1.id), 'file': upload3},
+            context={'request': request_for(instructor)},
+        )
+        self.assertFalse(ser3.is_valid())
+        self.assertIn('already exists', str(ser3.errors))
 
 
 class ExamSessionDefaultStatusTests(TestCase):
@@ -1042,3 +1049,95 @@ class PreanalyzeDemosCommandTests(TestCase):
 
         self.assertEqual(Video.objects.count(), 1)
         self.assertEqual(ExamSession.objects.count(), 1)
+
+
+class UserLookupAPITests(APITestCase):
+    """Invite-by-email modal: GET /api/users/lookup/?email= behaviour."""
+
+    def setUp(self):
+        self.dean = make_user(username='dean', email='dean@example.com', role=User.Role.DEAN)
+        self.instructor = make_user(username='prof.smith', email='smith@example.com')
+        self.instructor.first_name = 'Sarah'
+        self.instructor.last_name = 'Smith'
+        self.instructor.save(update_fields=['first_name', 'last_name'])
+
+    def test_lookup_requires_dean(self):
+        self.client.force_authenticate(self.instructor)
+
+        response = self.client.get(reverse('users_lookup'), {'email': self.instructor.email})
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_lookup_returns_404_for_unknown_email(self):
+        self.client.force_authenticate(self.dean)
+
+        response = self.client.get(reverse('users_lookup'), {'email': 'nobody@example.com'})
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_lookup_returns_account_with_display_name(self):
+        self.client.force_authenticate(self.dean)
+
+        response = self.client.get(reverse('users_lookup'), {'email': 'SMITH@example.com'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['id'], str(self.instructor.id))
+        self.assertEqual(response.data['email'], self.instructor.email)
+        self.assertEqual(response.data['username'], 'prof.smith')
+        self.assertEqual(response.data['display_name'], 'Sarah Smith')
+        self.assertEqual(response.data['role'], User.Role.INSTRUCTOR)
+
+    def test_lookup_display_name_falls_back_to_username(self):
+        self.client.force_authenticate(self.dean)
+        plain = make_user(username='plainuser', email='plain@example.com')
+
+        response = self.client.get(reverse('users_lookup'), {'email': plain.email})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['display_name'], 'plainuser')
+
+    def test_lookup_returns_role_for_non_instructor(self):
+        # A non-instructor account is still returned; the frontend shows the
+        # "not an instructor" message based on the role.
+        self.client.force_authenticate(self.dean)
+
+        response = self.client.get(reverse('users_lookup'), {'email': self.dean.email})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['role'], User.Role.DEAN)
+
+    def test_lookup_requires_email_param(self):
+        self.client.force_authenticate(self.dean)
+
+        response = self.client.get(reverse('users_lookup'))
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class ExamListAPITests(APITestCase):
+    """Invite modal exam picker: GET /api/exams/ scoping."""
+
+    def setUp(self):
+        self.dean = make_user(username='dean', email='dean@example.com', role=User.Role.DEAN)
+        self.owner = make_user(username='owner', email='owner@example.com')
+        self.other = make_user(username='other', email='other@example.com')
+        self.exam_a = make_exam(instructor=self.owner, name='Owner Exam A')
+        self.exam_b = make_exam(instructor=self.other, name='Other Exam B')
+
+    def test_dean_sees_every_exam(self):
+        self.client.force_authenticate(self.dean)
+
+        response = self.client.get(reverse('exams_list'))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        names = {row['name'] for row in response.data}
+        self.assertEqual(names, {'Owner Exam A', 'Other Exam B'})
+
+    def test_instructor_sees_only_their_own_exams(self):
+        self.client.force_authenticate(self.owner)
+
+        response = self.client.get(reverse('exams_list'))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        names = {row['name'] for row in response.data}
+        self.assertEqual(names, {'Owner Exam A'})

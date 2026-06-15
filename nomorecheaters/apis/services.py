@@ -2,15 +2,17 @@ import platform
 import sys
 from pathlib import Path
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.core.mail import send_mail
 from django.db import transaction
 from django.db.models import Count
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 from .models import (
-    Alert, AnalysisJob, AuditLog, Exam, ExamSession, Report,
-    SystemSettings, UserPreferences, Video,
+    Alert, AnalysisJob, AuditLog, Exam, ExamSession, Notification, Report,
+    SystemSettings, UserPreferences, Video, WorkspaceInvite,
 )
 from .selectors import is_admin, owned_reports, owned_sessions, owned_videos, recent_day_window
 
@@ -64,6 +66,91 @@ def write_audit_log(request, action, target_resource='', metadata=None):
         ip_address=get_client_ip(request),
         user_agent=request.META.get('HTTP_USER_AGENT', ''),
     )
+
+
+def create_notification(recipient, notif_type, title, body='', metadata=None):
+    """Create an in-app notification for *recipient* and return it.
+
+    Notifications live in the database only (never client storage) and are
+    surfaced by the frontend bell icon. Used by flows such as workspace-invite
+    assignment and invite responses.
+    """
+    return Notification.objects.create(
+        recipient=recipient,
+        notif_type=notif_type,
+        title=title,
+        body=body or '',
+        metadata=metadata or {},
+    )
+
+
+def send_workspace_invite(dean, instructor, exam):
+    """Create a workspace invite, email the instructor, and notify them in-app.
+
+    The email contains accept/decline links that point at the frontend
+    (``FRONTEND_URL``); the instructor does not need to be logged in to respond.
+    Returns the created :class:`WorkspaceInvite`.
+    """
+    invite = WorkspaceInvite.objects.create(dean=dean, instructor=instructor, exam=exam)
+
+    frontend = settings.FRONTEND_URL.rstrip('/')
+    accept_url = f'{frontend}/invite/{invite.token}/accept'
+    decline_url = f'{frontend}/invite/{invite.token}/decline'
+    message = (
+        'Hello,\n\n'
+        f'{dean.email} has assigned you to supervise the exam "{exam.name}" '
+        'on the No More Cheaters platform.\n\n'
+        f'Accept:  {accept_url}\n'
+        f'Decline: {decline_url}\n\n'
+        'If you did not expect this invitation you can safely ignore this email.\n'
+    )
+    send_mail(
+        subject=f'Invitation to supervise "{exam.name}"',
+        message=message,
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        recipient_list=[instructor.email],
+        fail_silently=False,
+    )
+
+    create_notification(
+        instructor,
+        Notification.NotifType.EXAM_ASSIGNED,
+        f'Assigned to {exam.name}',
+        f'{dean.email} invited you to supervise "{exam.name}".',
+        metadata={'invite_id': str(invite.id), 'exam_id': str(exam.id)},
+    )
+    return invite
+
+
+def respond_to_workspace_invite(invite, accepted):
+    """Record an accept/decline response and notify the dean.
+
+    Idempotent: once an invite has been responded to, repeat calls leave it
+    unchanged and send no further notifications.
+    """
+    if invite.status != WorkspaceInvite.Status.PENDING:
+        return invite
+
+    invite.status = (
+        WorkspaceInvite.Status.ACCEPTED if accepted else WorkspaceInvite.Status.DECLINED
+    )
+    invite.responded_at = timezone.now()
+    invite.save(update_fields=['status', 'responded_at'])
+
+    verb = 'accepted' if accepted else 'declined'
+    notif_type = (
+        Notification.NotifType.INVITE_ACCEPTED
+        if accepted
+        else Notification.NotifType.INVITE_DECLINED
+    )
+    create_notification(
+        invite.dean,
+        notif_type,
+        f'Invite {verb}',
+        f'{invite.instructor.email} {verb} the invite to "{invite.exam.name}".',
+        metadata={'invite_id': str(invite.id), 'exam_id': str(invite.exam_id)},
+    )
+    return invite
 
 
 def threshold_payload(values, updated_at=None):
@@ -195,6 +282,50 @@ def get_available_upload_session(instructor, upload, exam_name='', student_ident
             return session
         suffix += 1
         candidate = f'{base_identifier}-{suffix}'
+
+
+def recording_session_for(exam):
+    """Return the single canonical recording :class:`ExamSession` for an exam.
+
+    The calendar treats each exam as one recordable session, so video status,
+    manual uploads, and auto recording all target this same row (create on first
+    use).
+    """
+    session, _created = ExamSession.objects.get_or_create(
+        exam=exam,
+        student_identifier='__recording__',
+    )
+    return session
+
+
+def resolve_calendar_exam(user, name):
+    """Resolve a calendar entry name to a real, shared :class:`Exam` for *user*.
+
+    Prefers an exam the user already owns or is an accepted supervisor of — so an
+    invited instructor and the owning dean operate on the SAME exam — and only
+    creates a new owned exam when nothing matches. This bridges the mock calendar
+    entries to real, permission-checked backend records.
+    """
+    name = (name or '').strip() or 'Exam'
+    owned = Exam.objects.filter(instructor=user, name=name).first()
+    if owned is not None:
+        return owned
+    invited = (
+        Exam.objects
+        .filter(
+            name=name,
+            invites__instructor=user,
+            invites__status=WorkspaceInvite.Status.ACCEPTED,
+        )
+        .first()
+    )
+    if invited is not None:
+        return invited
+    return Exam.objects.create(
+        instructor=user,
+        name=name,
+        description='Created from the calendar for video analysis / recording.',
+    )
 
 
 def enqueue_analysis(request, video):
