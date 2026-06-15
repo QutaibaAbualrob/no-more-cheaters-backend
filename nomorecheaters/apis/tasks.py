@@ -13,8 +13,8 @@ from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.utils import timezone
 
-from .models import AnalysisJob, AuditLog, ExamSession
-from .services import build_ai_report, record_audit_log
+from .models import AnalysisJob, AuditLog, ExamSession, Notification
+from .services import build_ai_report, create_notification, record_audit_log
 
 
 User = get_user_model()
@@ -66,6 +66,17 @@ def run_analysis(job_id, actor_id=None):
     video_id = str(session.video.id) if hasattr(session, 'video') else str(session.id)
     record_audit_log(AuditLog.ActionType.ANALYSIS_COMPLETED, user=actor, target_resource=video_id)
     record_audit_log(AuditLog.ActionType.REPORT_GENERATED, user=actor, target_resource=str(report.id))
+
+    # Tell the exam's instructor their report is ready.
+    instructor = session.exam.instructor
+    if instructor is not None:
+        create_notification(
+            instructor,
+            Notification.NotifType.EXAM_UPDATED,
+            f'Analysis complete for {session.exam.name}',
+            f'{report.total_alerts} alerts detected. View the full report.',
+            metadata={'session_id': str(session.id)},
+        )
     return str(report.id)
 
 

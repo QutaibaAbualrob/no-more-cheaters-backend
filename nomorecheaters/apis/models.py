@@ -322,7 +322,7 @@ class Alert(models.Model):
         help_text='URL to the cropped face image of the flagged person at this alert.',
     )
     clip_url = models.CharField(
-        max_length=500, blank=True,
+        max_length=500, blank=True, default='',
         help_text='URL to the 3-second video clip centred on this alert.',
     )
     is_reviewed = models.BooleanField(default=False)
@@ -524,6 +524,8 @@ class Notification(models.Model):
     class NotifType(models.TextChoices):
         EXAM_ASSIGNED = 'EXAM_ASSIGNED', 'Exam Assigned'
         EXAM_UPDATED = 'EXAM_UPDATED', 'Exam Updated'
+        EXAM_CANCELLED = 'EXAM_CANCELLED', 'Exam Cancelled'
+        WORKSPACE_INVITE = 'WORKSPACE_INVITE', 'Workspace Invite'
         INVITE_ACCEPTED = 'INVITE_ACCEPTED', 'Invite Accepted'
         INVITE_DECLINED = 'INVITE_DECLINED', 'Invite Declined'
 

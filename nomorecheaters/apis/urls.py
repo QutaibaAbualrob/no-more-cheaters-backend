@@ -2,6 +2,7 @@
 from django.urls import path
 
 from .views import (
+    AlertReviewView,
     AllWorkspaceMembersView,
     AnalyzeVideoView,
     AutoSessionDetailView,
@@ -11,6 +12,7 @@ from .views import (
     DeleteUserView,
     DismissAllNotificationsView,
     DismissNotificationView,
+    ExamDetailView,
     ExamListView,
     ExamResolveView,
     GlobalThresholdsView,
@@ -80,8 +82,11 @@ urlpatterns = [
     path('auto-sessions/<uuid:pk>/', AutoSessionDetailView.as_view(), name='auto_session_detail'),
     path('exams/', ExamListView.as_view(), name='exams_list'),
     path('exams/resolve/', ExamResolveView.as_view(), name='exams_resolve'),
+    path('exams/<uuid:pk>/', ExamDetailView.as_view(), name='exam_detail'),
     path('sessions/<uuid:exam_id>/video-status/', SessionVideoStatusView.as_view(), name='session_video_status'),
     path('sessions/<uuid:session_id>/report/', SessionReportView.as_view(), name='session_report'),
+    path('alerts/<uuid:alert_id>/dismiss/', AlertReviewView.as_view(action='dismiss'), name='alert_dismiss'),
+    path('alerts/<uuid:alert_id>/flag/', AlertReviewView.as_view(action='flag'), name='alert_flag'),
     path('<uuid:pk>/activity/', UserActivityView.as_view(), name='user_activity'),
     path('<uuid:pk>/', DeleteUserView.as_view(), name='delete_user'),
 ]

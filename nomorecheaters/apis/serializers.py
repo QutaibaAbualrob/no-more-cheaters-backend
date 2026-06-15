@@ -126,6 +126,7 @@ class NotificationSerializer(serializers.ModelSerializer):
     """
 
     invite_status = serializers.SerializerMethodField()
+    invite_token = serializers.SerializerMethodField()
 
     class Meta:
         model = Notification
@@ -137,6 +138,7 @@ class NotificationSerializer(serializers.ModelSerializer):
             'is_read',
             'is_dismissed',
             'invite_status',
+            'invite_token',
             'metadata',
             'created_at',
         ]
@@ -148,6 +150,10 @@ class NotificationSerializer(serializers.ModelSerializer):
             return None
         invite = WorkspaceInvite.objects.filter(pk=invite_id).only('status').first()
         return invite.status if invite else None
+
+    def get_invite_token(self, obj):
+        """The secret token for accept/decline, surfaced for invite notifications."""
+        return (obj.metadata or {}).get('token')
 
 
 class WorkspaceInviteSerializer(serializers.ModelSerializer):

@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 
 
@@ -255,11 +257,49 @@ def _make_writer(cv2, out_path: str, fps: float, size):
     return None
 
 
+def _reencode_h264(src_path: str, dst_path: str) -> bool:
+    """Re-encode *src_path* to a browser-playable H.264/AAC MP4 at *dst_path*.
+
+    OpenCV's bundled FFmpeg can rarely write H.264 (the ``avc1`` encoder is
+    usually absent for licensing reasons), so clips written by
+    :func:`extract_clip` fall back to ``mp4v`` — which Chrome/Firefox refuse to
+    play inside an HTML5 ``<video>`` tag. When the system ``ffmpeg`` binary is
+    available we transcode to ``libx264`` + ``yuv420p`` (the pixel format browsers
+    require) so the clip plays inline. Returns ``True`` only when a non-empty
+    output file was produced; the caller keeps the original clip otherwise, so a
+    missing ffmpeg never breaks analysis.
+    """
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg, '-y',
+                '-i', str(src_path),
+                '-vcodec', 'libx264',
+                '-pix_fmt', 'yuv420p',
+                '-movflags', '+faststart',
+                '-an',  # the source clip carries no audio track
+                str(dst_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and os.path.exists(dst_path) and os.path.getsize(dst_path) > 0
+
+
 def extract_clip(video_path: str, timestamp_sec: float, out_path: str,
                  before: float = 1.0, after: float = 2.0) -> bool:
     """Save a clip spanning ``[t-before, t+after]`` to *out_path* (mp4).
 
-    Returns ``True`` when a non-empty clip was written.
+    The frames are first written with OpenCV; the result is then re-encoded to
+    browser-friendly H.264 with ffmpeg when that binary is installed (see
+    :func:`_reencode_h264`). Returns ``True`` when a non-empty clip exists at
+    *out_path*.
     """
     import cv2
 
@@ -280,7 +320,10 @@ def extract_clip(video_path: str, timestamp_sec: float, out_path: str,
     end_frame = int((timestamp_sec + after) * fps)
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    writer = _make_writer(cv2, out_path, fps, (width, height))
+    # OpenCV writes to a temp file; ffmpeg then transcodes it to the final
+    # H.264 path. If ffmpeg is missing we just promote the temp file as-is.
+    raw_path = f'{out_path}.raw.mp4'
+    writer = _make_writer(cv2, raw_path, fps, (width, height))
     if writer is None:
         capture.release()
         return False
@@ -299,4 +342,23 @@ def extract_clip(video_path: str, timestamp_sec: float, out_path: str,
     finally:
         writer.release()
         capture.release()
-    return written > 0
+
+    if written <= 0:
+        _safe_remove(raw_path)
+        return False
+
+    if _reencode_h264(raw_path, out_path):
+        _safe_remove(raw_path)
+    else:
+        # No ffmpeg (or it failed): keep the OpenCV clip at the final path.
+        os.replace(raw_path, out_path)
+    return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+
+
+def _safe_remove(path: str) -> None:
+    """Delete *path* if it exists, ignoring any IO error."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass

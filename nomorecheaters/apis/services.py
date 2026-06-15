@@ -1,3 +1,4 @@
+import logging
 import platform
 import sys
 from pathlib import Path
@@ -19,6 +20,8 @@ from .selectors import is_admin, owned_reports, owned_sessions, owned_videos, re
 
 
 User = get_user_model()
+
+logger = logging.getLogger(__name__)
 
 THRESHOLD_DEFAULTS = {
     'gaze_threshold': 0.65,
@@ -85,27 +88,21 @@ def create_notification(recipient, notif_type, title, body='', metadata=None):
     )
 
 
-def send_workspace_invite(dean, instructor, exam=None, workspace=None):
-    """Create an invite, email the instructor, and notify them in-app.
+def email_workspace_invite(invite):
+    """Send (or resend) the accept/decline email for an invite. Best-effort.
 
-    Targets a *workspace* (joining it on accept) and/or an *exam* (legacy
-    supervisor assignment); at least one should be supplied. The email contains
-    accept/decline links pointing at the frontend (``FRONTEND_URL``); the
-    instructor does not need to be logged in to respond. Returns the created
-    :class:`WorkspaceInvite`.
+    Returns ``True`` when the email was sent, ``False`` when sending failed —
+    the caller keeps the invite either way so a flaky mail server never blocks
+    the workflow.
     """
-    invite = WorkspaceInvite.objects.create(
-        dean=dean, instructor=instructor, exam=exam, workspace=workspace,
-    )
     target = invite.target_name
-
     frontend = settings.FRONTEND_URL.rstrip('/')
     accept_url = f'{frontend}/invite/{invite.token}/accept'
     decline_url = f'{frontend}/invite/{invite.token}/decline'
-    if workspace is not None:
-        action_line = f'{dean.email} has invited you to join the workspace "{target}"'
+    if invite.workspace_id:
+        action_line = f'{invite.dean.email} has invited you to join the workspace "{target}"'
     else:
-        action_line = f'{dean.email} has assigned you to supervise the exam "{target}"'
+        action_line = f'{invite.dean.email} has assigned you to supervise the exam "{target}"'
     message = (
         'Hello,\n\n'
         f'{action_line} on the No More Cheaters platform.\n\n'
@@ -113,27 +110,86 @@ def send_workspace_invite(dean, instructor, exam=None, workspace=None):
         f'Decline: {decline_url}\n\n'
         'If you did not expect this invitation you can safely ignore this email.\n'
     )
-    send_mail(
-        subject=f'Invitation to join "{target}"',
-        message=message,
-        from_email=settings.DEFAULT_FROM_EMAIL,
-        recipient_list=[instructor.email],
-        fail_silently=False,
-    )
+    try:
+        send_mail(
+            subject=f'Invitation to join "{target}"',
+            message=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[invite.instructor.email],
+            fail_silently=False,
+        )
+        return True
+    except Exception:  # noqa: BLE001 — email is best-effort, never fatal
+        logger.exception('Failed to send workspace invite email for invite %s', invite.id)
+        return False
 
-    metadata = {'invite_id': str(invite.id)}
+
+def send_workspace_invite(dean, instructor, exam=None, workspace=None):
+    """Create an invite, email the invitee (best-effort), and notify them in-app.
+
+    Targets a *workspace* (joining it on accept) and/or an *exam* (legacy
+    supervisor assignment); at least one should be supplied. Returns the created
+    :class:`WorkspaceInvite`. A failing mail server is logged but does not abort
+    the invite — the row and notification are still saved.
+    """
+    invite = WorkspaceInvite.objects.create(
+        dean=dean, instructor=instructor, exam=exam, workspace=workspace,
+    )
+    email_workspace_invite(invite)
+
+    target = invite.target_name
+    metadata = {'invite_id': str(invite.id), 'token': str(invite.token)}
     if workspace is not None:
         metadata['workspace_id'] = str(workspace.id)
-    if exam is not None:
-        metadata['exam_id'] = str(exam.id)
-    create_notification(
-        instructor,
-        Notification.NotifType.EXAM_ASSIGNED,
-        f'Invited to {target}',
-        f'{dean.email} invited you to "{target}".',
-        metadata=metadata,
-    )
+        metadata['workspace_name'] = workspace.name
+        notif_type = Notification.NotifType.WORKSPACE_INVITE
+        title = f'{dean.email} invited you to join workspace: {target}'
+        body = 'Click to view the invite and accept or decline'
+    else:
+        if exam is not None:
+            metadata['exam_id'] = str(exam.id)
+        notif_type = Notification.NotifType.EXAM_ASSIGNED
+        title = f'{dean.email} invited you to "{target}"'
+        body = 'Click to view the invite and accept or decline'
+
+    create_notification(instructor, notif_type, title, body, metadata=metadata)
     return invite
+
+
+def exam_supervisor_users(exam, extra_user_ids=None):
+    """Resolve the people who supervise *exam* and should be notified of changes.
+
+    That is the exam owner, every instructor with an ACCEPTED invite for the
+    exam, plus any extra user ids the caller supplies (e.g. the calendar's
+    selected supervisors). Returns a list of distinct :class:`User` objects.
+    """
+    ids = {exam.instructor_id}
+    ids.update(
+        WorkspaceInvite.objects
+        .filter(exam=exam, status=WorkspaceInvite.Status.ACCEPTED)
+        .values_list('instructor_id', flat=True)
+    )
+    for raw in (extra_user_ids or []):
+        if raw:
+            ids.add(raw)
+    ids.discard(None)
+    return list(User.objects.filter(id__in=ids))
+
+
+def notify_users(users, notif_type, title, body, metadata=None):
+    """In-app notification + best-effort email for each user in *users*."""
+    for user in users:
+        create_notification(user, notif_type, title, body, metadata=metadata)
+        try:
+            send_mail(
+                subject=title,
+                message=body,
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[user.email],
+                fail_silently=True,
+            )
+        except Exception:  # noqa: BLE001 — email is best-effort
+            logger.exception('Failed to email %s for %s', user.email, notif_type)
 
 
 def respond_to_workspace_invite(invite, accepted):
@@ -464,6 +520,23 @@ def _severity_for(confidence):
     return Alert.Severity.LOW
 
 
+# Severity → risk weight for the overall report probability (a simple average
+# of these, capped at 1.0).
+_SEVERITY_WEIGHTS = {
+    Alert.Severity.HIGH: 1.0,
+    Alert.Severity.MEDIUM: 0.6,
+    Alert.Severity.LOW: 0.3,
+}
+
+
+def _report_probability(alerts):
+    """Overall cheating probability: mean severity weight, capped at 1.0."""
+    if not alerts:
+        return 0.0
+    weights = [_SEVERITY_WEIGHTS.get(alert.severity, 0.3) for alert in alerts]
+    return round(min(1.0, sum(weights) / len(weights)), 2)
+
+
 def _cheating_probability(events):
     """Combine event confidences into an overall 0–1 cheating probability.
 
@@ -516,6 +589,12 @@ def _attach_alert_evidence(video, session, alerts):
 
         metadata = dict(alert.metadata or {})
         metadata['person_id'] = person_id
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            metadata['bbox'] = [
+                int(round(x1)), int(round(y1)),
+                int(round(x2 - x1)), int(round(y2 - y1)),
+            ]
         alert.metadata = metadata
 
         snapshot_rel = f'snapshots/{session.id}/{alert.id}.jpg'
@@ -581,22 +660,25 @@ def build_ai_report(session, job=None):
     # Enrich each alert with a face crop, a 3-second clip, and a person id.
     _attach_alert_evidence(video, session, alerts)
 
-    alerts_by_type = dict(result.metadata.get('events_by_type', {}))
+    # Aggregate from the persisted alerts (now enriched with person ids), so the
+    # report reflects exactly what was saved.
+    alerts_by_type = {}
+    person_ids = set()
+    for alert in alerts:
+        alerts_by_type[alert.behavior_type] = alerts_by_type.get(alert.behavior_type, 0) + 1
+        person_id = (alert.metadata or {}).get('person_id')
+        if person_id:
+            person_ids.add(person_id)
+
     total_alerts = len(alerts)
-    probability = _cheating_probability(result.events)
+    person_count = len(person_ids) or (1 if total_alerts else 0)
+    probability = _report_probability(alerts)
     processing_time = result.metadata.get('processing_time_seconds')
 
     if total_alerts:
-        summary = (
-            f'AI analysis flagged {total_alerts} event(s) across '
-            f'{result.metadata.get("frames_analyzed", 0)} sampled frame(s). '
-            f'Overall cheating probability: {probability:.0%}.'
-        )
+        summary = f'{total_alerts} alert(s) detected across {person_count} person(s).'
     else:
-        summary = (
-            'AI analysis completed with no suspicious behaviour detected '
-            f'across {result.metadata.get("frames_analyzed", 0)} sampled frame(s).'
-        )
+        summary = 'No suspicious activity detected in this session.'
 
     report, _created = Report.objects.update_or_create(
         session=session,
