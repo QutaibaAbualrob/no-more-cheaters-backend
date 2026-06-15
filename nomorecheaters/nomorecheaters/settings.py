@@ -155,13 +155,17 @@ TEMPLATES = [
 ]
 
 # ── Email (workspace invites, verification, password resets) ──────────────────
-# Uses Resend SMTP. Override via env in production.
-EMAIL_BACKEND = env('EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend')
-EMAIL_HOST = env('EMAIL_HOST', 'smtp.resend.com')
-EMAIL_PORT = int(env('EMAIL_PORT', '587'))
-EMAIL_USE_TLS = env_bool('EMAIL_USE_TLS', True)
-EMAIL_HOST_USER = env('EMAIL_HOST_USER', 'resend')
-EMAIL_HOST_PASSWORD = env('EMAIL_HOST_PASSWORD', '')
+# When EMAIL_HOST_PASSWORD is set → Resend SMTP. Otherwise → console (dev).
+_EMAIL_PASSWORD = env('EMAIL_HOST_PASSWORD', '')
+if _EMAIL_PASSWORD:
+    EMAIL_BACKEND = env('EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend')
+    EMAIL_HOST = env('EMAIL_HOST', 'smtp.resend.com')
+    EMAIL_PORT = int(env('EMAIL_PORT', '587'))
+    EMAIL_USE_TLS = env_bool('EMAIL_USE_TLS', True)
+    EMAIL_HOST_USER = env('EMAIL_HOST_USER', 'resend')
+    EMAIL_HOST_PASSWORD = _EMAIL_PASSWORD
+else:
+    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', 'noreply@nomorecheater.online')
 
 SITE_ID = 1
@@ -169,7 +173,7 @@ SITE_ID = 1
 # Settings for allauth email login.
 ACCOUNT_LOGIN_METHODS = {'email'}
 ACCOUNT_SIGNUP_FIELDS = ['email*', 'password1*', 'password2*']
-ACCOUNT_EMAIL_VERIFICATION = env('ACCOUNT_EMAIL_VERIFICATION', 'mandatory')
+ACCOUNT_EMAIL_VERIFICATION = env('ACCOUNT_EMAIL_VERIFICATION', 'optional')
 
 # allauth requires its backend alongside Django's default ModelBackend.
 AUTHENTICATION_BACKENDS = [
