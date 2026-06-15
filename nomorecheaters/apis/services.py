@@ -493,7 +493,7 @@ def _attach_alert_evidence(video, session, alerts):
         return
 
     try:
-        from apis.ai.face_tracker import extract_clip, extract_face_crop, track_persons
+        from .ai.face_tracker import extract_clip, extract_face_crop, track_persons
     except Exception:  # noqa: BLE001 — OpenCV missing → skip evidence entirely
         return
 
@@ -549,7 +549,7 @@ def build_ai_report(session, job=None):
     reflects the latest analysis. Heavy dependencies (OpenCV, ultralytics) are
     imported lazily here so the service module stays cheap to import.
     """
-    from apis.ai import analyze_video
+    from .ai import analyze_video
 
     video = getattr(session, 'video', None)
     if video is None or not video.file:
