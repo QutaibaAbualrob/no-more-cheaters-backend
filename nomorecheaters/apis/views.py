@@ -1218,22 +1218,20 @@ class ExamDetailView(APIView):
         if not (is_admin(request.user) or is_dean(request.user)):
             raise PermissionDenied('Only deans or administrators can delete exams.')
 
-        # Resolve recipients and compose the message *before* deleting the exam.
+        # Resolve recipients and capture the message fields *before* deleting —
+        # the supervisor links and the exam's own attributes are gone once the
+        # cascade runs. We only *send* after the delete succeeds (see below).
         supervisors = exam_supervisor_users(exam, request.data.get('supervisor_ids'))
         name = exam.name
         exam_id = str(exam.id)
         date = request.data.get('date') or 'its scheduled date'
         time = request.data.get('time') or 'its scheduled time'
-        notify_users(
-            supervisors,
-            Notification.NotifType.EXAM_CANCELLED,
-            f'Exam cancelled: {name}',
-            f'The exam "{name}" scheduled for {date} at {time} has been deleted. '
-            f'All sessions and uploaded videos were removed. This cannot be undone.',
-            metadata={'exam_name': name},
-        )
-        # Remove on-disk media (videos, clips, snapshots) before the DB cascade
-        # drops the rows that point at them.
+
+        # Delete first, notify last (M11). Media goes before the DB cascade so the
+        # rows pointing at the files still exist while the files are removed; the
+        # "exam cancelled" emails are sent only once the exam is actually gone, so
+        # a disk error mid-delete never tells recipients an exam was removed while
+        # it still exists.
         delete_exam_media(exam)
         write_audit_log(
             request,
@@ -1242,4 +1240,13 @@ class ExamDetailView(APIView):
             metadata={'name': name},
         )
         exam.delete()
+
+        notify_users(
+            supervisors,
+            Notification.NotifType.EXAM_CANCELLED,
+            f'Exam cancelled: {name}',
+            f'The exam "{name}" scheduled for {date} at {time} has been deleted. '
+            f'All sessions and uploaded videos were removed. This cannot be undone.',
+            metadata={'exam_name': name},
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)

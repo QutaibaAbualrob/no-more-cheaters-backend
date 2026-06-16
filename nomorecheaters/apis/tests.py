@@ -1226,6 +1226,45 @@ class MediaUrlForTests(TestCase):
         self.assertIsNone(_media_url_for(''))
 
 
+class ExamDeleteOrderingTests(APITestCase):
+    """M11: exam deletion must finish before the 'cancelled' emails go out."""
+
+    def _setup(self):
+        dean = make_user(username='deanDEL', email='deandel@example.com',
+                         role=User.Role.DEAN)
+        exam = make_exam(instructor=dean)
+        self.client.force_authenticate(dean)
+        return dean, exam
+
+    def test_notifications_not_sent_when_media_delete_fails(self):
+        dean, exam = self._setup()
+
+        # Media cleanup blows up (disk error) mid-delete. The exam must remain,
+        # and recipients must NOT have been told it was cancelled.
+        with mock.patch('apis.views.notify_users') as notify, \
+                mock.patch('apis.views.delete_exam_media',
+                           side_effect=OSError('disk gone')):
+            with self.assertRaises(OSError):
+                self.client.delete(
+                    reverse('exam_detail', kwargs={'pk': exam.id}))
+
+        notify.assert_not_called()
+        self.assertTrue(Exam.objects.filter(pk=exam.id).exists())
+
+    def test_delete_then_notify_on_success(self):
+        dean, exam = self._setup()
+
+        with mock.patch('apis.views.notify_users') as notify, \
+                mock.patch('apis.views.delete_exam_media') as media:
+            response = self.client.delete(
+                reverse('exam_detail', kwargs={'pk': exam.id}))
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Exam.objects.filter(pk=exam.id).exists())
+        media.assert_called_once()
+        notify.assert_called_once()
+
+
 class DuplicateVideoHashTests(TestCase):
     """Issue 7 / FR4: duplicate video uploads must be rejected cleanly."""
 
