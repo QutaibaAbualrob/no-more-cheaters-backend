@@ -1033,6 +1033,28 @@ class ReportProbabilityTests(TestCase):
         certain = [self._alert(Alert.BehaviorType.PHONE_DETECTED, 1.0)]
         self.assertLessEqual(_report_probability(certain), 0.99)
 
+    def test_scoring_uses_raw_confidence_not_severity_bucket(self):
+        """H1: two alerts in the *same* severity bucket but with different raw
+        confidences must score differently.
+
+        ``_severity_for`` collapses confidence into 3 buckets (LOW/MEDIUM/HIGH).
+        The old formula keyed scoring on that bucket, so 0.51 and 0.79 (both
+        MEDIUM) were indistinguishable. Scoring now reads ``confidence_score``
+        directly, so the raw precision must survive into the report.
+        """
+        from apis.services import _report_probability, _severity_for
+
+        low_mid = self._alert(Alert.BehaviorType.LOOKING_AWAY, 0.51)
+        high_mid = self._alert(Alert.BehaviorType.LOOKING_AWAY, 0.79)
+        # Both land in the same severity bucket...
+        self.assertEqual(_severity_for(0.51), _severity_for(0.79))
+        self.assertEqual(_severity_for(0.51), Alert.Severity.MEDIUM)
+        # ...yet the report distinguishes them by raw confidence.
+        self.assertNotEqual(
+            _report_probability([low_mid]), _report_probability([high_mid]),
+        )
+        self.assertLess(_report_probability([low_mid]), _report_probability([high_mid]))
+
 
 class ClearSessionEvidenceTests(TestCase):
     """C5: re-analysis wipes a session's prior clip/snapshot files on disk."""
