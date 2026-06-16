@@ -540,6 +540,7 @@ class VideoReadSerializer(serializers.ModelSerializer):
     """
 
     file_url = serializers.SerializerMethodField()
+    annotated_video_url = serializers.SerializerMethodField()
     analysis = serializers.SerializerMethodField()
     exam_name = serializers.CharField(source='session.exam.name', read_only=True)
     student_identifier = serializers.CharField(source='session.student_identifier', read_only=True)
@@ -555,6 +556,7 @@ class VideoReadSerializer(serializers.ModelSerializer):
             'student_identifier',
             'session_status',
             'file_url',
+            'annotated_video_url',
             'analysis',
             'original_filename',
             'content_type',
@@ -580,6 +582,21 @@ class VideoReadSerializer(serializers.ModelSerializer):
         if request is None:
             return obj.file.url
         return request.build_absolute_uri(obj.file.url)
+
+    def get_annotated_video_url(self, obj):
+        """Absolute URL to the annotated analysis video, or ``None``.
+
+        The pipeline writes a full-length copy of the video with detection
+        boxes/labels drawn on flagged frames and stores its ``/media/...`` URL
+        on the session's :class:`AnalysisJob` metadata (H8). Returns ``None``
+        until analysis has produced one.
+        """
+        job = getattr(obj.session, 'analysis_job', None)
+        url = (job.metadata or {}).get('annotated_video_url') if job else None
+        if not url:
+            return None
+        request = self.context.get('request')
+        return request.build_absolute_uri(url) if request is not None else url
 
     def get_analysis(self, obj):
         """Include the session report when analysis has completed."""

@@ -370,6 +370,54 @@ class VideoUploadSerializerTests(TestCase):
         self.assertIn('duration_seconds', serializer.errors)
 
 
+class VideoReadSerializerAnnotatedVideoTests(TestCase):
+    """H8: VideoReadSerializer exposes the annotated analysis video URL."""
+
+    def _video(self, session):
+        return Video.objects.create(
+            session=session,
+            file='exam-videos/test/test.mp4',
+            original_filename='test.mp4',
+            file_hash='a' * 64,
+        )
+
+    def test_annotated_video_url_from_job_metadata(self):
+        from apis.serializers import VideoReadSerializer
+
+        session = make_session()
+        video = self._video(session)
+        AnalysisJob.objects.create(
+            session=session,
+            metadata={'annotated_video_url': '/media/exam-videos/test/test.annotated.mp4'},
+        )
+
+        # No request in context → the raw stored URL is returned verbatim.
+        data = VideoReadSerializer(video, context={}).data
+        self.assertEqual(
+            data['annotated_video_url'],
+            '/media/exam-videos/test/test.annotated.mp4',
+        )
+
+    def test_annotated_video_url_none_without_metadata_key(self):
+        from apis.serializers import VideoReadSerializer
+
+        session = make_session()
+        video = self._video(session)
+        AnalysisJob.objects.create(session=session, metadata={})
+
+        data = VideoReadSerializer(video, context={}).data
+        self.assertIsNone(data['annotated_video_url'])
+
+    def test_annotated_video_url_none_without_job(self):
+        from apis.serializers import VideoReadSerializer
+
+        session = make_session()
+        video = self._video(session)
+
+        data = VideoReadSerializer(video, context={}).data
+        self.assertIsNone(data['annotated_video_url'])
+
+
 class AlertSerializerTests(TestCase):
     """Verify the review and un-review workflow via AlertReviewSerializer."""
 
