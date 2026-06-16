@@ -1557,6 +1557,53 @@ class ConsolidateEventsTrackingTests(APITestCase):
         self.assertEqual(len(events), 2)
 
 
+class FfmpegTimeoutTests(APITestCase):
+    """M7: the ffmpeg re-encode is bounded so a wedged process can't hang a worker.
+
+    The single ``subprocess.run`` (in ``_reencode_h264``) carries a timeout; the
+    short evidence clips use the default, while the full annotated-video re-encode
+    passes a larger, duration-scaled budget so a long-but-healthy transcode is not
+    killed prematurely. A timeout is treated like any ffmpeg failure (returns
+    ``False``), so the caller falls back to the mp4v output.
+    """
+
+    def test_reencode_timeout_scales_and_clamps(self):
+        from apis.ai.detector import _reencode_timeout_for
+
+        # Short/zero durations get the floor; long ones scale; huge ones clamp.
+        self.assertEqual(_reencode_timeout_for(0), 120.0)
+        self.assertEqual(_reencode_timeout_for(5), 120.0)       # 5*6=30 < floor
+        self.assertEqual(_reencode_timeout_for(60), 360.0)      # 60*6, within range
+        self.assertEqual(_reencode_timeout_for(100000), 1800.0)  # clamped to ceiling
+
+    def test_reencode_forwards_timeout_to_subprocess(self):
+        from apis.ai import face_tracker
+
+        with mock.patch('apis.ai.face_tracker._ffmpeg_exe', return_value='ffmpeg'), \
+                mock.patch('apis.ai.face_tracker.subprocess.run') as run, \
+                mock.patch('apis.ai.face_tracker.os.path.exists', return_value=True), \
+                mock.patch('apis.ai.face_tracker.os.path.getsize', return_value=10):
+            run.return_value = SimpleNamespace(returncode=0)
+            ok = face_tracker._reencode_h264('in.mp4', 'out.mp4', timeout=777)
+
+        self.assertTrue(ok)
+        self.assertEqual(run.call_args.kwargs.get('timeout'), 777)
+
+    def test_reencode_timeout_is_treated_as_failure(self):
+        import subprocess
+
+        from apis.ai import face_tracker
+
+        with mock.patch('apis.ai.face_tracker._ffmpeg_exe', return_value='ffmpeg'), \
+                mock.patch(
+                    'apis.ai.face_tracker.subprocess.run',
+                    side_effect=subprocess.TimeoutExpired(cmd='ffmpeg', timeout=1),
+                ):
+            ok = face_tracker._reencode_h264('in.mp4', 'out.mp4', timeout=1)
+
+        self.assertFalse(ok)  # caller keeps the mp4v file
+
+
 class YoloPersonBoxReuseTests(APITestCase):
     """H6: evidence reuses the YOLO person boxes instead of a Haar sweep.
 

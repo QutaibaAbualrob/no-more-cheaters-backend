@@ -274,6 +274,19 @@ def _default_output_path(video_path: str) -> str:
     return str(path.with_name(f'{path.stem}_annotated.mp4'))
 
 
+def _reencode_timeout_for(duration_sec: float) -> float:
+    """ffmpeg timeout budget for re-encoding a *duration_sec*-long video (M7).
+
+    The annotated re-encode runs over the WHOLE recording, so a fixed clip-sized
+    timeout would kill a long but healthy transcode. We allow several times
+    real-time and clamp to a sane range: a floor that covers ffmpeg start-up plus
+    very short clips, and a hard ceiling so a genuinely wedged process still can't
+    hold the worker indefinitely.
+    """
+    floor, ceiling, realtime_factor = 120.0, 1800.0, 6.0
+    return max(floor, min(ceiling, (duration_sec or 0.0) * realtime_factor))
+
+
 def _write_annotated_video(
     video_path: str,
     detections: list[FrameDetection],
@@ -338,10 +351,11 @@ def _write_annotated_video(
         _safe_remove(raw_path)
         return None
 
-    if _reencode_h264(raw_path, str(output_path)):
+    if _reencode_h264(raw_path, str(output_path),
+                      timeout=_reencode_timeout_for(meta.duration_sec)):
         _safe_remove(raw_path)
     else:
-        # No ffmpeg (or it failed): keep the OpenCV mp4v output at the final path.
+        # No ffmpeg (or it failed/timed out): keep the OpenCV mp4v output.
         os.replace(raw_path, str(output_path))
     return str(output_path)
 

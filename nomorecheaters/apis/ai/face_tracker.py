@@ -465,7 +465,7 @@ def _ffmpeg_exe():
         return None
 
 
-def _reencode_h264(src_path: str, dst_path: str) -> bool:
+def _reencode_h264(src_path: str, dst_path: str, timeout: float = 120) -> bool:
     """Re-encode *src_path* to a browser-playable H.264 MP4 at *dst_path*.
 
     OpenCV writes the temp clip as ``mp4v`` (MPEG-4 Part 2), which Chrome/Firefox
@@ -475,6 +475,13 @@ def _reencode_h264(src_path: str, dst_path: str) -> bool:
     the bundled :func:`_ffmpeg_exe`. Returns ``True`` only when a non-empty output
     file was produced; the caller keeps the mp4v clip otherwise, so a missing
     ffmpeg never breaks analysis.
+
+    *timeout* bounds the ffmpeg call so a wedged process can never hang the rq
+    worker forever (M7). The default suits the short evidence clips; the
+    full-length annotated-video re-encode passes a larger, duration-scaled
+    budget (see :func:`apis.ai.detector._reencode_timeout_for`) so a long but
+    healthy transcode is not killed prematurely. A timeout — like any ffmpeg
+    failure — returns ``False``, leaving the caller to fall back to the mp4v file.
     """
     ffmpeg = _ffmpeg_exe()
     if not ffmpeg:
@@ -492,7 +499,7 @@ def _reencode_h264(src_path: str, dst_path: str) -> bool:
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=120,
+            timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError):
         return False
