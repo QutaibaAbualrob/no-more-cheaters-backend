@@ -1052,6 +1052,38 @@ class AsyncQueueWiringTests(APITestCase):
             ExamSession.Status.FAILED,
         )
 
+    def test_run_analysis_skips_already_completed_job(self):
+        """C7: re-invoking run_analysis on a COMPLETED job is a no-op."""
+        video = self._make_video()
+        job = AnalysisJob.objects.create(session=video.session, status=AnalysisJob.Status.QUEUED)
+
+        with mock.patch('apis.ai.analyze_video', return_value=fake_analysis_result()):
+            report_id = run_analysis(str(job.id))
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, AnalysisJob.Status.COMPLETED)
+
+        # A duplicate enqueue / second worker must NOT re-run the pipeline; the
+        # existing report id is returned unchanged.
+        with mock.patch('apis.tasks.build_ai_report') as mocked_build:
+            skipped = run_analysis(str(job.id))
+
+        mocked_build.assert_not_called()
+        self.assertEqual(skipped, report_id)
+
+    def test_run_analysis_skips_job_already_processing(self):
+        """C7: a job another worker is already PROCESSING is not picked up again."""
+        video = self._make_video()
+        job = AnalysisJob.objects.create(session=video.session, status=AnalysisJob.Status.PROCESSING)
+
+        with mock.patch('apis.tasks.build_ai_report') as mocked_build:
+            result = run_analysis(str(job.id))
+
+        mocked_build.assert_not_called()
+        self.assertIsNone(result)
+        job.refresh_from_db()
+        self.assertEqual(job.status, AnalysisJob.Status.PROCESSING)
+
 
 class PreanalyzeDemosCommandTests(TestCase):
     """Task 1.5: the ``preanalyze_demos`` management command.
