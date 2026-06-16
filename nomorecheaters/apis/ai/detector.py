@@ -143,15 +143,19 @@ def _bbox_center(bbox) -> tuple[float, float, float] | None:
 
 
 def _same_track(center_a, center_b, factor: float = 0.75) -> bool:
-    """Whether two bbox centres are close enough to be the same person/object.
+    """Whether two *known* bbox centres are close enough to be the same person.
 
     The distance threshold scales with box size so it adapts to camera distance.
-    Either centre being ``None`` (no usable box) returns ``True`` — such
-    detections fall back to pure temporal merging rather than spawning spurious
-    extra events.
+    Both centres must be present: a ``None`` centre means the detection had no
+    usable box, and with no location we cannot prove two detections share a
+    person, so this returns ``False``. The missing-box case is handled by the
+    caller's temporal fallback (see :func:`consolidate_events`) — it is
+    deliberately NOT collapsed here, because returning ``True`` on ``None``
+    merged two different students who both fell back to ``(0,0,0,0)`` into a
+    single event and under-counted people (H11).
     """
     if center_a is None or center_b is None:
-        return True
+        return False
     ax, ay, a_size = center_a
     bx, by, b_size = center_b
     distance = ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
@@ -192,6 +196,20 @@ def consolidate_events(
             for track in tracks:
                 if (det.timestamp_sec - track['last_ts']) > merge_window_sec:
                     continue
+                if center is None or track['center'] is None:
+                    # At least one side has no usable box, so we cannot place
+                    # them spatially. Fall back to temporal continuity — but
+                    # only across *different* frames. Two detections of the
+                    # same behaviour in the SAME frame are necessarily
+                    # different people (the pose model emits at most one
+                    # looking-away per person per frame), so they must not
+                    # collapse into one event (H11). ``items`` is sorted by
+                    # timestamp, so ``last_ts >= det.timestamp_sec`` means the
+                    # track already has a detection from this very frame.
+                    if track['last_ts'] >= det.timestamp_sec:
+                        continue
+                    match = track
+                    break
                 if _same_track(center, track['center']):
                     match = track
                     break

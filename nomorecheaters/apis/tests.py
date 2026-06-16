@@ -1444,6 +1444,85 @@ class _FakeBox:
         self.conf = [conf]
 
 
+class ConsolidateEventsTrackingTests(APITestCase):
+    """H11: distinct people are not merged when their boxes are degenerate.
+
+    ``PoseAnalyzer`` falls back to ``bbox=(0,0,0,0)`` when it cannot match a
+    person box to the keypoints. ``_bbox_center`` maps that to ``None``. The old
+    ``_same_track`` returned ``True`` whenever either centre was ``None``, so two
+    different students who both fell back to ``(0,0,0,0)`` collapsed into a single
+    event — the report then showed fewer people and fewer events than reality.
+    The fix keeps the missing-box temporal fallback (so one person's behaviour
+    still sustains across frames) but refuses to merge two same-frame detections,
+    which are necessarily different people.
+    """
+
+    @staticmethod
+    def _det(ts, bbox, behavior=None, confidence=0.9):
+        from apis.ai import config
+        from apis.ai.detector import FrameDetection
+
+        return FrameDetection(
+            behavior_type=behavior or config.LOOKING_AWAY,
+            confidence=confidence,
+            bbox=bbox,
+            frame_number=int(ts * 10),
+            timestamp_sec=float(ts),
+        )
+
+    def test_same_track_requires_two_known_centres(self):
+        from apis.ai.detector import _same_track
+
+        a = (100.0, 100.0, 60.0)
+        # Two unlocalisable detections must NOT be assumed to be one person.
+        self.assertFalse(_same_track(None, None))
+        self.assertFalse(_same_track(a, None))
+        self.assertFalse(_same_track(None, a))
+        # Known, close centres still match; known, far centres do not.
+        self.assertTrue(_same_track(a, (105.0, 102.0, 60.0)))
+        self.assertFalse(_same_track(a, (400.0, 100.0, 60.0)))
+
+    def test_two_degenerate_people_same_frames_stay_two_events(self):
+        """Two students with (0,0,0,0) boxes across two frames → two events."""
+        from apis.ai.detector import consolidate_events
+
+        zero = (0.0, 0.0, 0.0, 0.0)
+        # Person A and person B both flagged at t=0 and t=3 (within the 5s merge
+        # window; 3s span clears the 2s min-duration so the events survive).
+        detections = [
+            self._det(0.0, zero), self._det(0.0, zero),
+            self._det(3.0, zero), self._det(3.0, zero),
+        ]
+        events = consolidate_events(detections)
+        self.assertEqual(len(events), 2)
+        for event in events:
+            self.assertEqual(event.frame_count, 2)
+            self.assertAlmostEqual(event.duration_sec, 3.0)
+
+    def test_single_degenerate_person_still_merges_across_frames(self):
+        """One person's degenerate-box behaviour sustains into a single event."""
+        from apis.ai.detector import consolidate_events
+
+        zero = (0.0, 0.0, 0.0, 0.0)
+        detections = [self._det(t, zero) for t in (0.0, 2.0, 4.0)]
+        events = consolidate_events(detections)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].frame_count, 3)
+
+    def test_distinct_real_boxes_are_two_events(self):
+        """Control: two well-separated boxes were (and remain) two events."""
+        from apis.ai.detector import consolidate_events
+
+        left = (100, 50, 160, 200)
+        right = (400, 60, 470, 210)
+        detections = [
+            self._det(0.0, left), self._det(0.0, right),
+            self._det(3.0, left), self._det(3.0, right),
+        ]
+        events = consolidate_events(detections)
+        self.assertEqual(len(events), 2)
+
+
 class YoloPersonBoxReuseTests(APITestCase):
     """H6: evidence reuses the YOLO person boxes instead of a Haar sweep.
 
