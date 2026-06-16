@@ -489,6 +489,14 @@ def update_global_thresholds(request, payload):
     return threshold_payload({**get_global_thresholds(), **cleaned}, latest_updated_at)
 
 
+# How many `student_identifier` variants to probe before giving up. Each probe is
+# a `get_or_create` round trip, so an unbounded loop lets one identifier with many
+# uploads (`john`, `john-2`, ... `john-10000`) fire thousands of DB queries and
+# exhaust the connection pool (N4). 100 free slots per identifier is far beyond any
+# legitimate use; past that we stop probing and surface a clean error.
+MAX_UPLOAD_SESSION_ATTEMPTS = 100
+
+
 def get_available_upload_session(instructor, upload, exam_name='', student_identifier=''):
     """Create or reuse a direct-upload session that does not already have a video."""
     resolved_exam_name = exam_name or 'Uploaded Videos'
@@ -500,17 +508,20 @@ def get_available_upload_session(instructor, upload, exam_name='', student_ident
     )
     base_identifier = resolved_student_identifier[:220]
     candidate = base_identifier
-    suffix = 1
 
-    while True:
+    for suffix in range(1, MAX_UPLOAD_SESSION_ATTEMPTS + 1):
         session, _created = ExamSession.objects.get_or_create(
             exam=exam,
             student_identifier=candidate,
         )
         if not hasattr(session, 'video'):
             return session
-        suffix += 1
-        candidate = f'{base_identifier}-{suffix}'
+        candidate = f'{base_identifier}-{suffix + 1}'
+
+    raise ValidationError(
+        f'Could not allocate an upload session for "{base_identifier}" after '
+        f'{MAX_UPLOAD_SESSION_ATTEMPTS} attempts; all are already in use. '
+        'Use a different student identifier.')
 
 
 def recording_session_for(exam):

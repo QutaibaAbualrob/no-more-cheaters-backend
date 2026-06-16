@@ -1033,6 +1033,74 @@ class InviteRespondMethodTests(APITestCase):
         self.assertEqual(invite.status, WorkspaceInvite.Status.DECLINED)
 
 
+class UploadSessionBoundTests(TestCase):
+    """N4: get_available_upload_session must not probe identifiers forever.
+
+    Each probe is a `get_or_create` round trip, so an unbounded loop lets one
+    identifier with many occupied sessions fire thousands of queries. The loop
+    is capped at MAX_UPLOAD_SESSION_ATTEMPTS, after which it raises rather than
+    spinning.
+    """
+
+    def _upload(self):
+        return SimpleNamespace(name='john.mp4')
+
+    def _occupy(self, instructor, upload, ident, n):
+        """Allocate *n* sessions for *ident* and attach a video to each."""
+        from apis.services import get_available_upload_session
+
+        sessions = []
+        for i in range(n):
+            session = get_available_upload_session(
+                instructor, upload, student_identifier=ident)
+            Video.objects.create(
+                session=session,
+                original_filename='x.mp4',
+                file='x.mp4',
+                file_hash=f'hash-{i}-{uuid.uuid4().hex}',
+            )
+            sessions.append(session)
+        return sessions
+
+    def test_reuses_next_free_identifier_variant(self):
+        from apis.services import get_available_upload_session
+
+        instructor = make_user()
+        upload = self._upload()
+        first, = self._occupy(instructor, upload, 'john', 1)
+
+        # 'john' is taken, so the next allocation must fall through to 'john-2'.
+        nxt = get_available_upload_session(
+            instructor, upload, student_identifier='john')
+
+        self.assertNotEqual(nxt.id, first.id)
+        self.assertEqual(nxt.student_identifier, 'john-2')
+        self.assertFalse(hasattr(nxt, 'video'))
+
+    def test_raises_after_max_attempts_exhausted(self):
+        from apis import services
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        instructor = make_user()
+        upload = self._upload()
+
+        # Cap the loop low so the test stays fast; occupy every slot it will probe.
+        with mock.patch.object(services, 'MAX_UPLOAD_SESSION_ATTEMPTS', 3):
+            self._occupy(instructor, upload, 'john', 3)
+
+            with self.assertRaises(DRFValidationError) as ctx:
+                services.get_available_upload_session(
+                    instructor, upload, student_identifier='john')
+
+        self.assertIn('john', str(ctx.exception.detail))
+        # No runaway session creation past the cap: john, john-2, john-3 only.
+        self.assertEqual(
+            ExamSession.objects.filter(
+                student_identifier__startswith='john').count(),
+            3,
+        )
+
+
 class DuplicateVideoHashTests(TestCase):
     """Issue 7 / FR4: duplicate video uploads must be rejected cleanly."""
 
