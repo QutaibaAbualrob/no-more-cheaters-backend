@@ -9,6 +9,7 @@ from django.contrib.auth import get_user_model
 from django.core.mail import send_mail
 from django.db import transaction
 from django.db.models import Count
+from django.db.models.functions import TruncDate
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
@@ -931,15 +932,44 @@ def dashboard_stats_for(user):
 
 
 def activity_series_for(user):
-    """Return seven-day upload and analysis counts for charts."""
+    """Return seven-day upload and analysis counts for charts.
+
+    Two grouped queries — one per series — instead of the old 2·N per-day
+    ``COUNT`` queries (H7). Each truncates the timestamp to a local date, groups,
+    and counts in the database; the rows are then mapped onto the fixed day
+    window, with any day that has no rows reported as 0.
+    """
     videos = owned_videos(user)
     analyses = AnalysisJob.objects.filter(session__in=owned_sessions(user))
     days, labels = recent_day_window()
+    start = days[0]  # window is oldest -> newest, so days[0] is the lower bound
+
+    video_counts = _daily_counts(videos, 'uploaded_at', start)
+    analysis_counts = _daily_counts(analyses, 'created_at', start)
     return {
         'days': labels,
-        'videos': [videos.filter(uploaded_at__date=day).count() for day in days],
-        'analyses': [analyses.filter(created_at__date=day).count() for day in days],
+        'videos': [video_counts.get(day, 0) for day in days],
+        'analyses': [analysis_counts.get(day, 0) for day in days],
     }
+
+
+def _daily_counts(queryset, field_name, start_date):
+    """Return ``{date: row_count}`` for *field_name*, grouped by day in one query.
+
+    Only rows on/after *start_date* are scanned, and ``order_by()`` clears any
+    model default ordering so it cannot leak into (and break) the ``GROUP BY``.
+    The truncation uses the active timezone, matching ``recent_day_window``'s
+    use of :func:`~django.utils.timezone.localdate`.
+    """
+    rows = (
+        queryset
+        .filter(**{f'{field_name}__date__gte': start_date})
+        .annotate(_day=TruncDate(field_name))
+        .order_by()
+        .values('_day')
+        .annotate(_count=Count('pk'))
+    )
+    return {row['_day']: row['_count'] for row in rows}
 
 
 def system_metrics():

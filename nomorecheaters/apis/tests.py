@@ -1562,6 +1562,84 @@ class YoloPersonBoxReuseTests(APITestCase):
             self.assertIs(attach.call_args.kwargs.get('person_index'), sentinel_index)
 
 
+class ActivitySeriesQueryTests(APITestCase):
+    """H7: the activity chart is two grouped queries, not 2·N per-day COUNTs.
+
+    Verifies both correctness (counts land on the right days, out-of-window rows
+    are excluded) and that the query count is a small constant independent of how
+    many rows or days are involved.
+    """
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+        self.addCleanup(self.settings_override.disable)
+        self.addCleanup(shutil.rmtree, self.media_root, ignore_errors=True)
+        self.user = make_user(username='chart', email='chart@example.com')
+        self.exam = make_exam(instructor=self.user)
+
+    @staticmethod
+    def _days_ago(offset):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        return timezone.now() - timedelta(days=offset)
+
+    def _video_on(self, day_offset):
+        """Create a session + video uploaded *day_offset* days ago; return the session."""
+        session = make_session(exam=self.exam, student_identifier=f'v-{uuid.uuid4().hex[:6]}')
+        video = Video.objects.create(
+            session=session,
+            file=SimpleUploadedFile('v.mp4', fake_video_bytes(), content_type='video/mp4'),
+            file_hash=uuid.uuid4().hex,
+        )
+        # uploaded_at is auto_now_add, so bypass it with an UPDATE.
+        Video.objects.filter(pk=video.pk).update(uploaded_at=self._days_ago(day_offset))
+        return session
+
+    def _job_on(self, session, day_offset):
+        job = AnalysisJob.objects.create(session=session)
+        AnalysisJob.objects.filter(pk=job.pk).update(created_at=self._days_ago(day_offset))
+
+    def test_series_counts_map_to_correct_days(self):
+        from apis.services import activity_series_for
+
+        # Uploads: two today, one two days ago, one outside the 7-day window.
+        s_today_a = self._video_on(0)
+        s_today_b = self._video_on(0)
+        s_old = self._video_on(2)
+        self._video_on(8)  # out of window — must be excluded
+        # Analyses: one today, two one-day-ago.
+        self._job_on(s_today_a, 0)
+        self._job_on(s_today_b, 1)
+        self._job_on(s_old, 1)
+
+        series = activity_series_for(self.user)
+
+        self.assertEqual(len(series['videos']), 7)
+        self.assertEqual(len(series['analyses']), 7)
+        # days run oldest -> newest: idx 6 = today, 5 = yesterday, 4 = two days ago.
+        self.assertEqual(series['videos'][6], 2)
+        self.assertEqual(series['videos'][4], 1)
+        self.assertEqual(sum(series['videos']), 3)  # the 8-days-ago upload is dropped
+        self.assertEqual(series['analyses'][6], 1)
+        self.assertEqual(series['analyses'][5], 2)
+        self.assertEqual(sum(series['analyses']), 3)
+
+    def test_query_count_is_constant_regardless_of_volume(self):
+        from apis.services import activity_series_for
+
+        for _ in range(6):
+            session = self._video_on(0)
+            self._job_on(session, 0)
+
+        # One grouped query per series (videos, analyses) — never 2·N.
+        with self.assertNumQueries(2):
+            activity_series_for(self.user)
+
+
 class PreanalyzeDemosCommandTests(TestCase):
     """Task 1.5: the ``preanalyze_demos`` management command.
 
