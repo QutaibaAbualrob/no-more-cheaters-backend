@@ -1,6 +1,7 @@
 # Django backend — No More Cheaters
 # Use Python 3.10–3.13. Install when online: pip install -r requirements.txt
 
+Django
 djangorestframework
 django-allauth
 django-cors-headers
@@ -9,9 +10,13 @@ requests
 # Loads a local .env file for environment-driven settings (optional in prod)
 python-dotenv
 
-# AI Pipeline — YOLO video analysis
+# AI Pipeline — YOLO video analysis (numpy backs frame arrays / bbox math)
 ultralytics
 opencv-python-headless
+numpy
+# Ships a static ffmpeg binary so evidence clips can be re-encoded to
+# browser-playable H.264 even when no system ffmpeg is installed.
+imageio-ffmpeg
 dj-rest-auth
 # Background job queue (django-rq + Redis)
 # Analysis runs through this queue. Jobs execute synchronously in-process by

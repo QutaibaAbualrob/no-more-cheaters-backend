@@ -1,21 +1,22 @@
 from django.contrib.auth import get_user_model
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import generics, status
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import (
-    AnalysisJob, AuditLog, AutoExamSession, Exam, ExamSession, Notification,
+    Alert, AnalysisJob, AuditLog, AutoExamSession, Exam, ExamSession, Notification,
     UserPreferences, Video, Workspace, WorkspaceInvite, WorkspaceMembership,
 )
 from .selectors import (
-    actionable_exams, assigned_supervisor_ids, can_supervise_exam,
+    actionable_exams, assigned_supervisor_ids, can_supervise_exam, can_view_report,
     is_admin, is_dean, owned_sessions, owned_students, owned_videos,
-    recent_day_window, users_visible_to,
+    recent_day_window, users_visible_to, visible_sessions, visible_videos,
 )
 from .serializers import (
     AutoExamSessionCreateSerializer,
@@ -39,8 +40,12 @@ from .services import (
     activity_series_for,
     build_thresholds_response,
     dashboard_stats_for,
+    delete_exam_media,
+    email_workspace_invite,
     enqueue_analysis,
+    exam_supervisor_users,
     get_available_upload_session,
+    notify_users,
     recording_session_for,
     resolve_calendar_exam,
     respond_to_workspace_invite,
@@ -293,12 +298,47 @@ class AnalyzeVideoView(APIView):
 
 
 class VideoHistoryView(APIView):
-    """List analyzed videos for the History page."""
+    """List analyzed videos for the History page (workspace-scoped)."""
 
     def get(self, request):
-        queryset = owned_videos(request.user).filter(session__status=ExamSession.Status.COMPLETED)
+        queryset = visible_videos(request.user).filter(
+            session__status=ExamSession.Status.COMPLETED,
+        )
         serializer = VideoReadSerializer(queryset, many=True, context={'request': request})
         return Response(serializer.data)
+
+
+class AnalysisSessionsView(APIView):
+    """All analyzed sessions the user may view — drives the Analysis page exam list.
+
+    Returns sessions whose status is PROCESSING / COMPLETED / FAILED (anything
+    that has been or is being analyzed), workspace-scoped via
+    :func:`visible_sessions`. Ordered newest-first. Each row carries enough for
+    the frontend's grouped list and status dot.
+    """
+
+    def get(self, request):
+        sessions = (
+            visible_sessions(request.user)
+            .exclude(status=ExamSession.Status.PENDING)
+            .order_by('-created_at')
+        )
+        rows = []
+        for session in sessions:
+            report = getattr(session, 'report', None)
+            job = getattr(session, 'analysis_job', None)
+            rows.append({
+                'session_id': str(session.id),
+                'exam_name': session.exam.name,
+                # No scheduled date exists server-side (calendar schedule is
+                # client-only); the analysis date is the meaningful timestamp.
+                'exam_date': session.created_at,
+                'status': session.status,
+                'analysis_status': job.status if job else session.status,
+                'total_alerts': report.total_alerts if report else 0,
+                'created_at': session.created_at,
+            })
+        return Response(rows)
 
 
 def _person_sort_key(person_id):
@@ -307,6 +347,39 @@ def _person_sort_key(person_id):
         return (0, int(str(person_id).rsplit('_', 1)[-1]))
     except (ValueError, IndexError):
         return (1, 0)
+
+
+def _alert_payload(alert, request):
+    """Serialize one alert with absolute media URLs and review state.
+
+    Shared by the report endpoint and the dismiss/flag endpoints so all three
+    return the same alert shape.
+    """
+    def absolute(url):
+        return request.build_absolute_uri(url) if url else None
+
+    # Copy metadata so we can hand back an absolute crop_url without mutating
+    # the stored (relative) value. crop_url is the clean face avatar; snapshot_url
+    # is the full frame with the green box drawn on the flagged person.
+    metadata = dict(alert.metadata or {})
+    crop_url = absolute(metadata.get('crop_url'))
+    if metadata.get('crop_url'):
+        metadata['crop_url'] = crop_url
+    return {
+        'id': str(alert.id),
+        'behavior_type': alert.behavior_type,
+        'behavior_label': alert.get_behavior_type_display(),
+        'severity': alert.severity,
+        'confidence_score': alert.confidence_score,
+        'timestamp_sec': alert.timestamp_sec,
+        'snapshot_url': absolute(alert.snapshot_url),
+        'clip_url': absolute(alert.clip_url),
+        'crop_url': crop_url,
+        'metadata': metadata,
+        'is_reviewed': alert.is_reviewed,
+        'reviewed_at': alert.reviewed_at,
+        'flagged': bool(metadata.get('flagged')),
+    }
 
 
 class SessionReportView(APIView):
@@ -320,65 +393,124 @@ class SessionReportView(APIView):
 
     def get(self, request, session_id):
         session = get_object_or_404(
-            owned_sessions(request.user), pk=session_id,
+            ExamSession.objects.select_related(
+                'exam', 'exam__instructor', 'video', 'report', 'analysis_job',
+            ),
+            pk=session_id,
         )
-        report = getattr(session, 'report', None)
-        if report is None:
-            return Response(
-                {'detail': 'No analysis report exists for this session yet.'},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+        # Workspace-scoped: the exam owner, a co-member of a shared workspace, an
+        # accepted per-exam supervisor, the workspace's dean, or an admin may view.
+        if not can_view_report(request.user, session.exam):
+            raise PermissionDenied('You do not have access to this session.')
 
         def absolute(url):
             return request.build_absolute_uri(url) if url else None
 
         video = getattr(session, 'video', None)
+        job = getattr(session, 'analysis_job', None)
+        report = getattr(session, 'report', None)
+
+        # Base envelope — always 200 so the client can poll for status while a
+        # job is still QUEUED/PROCESSING (or surface a FAILED error + retry).
+        analysis_status = job.status if job else ('COMPLETED' if report else 'PENDING')
+        base = {
+            'session_id': str(session.id),
+            'exam_name': session.exam.name,
+            'student_identifier': session.student_identifier,
+            'status': session.status,
+            'analysis_status': analysis_status,
+            'error_message': job.error_message if job else '',
+            'video_id': str(video.id) if video else None,
+            'video_url': absolute(video.file.url) if video and video.file else None,
+            # The annotated full-length video (boxes/labels drawn on flagged
+            # frames), produced by the analysis pipeline. None until analysis runs.
+            'annotated_video_url': absolute((job.metadata or {}).get('annotated_video_url')) if job else None,
+        }
+
+        if report is None:
+            base.update({
+                'overall_cheating_probability': 0,
+                'total_alerts': 0,
+                'alerts_by_type': {},
+                'summary': '',
+                'generated_at': None,
+                'report': None,
+                'person_count': 0,
+                'persons': [],
+            })
+            return Response(base)
 
         groups = {}
         for alert in session.alerts.all().order_by('timestamp_sec', 'created_at'):
             person_id = (alert.metadata or {}).get('person_id') or 'person_1'
-            payload = {
-                'id': str(alert.id),
-                'behavior_type': alert.behavior_type,
-                'behavior_label': alert.get_behavior_type_display(),
-                'severity': alert.severity,
-                'confidence_score': alert.confidence_score,
-                'timestamp_sec': alert.timestamp_sec,
-                'snapshot_url': absolute(alert.snapshot_url),
-                'clip_url': absolute(alert.clip_url),
-                'metadata': alert.metadata,
-            }
-            group = groups.setdefault(person_id, [])
-            group.append((alert.confidence_score, payload))
+            groups.setdefault(person_id, []).append(_alert_payload(alert, request))
 
         persons = []
         for person_id in sorted(groups, key=_person_sort_key):
-            scored = groups[person_id]
-            # Section face = the snapshot of this person's highest-confidence alert.
+            payloads = groups[person_id]
+            # Section avatar = this person's highest-confidence face crop (clean,
+            # no box); fall back to the boxed full-frame snapshot if no crop.
+            ranked = sorted(payloads, key=lambda p: p['confidence_score'], reverse=True)
             face_url = None
-            for _conf, payload in sorted(scored, key=lambda item: item[0], reverse=True):
-                if payload['snapshot_url']:
-                    face_url = payload['snapshot_url']
+            for payload in ranked:
+                if payload.get('crop_url'):
+                    face_url = payload['crop_url']
                     break
+            if face_url is None:
+                for payload in ranked:
+                    if payload['snapshot_url']:
+                        face_url = payload['snapshot_url']
+                        break
             label = 'Person ' + str(person_id).rsplit('_', 1)[-1]
             persons.append({
                 'person_id': person_id,
                 'label': label,
                 'face_url': face_url,
-                'alert_count': len(scored),
-                'alerts': [payload for _conf, payload in scored],
+                'alert_count': len(payloads),
+                'alerts': payloads,
             })
 
-        return Response({
-            'session_id': str(session.id),
-            'exam_name': session.exam.name,
-            'student_identifier': session.student_identifier,
-            'status': session.status,
-            'video_url': absolute(video.file.url) if video and video.file else None,
+        base.update({
+            'overall_cheating_probability': report.overall_cheating_probability,
+            'total_alerts': report.total_alerts,
+            'alerts_by_type': report.alerts_by_type,
+            'summary': report.summary,
+            'generated_at': report.generated_at,
             'report': ReportReadSerializer(report).data,
             'person_count': len(persons),
             'persons': persons,
         })
+        return Response(base)
+
+
+class AlertReviewView(APIView):
+    """Dismiss or flag a single alert (assigned supervisor / dean / admin).
+
+    ``action='dismiss'`` marks the alert reviewed; ``action='flag'`` marks it
+    reviewed AND records ``metadata['flagged'] = True`` for the "Flagged" badge.
+    """
+
+    action = 'dismiss'  # overridden per-URL via .as_view(action=...)
+
+    def patch(self, request, alert_id):
+        alert = get_object_or_404(
+            Alert.objects.select_related('session__exam__instructor'), pk=alert_id,
+        )
+        if not can_supervise_exam(request.user, alert.session.exam):
+            raise PermissionDenied('You do not have access to this alert.')
+
+        if self.action == 'flag':
+            metadata = dict(alert.metadata or {})
+            metadata['flagged'] = True
+            alert.metadata = metadata
+            alert.is_reviewed = True
+            alert.reviewed_by = request.user
+            alert.reviewed_at = timezone.now()
+            alert.save(update_fields=['metadata', 'is_reviewed', 'reviewed_by', 'reviewed_at'])
+        else:
+            alert.mark_reviewed(request.user)
+
+        return Response(_alert_payload(alert, request))
 
 
 class DashboardStatsView(APIView):
@@ -537,6 +669,34 @@ class AllWorkspaceMembersView(APIView):
         if not is_dean(request.user):
             raise PermissionDenied('Only deans can list workspace members.')
         return Response(accepted_instructor_rows(request.user))
+
+
+class MyWorkspacesView(APIView):
+    """Workspaces the CURRENT user belongs to (as an accepted member).
+
+    Powers the frontend's ``hasWorkspace`` gate: a freshly-registered instructor
+    with no accepted membership gets ``has_workspace: false`` and is shown the
+    "ask your dean for an invite" empty state instead of an empty dashboard.
+    Works for any authenticated user (unlike the dean-only members endpoint).
+    """
+
+    def get(self, request):
+        memberships = (
+            WorkspaceMembership.objects
+            .filter(instructor=request.user)
+            .select_related('workspace', 'workspace__owner')
+            .order_by('joined_at')
+        )
+        rows = [
+            {
+                'workspace_id': str(m.workspace_id),
+                'workspace_name': m.workspace.name,
+                'owner_email': m.workspace.owner.email if m.workspace.owner_id else None,
+                'joined_at': m.joined_at,
+            }
+            for m in memberships
+        ]
+        return Response({'has_workspace': len(rows) > 0, 'workspaces': rows})
 
 
 class HallManagementView(APIView):
@@ -727,11 +887,11 @@ class WorkspaceMemberDetailView(APIView):
 
 
 class WorkspaceInviteView(APIView):
-    """Dean invites: list the ones you've sent, or send a new one.
+    """Dean workspace invites: list the ones you've sent, or send a new one.
 
-    An invite targets a ``workspace_id`` (modern flow — accepting joins the
-    workspace) and/or an ``exam_id`` (legacy supervisor assignment). At least
-    one of the two is required.
+    Inviting is a pure workspace action — it never touches exams. The invite is
+    created with ``exam = null``; exam/supervisor assignment happens separately
+    in the Calendar, drawing only from accepted workspace members.
     """
 
     def get(self, request):
@@ -748,28 +908,47 @@ class WorkspaceInviteView(APIView):
         if not is_dean(request.user):
             raise PermissionDenied('Only deans can send workspace invites.')
 
-        instructor_email = (request.data.get('instructor_email') or '').strip()
+        # `invitee_email` is the canonical field; `instructor_email` is accepted
+        # as an alias for older callers.
+        invitee_email = (
+            request.data.get('invitee_email')
+            or request.data.get('instructor_email')
+            or ''
+        ).strip()
         workspace_id = request.data.get('workspace_id')
-        exam_id = request.data.get('exam_id')
-        if not instructor_email:
-            raise ValidationError({'instructor_email': 'This field is required.'})
-        if not workspace_id and not exam_id:
-            raise ValidationError(
-                {'workspace_id': 'Provide a workspace_id (or an exam_id).'}
-            )
+        if not invitee_email:
+            raise ValidationError({'invitee_email': 'This field is required.'})
+        if not workspace_id:
+            raise ValidationError({'workspace_id': 'This field is required.'})
 
-        instructor = User.objects.filter(email__iexact=instructor_email).first()
-        if instructor is None:
-            raise ValidationError({'instructor_email': 'No user found with that email.'})
+        workspace = _owned_workspaces(request.user).filter(pk=workspace_id).first()
+        if workspace is None:
+            raise NotFound('Workspace not found')
 
-        workspace = None
-        if workspace_id:
-            workspace = get_object_or_404(_owned_workspaces(request.user), pk=workspace_id)
-        exam = get_object_or_404(Exam, pk=exam_id) if exam_id else None
+        invitee = User.objects.filter(email__iexact=invitee_email).first()
+        if invitee is None:
+            raise NotFound('No user found with this email')
+        if invitee.is_superuser or invitee.role == User.Role.ADMIN:
+            raise ValidationError('Cannot invite admin users')
+        if invitee.role not in (User.Role.INSTRUCTOR, User.Role.DEAN):
+            raise ValidationError('Only instructors or deans can be invited')
+        if WorkspaceMembership.objects.filter(workspace=workspace, instructor=invitee).exists():
+            raise ValidationError('This user is already a member of this workspace')
 
-        invite = send_workspace_invite(
-            request.user, instructor, exam=exam, workspace=workspace,
-        )
+        # Already-pending invite: resend the email instead of erroring (200).
+        pending = WorkspaceInvite.objects.filter(
+            workspace=workspace,
+            instructor=invitee,
+            status=WorkspaceInvite.Status.PENDING,
+        ).first()
+        if pending is not None:
+            email_workspace_invite(pending)
+            data = WorkspaceInviteSerializer(pending).data
+            data['detail'] = 'Invite resent'
+            return Response(data, status=status.HTTP_200_OK)
+
+        # exam stays null — assignment is a separate Calendar step.
+        invite = send_workspace_invite(request.user, invitee, workspace=workspace)
         return Response(
             WorkspaceInviteSerializer(invite).data,
             status=status.HTTP_201_CREATED,
@@ -794,7 +973,16 @@ class InviteRespondView(APIView):
         )
         already_responded = invite.status != WorkspaceInvite.Status.PENDING
         respond_to_workspace_invite(invite, self.accepted)
+
+        if already_responded:
+            detail = 'You have already responded to this invite'
+        elif self.accepted:
+            detail = 'You have joined the workspace successfully'
+        else:
+            detail = 'You have declined the invite'
+
         return Response({
+            'detail': detail,
             'status': invite.status,
             'already_responded': already_responded,
             'target_name': invite.target_name,
@@ -948,3 +1136,83 @@ class ExamListView(APIView):
     def get(self, request):
         exams = actionable_exams(request.user).order_by('-created_at')
         return Response(ExamReadSerializer(exams, many=True).data)
+
+
+class ExamDetailView(APIView):
+    """Edit/delete an exam, notifying every assigned supervisor.
+
+    * **PATCH (edit)** — the exam owner, a dean, or an admin. Updates the name
+      and notifies supervisors of the new schedule.
+    * **DELETE (cancel)** — a dean or an admin only (never a plain instructor).
+      Removes the exam (cascading to its sessions/videos/alerts/reports), clears
+      the media files from disk, audits the action, and notifies supervisors.
+
+    Schedule fields (date/start_time/end_time/hall) live in the calendar client;
+    they are accepted here only to compose the notification text. Recipients are
+    the exam owner, accepted-invite supervisors, auto-session instructors, and
+    any extra ``supervisor_ids`` the request supplies.
+    """
+
+    def patch(self, request, pk):
+        exam = get_object_or_404(Exam, pk=pk)
+        can_edit = (
+            is_admin(request.user)
+            or is_dean(request.user)
+            or exam.instructor_id == request.user.id
+        )
+        if not can_edit:
+            raise PermissionDenied('You do not have permission to edit this exam.')
+
+        name = request.data.get('name')
+        if name is not None and str(name).strip():
+            exam.name = str(name).strip()
+        if 'description' in request.data:
+            exam.description = request.data.get('description') or ''
+        exam.save(update_fields=['name', 'description', 'updated_at'])
+
+        supervisors = exam_supervisor_users(exam, request.data.get('supervisor_ids'))
+        new_date = request.data.get('date') or 'the same date'
+        start_time = request.data.get('start_time') or request.data.get('time') or 'the same time'
+        end_time = request.data.get('end_time') or ''
+        hall = request.data.get('hall') or 'the same hall'
+        time_range = f'{start_time}–{end_time}' if end_time else start_time
+        notify_users(
+            supervisors,
+            Notification.NotifType.EXAM_UPDATED,
+            f'Exam updated: {exam.name}',
+            f'"{exam.name}" has been updated. '
+            f'New date: {new_date}, time: {time_range}, hall: {hall}.',
+            metadata={'exam_id': str(exam.id)},
+        )
+        return Response(ExamReadSerializer(exam).data)
+
+    def delete(self, request, pk):
+        exam = get_object_or_404(Exam, pk=pk)
+        if not (is_admin(request.user) or is_dean(request.user)):
+            raise PermissionDenied('Only deans or administrators can delete exams.')
+
+        # Resolve recipients and compose the message *before* deleting the exam.
+        supervisors = exam_supervisor_users(exam, request.data.get('supervisor_ids'))
+        name = exam.name
+        exam_id = str(exam.id)
+        date = request.data.get('date') or 'its scheduled date'
+        time = request.data.get('time') or 'its scheduled time'
+        notify_users(
+            supervisors,
+            Notification.NotifType.EXAM_CANCELLED,
+            f'Exam cancelled: {name}',
+            f'The exam "{name}" scheduled for {date} at {time} has been deleted. '
+            f'All sessions and uploaded videos were removed. This cannot be undone.',
+            metadata={'exam_name': name},
+        )
+        # Remove on-disk media (videos, clips, snapshots) before the DB cascade
+        # drops the rows that point at them.
+        delete_exam_media(exam)
+        write_audit_log(
+            request,
+            AuditLog.ActionType.EXAM_DELETED,
+            target_resource=f'exam:{exam_id}',
+            metadata={'name': name},
+        )
+        exam.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)

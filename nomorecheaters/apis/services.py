@@ -1,4 +1,6 @@
+import logging
 import platform
+import shutil
 import sys
 from pathlib import Path
 
@@ -11,14 +13,16 @@ from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 from .models import (
-    Alert, AnalysisJob, AuditLog, Exam, ExamSession, Notification, Report,
-    SystemSettings, UserPreferences, Video, Workspace, WorkspaceInvite,
+    Alert, AnalysisJob, AuditLog, AutoExamSession, Exam, ExamSession, Notification,
+    Report, SystemSettings, UserPreferences, Video, Workspace, WorkspaceInvite,
     WorkspaceMembership,
 )
 from .selectors import is_admin, owned_reports, owned_sessions, owned_videos, recent_day_window
 
 
 User = get_user_model()
+
+logger = logging.getLogger(__name__)
 
 THRESHOLD_DEFAULTS = {
     'gaze_threshold': 0.65,
@@ -85,27 +89,21 @@ def create_notification(recipient, notif_type, title, body='', metadata=None):
     )
 
 
-def send_workspace_invite(dean, instructor, exam=None, workspace=None):
-    """Create an invite, email the instructor, and notify them in-app.
+def email_workspace_invite(invite):
+    """Send (or resend) the accept/decline email for an invite. Best-effort.
 
-    Targets a *workspace* (joining it on accept) and/or an *exam* (legacy
-    supervisor assignment); at least one should be supplied. The email contains
-    accept/decline links pointing at the frontend (``FRONTEND_URL``); the
-    instructor does not need to be logged in to respond. Returns the created
-    :class:`WorkspaceInvite`.
+    Returns ``True`` when the email was sent, ``False`` when sending failed —
+    the caller keeps the invite either way so a flaky mail server never blocks
+    the workflow.
     """
-    invite = WorkspaceInvite.objects.create(
-        dean=dean, instructor=instructor, exam=exam, workspace=workspace,
-    )
     target = invite.target_name
-
     frontend = settings.FRONTEND_URL.rstrip('/')
     accept_url = f'{frontend}/invite/{invite.token}/accept'
     decline_url = f'{frontend}/invite/{invite.token}/decline'
-    if workspace is not None:
-        action_line = f'{dean.email} has invited you to join the workspace "{target}"'
+    if invite.workspace_id:
+        action_line = f'{invite.dean.email} has invited you to join the workspace "{target}"'
     else:
-        action_line = f'{dean.email} has assigned you to supervise the exam "{target}"'
+        action_line = f'{invite.dean.email} has assigned you to supervise the exam "{target}"'
     message = (
         'Hello,\n\n'
         f'{action_line} on the No More Cheaters platform.\n\n'
@@ -113,27 +111,119 @@ def send_workspace_invite(dean, instructor, exam=None, workspace=None):
         f'Decline: {decline_url}\n\n'
         'If you did not expect this invitation you can safely ignore this email.\n'
     )
-    send_mail(
-        subject=f'Invitation to join "{target}"',
-        message=message,
-        from_email=settings.DEFAULT_FROM_EMAIL,
-        recipient_list=[instructor.email],
-        fail_silently=False,
-    )
+    try:
+        send_mail(
+            subject=f'Invitation to join "{target}"',
+            message=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[invite.instructor.email],
+            fail_silently=False,
+        )
+        return True
+    except Exception:  # noqa: BLE001 — email is best-effort, never fatal
+        logger.exception('Failed to send workspace invite email for invite %s', invite.id)
+        return False
 
-    metadata = {'invite_id': str(invite.id)}
+
+def send_workspace_invite(dean, instructor, exam=None, workspace=None):
+    """Create an invite, email the invitee (best-effort), and notify them in-app.
+
+    Targets a *workspace* (joining it on accept) and/or an *exam* (legacy
+    supervisor assignment); at least one should be supplied. Returns the created
+    :class:`WorkspaceInvite`. A failing mail server is logged but does not abort
+    the invite — the row and notification are still saved.
+    """
+    invite = WorkspaceInvite.objects.create(
+        dean=dean, instructor=instructor, exam=exam, workspace=workspace,
+    )
+    email_workspace_invite(invite)
+
+    target = invite.target_name
+    # dean_email + token are required by the frontend Alerts page so it can
+    # render the sender and call accept/decline.
+    metadata = {
+        'invite_id': str(invite.id),
+        'token': str(invite.token),
+        'dean_email': dean.email,
+    }
     if workspace is not None:
         metadata['workspace_id'] = str(workspace.id)
-    if exam is not None:
-        metadata['exam_id'] = str(exam.id)
-    create_notification(
-        instructor,
-        Notification.NotifType.EXAM_ASSIGNED,
-        f'Invited to {target}',
-        f'{dean.email} invited you to "{target}".',
-        metadata=metadata,
-    )
+        metadata['workspace_name'] = workspace.name
+        notif_type = Notification.NotifType.WORKSPACE_INVITE
+        title = f'{dean.email} invited you to join workspace: {target}'
+        body = 'Click to view the invite and accept or decline'
+    else:
+        if exam is not None:
+            metadata['exam_id'] = str(exam.id)
+        notif_type = Notification.NotifType.EXAM_ASSIGNED
+        title = f'{dean.email} invited you to "{target}"'
+        body = 'Click to view the invite and accept or decline'
+
+    create_notification(instructor, notif_type, title, body, metadata=metadata)
     return invite
+
+
+def exam_supervisor_users(exam, extra_user_ids=None):
+    """Resolve the people who supervise *exam* and should be notified of changes.
+
+    That is the exam owner, every instructor with an ACCEPTED invite for the
+    exam, every instructor who scheduled an :class:`AutoExamSession` for it, plus
+    any extra user ids the caller supplies (e.g. the calendar's selected
+    supervisors). Returns a list of distinct :class:`User` objects.
+    """
+    ids = {exam.instructor_id}
+    ids.update(
+        WorkspaceInvite.objects
+        .filter(exam=exam, status=WorkspaceInvite.Status.ACCEPTED)
+        .values_list('instructor_id', flat=True)
+    )
+    ids.update(
+        AutoExamSession.objects
+        .filter(exam=exam)
+        .values_list('instructor_id', flat=True)
+    )
+    for raw in (extra_user_ids or []):
+        if raw:
+            ids.add(raw)
+    ids.discard(None)
+    return list(User.objects.filter(id__in=ids))
+
+
+def delete_exam_media(exam):
+    """Delete all on-disk media for an exam's sessions before the DB cascade.
+
+    Django's FK cascade removes the Video/Alert/Report rows but never the files
+    they reference. This clears the uploaded video plus the per-session clip and
+    snapshot directories under ``MEDIA_ROOT``. Best-effort: any IO error is
+    logged and skipped so a locked/missing file never blocks the delete.
+    """
+    media_root = Path(settings.MEDIA_ROOT)
+    for session in exam.sessions.all():
+        video = getattr(session, 'video', None)
+        if video is not None and video.file:
+            try:
+                video.file.delete(save=False)
+            except Exception:  # noqa: BLE001 — best-effort file cleanup
+                logger.exception('Failed to delete video file for session %s', session.id)
+        # exam-videos/<session>, clips/<session>, snapshots/<session>
+        for subdir in ('exam-videos', 'clips', 'snapshots'):
+            shutil.rmtree(media_root / subdir / str(session.id), ignore_errors=True)
+
+
+def notify_users(users, notif_type, title, body, metadata=None):
+    """In-app notification + best-effort email for each user in *users*."""
+    for user in users:
+        create_notification(user, notif_type, title, body, metadata=metadata)
+        try:
+            send_mail(
+                subject=title,
+                message=body,
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[user.email],
+                fail_silently=True,
+            )
+        except Exception:  # noqa: BLE001 — email is best-effort
+            logger.exception('Failed to email %s for %s', user.email, notif_type)
 
 
 def respond_to_workspace_invite(invite, accepted):
@@ -464,6 +554,23 @@ def _severity_for(confidence):
     return Alert.Severity.LOW
 
 
+# Severity → risk weight for the overall report probability (a simple average
+# of these, capped at 1.0).
+_SEVERITY_WEIGHTS = {
+    Alert.Severity.HIGH: 1.0,
+    Alert.Severity.MEDIUM: 0.6,
+    Alert.Severity.LOW: 0.3,
+}
+
+
+def _report_probability(alerts):
+    """Overall cheating probability: mean severity weight, capped at 1.0."""
+    if not alerts:
+        return 0.0
+    weights = [_SEVERITY_WEIGHTS.get(alert.severity, 0.3) for alert in alerts]
+    return round(min(1.0, sum(weights) / len(weights)), 2)
+
+
 def _cheating_probability(events):
     """Combine event confidences into an overall 0–1 cheating probability.
 
@@ -480,20 +587,31 @@ def _cheating_probability(events):
 
 
 def _attach_alert_evidence(video, session, alerts):
-    """Attach per-alert visual evidence: face crop, 3-second clip, person id.
+    """Attach per-alert visual evidence with a green-boxed flagged person.
 
     Tracks faces across the recording once (see :mod:`apis.ai.face_tracker`),
-    then for each alert resolves the flagged person near its timestamp, crops
-    their face, and cuts a short clip. Best-effort and fully isolated: any
-    OpenCV/IO failure simply leaves that artifact empty and never aborts the
-    analysis. URLs are stored as ``/media/...`` web paths (served by Django in
-    DEBUG); the report serializer turns them into absolute URLs for the client.
+    then for each alert resolves the flagged person near its timestamp and saves
+    three artifacts:
+
+    * **crop** (``metadata['crop_url']``) — the flagged face only, no overlay;
+      used as the per-person avatar in the report header.
+    * **annotated frame** (``snapshot_url``) — the FULL frame with a green box +
+      behaviour label on the flagged person and gray boxes on anyone else; the
+      main evidence image so the flagged student is visible in context.
+    * **clip** (``clip_url``) — a 3-second clip with the same green/gray overlay
+      baked onto every frame.
+
+    Best-effort and fully isolated: any OpenCV/IO failure simply leaves that
+    artifact empty and never aborts the analysis. URLs are stored as
+    ``/media/...`` web paths; the report view turns them into absolute URLs.
     """
     if not alerts or not getattr(video, 'file', None):
         return
 
     try:
-        from .ai.face_tracker import extract_clip, extract_face_crop, track_persons
+        from .ai.face_tracker import (
+            extract_annotated_frame, extract_clip, extract_face_crop, track_persons,
+        )
     except Exception:  # noqa: BLE001 — OpenCV missing → skip evidence entirely
         return
 
@@ -507,29 +625,62 @@ def _attach_alert_evidence(video, session, alerts):
         index = None
 
     for alert in alerts:
-        person_id, bbox = 'person_1', None
+        person_id, bbox, others = 'person_1', None, {}
         if index is not None:
             try:
                 person_id, bbox = index.query(alert.timestamp_sec)
+                others = index.persons_at(alert.timestamp_sec)
             except Exception:  # noqa: BLE001
-                person_id, bbox = 'person_1', None
+                person_id, bbox, others = 'person_1', None, {}
+
+        # Human-readable behaviour ("Phone Detected", "Looking Away", …).
+        behavior_label = alert.get_behavior_type_display()
+
+        # All people in the frame, with the flagged person's precise bbox.
+        boxes = dict(others)
+        if bbox is not None:
+            boxes[person_id] = bbox
+        boxes_list = list(boxes.items())
 
         metadata = dict(alert.metadata or {})
         metadata['person_id'] = person_id
-        alert.metadata = metadata
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            metadata['bbox'] = [
+                int(round(x1)), int(round(y1)),
+                int(round(x2 - x1)), int(round(y2 - y1)),
+            ]
 
-        snapshot_rel = f'snapshots/{session.id}/{alert.id}.jpg'
+        crop_rel = f'snapshots/{session.id}/{alert.id}_crop.jpg'
+        frame_rel = f'snapshots/{session.id}/{alert.id}_frame.jpg'
         clip_rel = f'clips/{session.id}/{alert.id}.mp4'
+
+        # 1. Clean face crop → avatar (stored in metadata).
         try:
-            if extract_face_crop(video_path, alert.timestamp_sec, bbox, str(media_root / snapshot_rel)):
-                alert.snapshot_url = f'{media_url}/{snapshot_rel}'
+            if extract_face_crop(video_path, alert.timestamp_sec, bbox, str(media_root / crop_rel)):
+                metadata['crop_url'] = f'{media_url}/{crop_rel}'
         except Exception:  # noqa: BLE001
             pass
+        # 2. Full annotated frame → main evidence image (snapshot_url).
         try:
-            if extract_clip(video_path, alert.timestamp_sec, str(media_root / clip_rel)):
+            if extract_annotated_frame(
+                video_path, alert.timestamp_sec, boxes_list, person_id,
+                behavior_label, str(media_root / frame_rel),
+            ):
+                alert.snapshot_url = f'{media_url}/{frame_rel}'
+        except Exception:  # noqa: BLE001
+            pass
+        # 3. 3-second clip with the overlay on every frame (clip_url).
+        try:
+            if extract_clip(
+                video_path, alert.timestamp_sec, str(media_root / clip_rel),
+                boxes=boxes_list, flagged_person_id=person_id, behavior_label=behavior_label,
+            ):
                 alert.clip_url = f'{media_url}/{clip_rel}'
         except Exception:  # noqa: BLE001
             pass
+
+        alert.metadata = metadata
 
     Alert.objects.bulk_update(alerts, ['snapshot_url', 'clip_url', 'metadata'])
 
@@ -581,22 +732,25 @@ def build_ai_report(session, job=None):
     # Enrich each alert with a face crop, a 3-second clip, and a person id.
     _attach_alert_evidence(video, session, alerts)
 
-    alerts_by_type = dict(result.metadata.get('events_by_type', {}))
+    # Aggregate from the persisted alerts (now enriched with person ids), so the
+    # report reflects exactly what was saved.
+    alerts_by_type = {}
+    person_ids = set()
+    for alert in alerts:
+        alerts_by_type[alert.behavior_type] = alerts_by_type.get(alert.behavior_type, 0) + 1
+        person_id = (alert.metadata or {}).get('person_id')
+        if person_id:
+            person_ids.add(person_id)
+
     total_alerts = len(alerts)
-    probability = _cheating_probability(result.events)
+    person_count = len(person_ids) or (1 if total_alerts else 0)
+    probability = _report_probability(alerts)
     processing_time = result.metadata.get('processing_time_seconds')
 
     if total_alerts:
-        summary = (
-            f'AI analysis flagged {total_alerts} event(s) across '
-            f'{result.metadata.get("frames_analyzed", 0)} sampled frame(s). '
-            f'Overall cheating probability: {probability:.0%}.'
-        )
+        summary = f'{total_alerts} alert(s) detected across {person_count} person(s).'
     else:
-        summary = (
-            'AI analysis completed with no suspicious behaviour detected '
-            f'across {result.metadata.get("frames_analyzed", 0)} sampled frame(s).'
-        )
+        summary = 'No suspicious activity detected in this session.'
 
     report, _created = Report.objects.update_or_create(
         session=session,
@@ -614,11 +768,28 @@ def build_ai_report(session, job=None):
         job_metadata.update({
             'analysis': result.metadata,
             'annotated_video_path': result.annotated_video_path,
+            'annotated_video_url': _media_url_for(result.annotated_video_path),
         })
         job.metadata = job_metadata
         job.save(update_fields=['metadata'])
 
     return report
+
+
+def _media_url_for(filesystem_path):
+    """Turn an absolute path under ``MEDIA_ROOT`` into a ``/media/...`` web URL.
+
+    Used to expose the annotated analysis video (written next to the source
+    upload) to the frontend. Returns ``None`` for a missing path or one that
+    falls outside ``MEDIA_ROOT``.
+    """
+    if not filesystem_path:
+        return None
+    try:
+        rel = Path(filesystem_path).resolve().relative_to(Path(settings.MEDIA_ROOT).resolve())
+    except (ValueError, OSError):
+        return None
+    return '/' + settings.MEDIA_URL.strip('/') + '/' + str(rel).replace('\\', '/')
 
 
 def dashboard_stats_for(user):

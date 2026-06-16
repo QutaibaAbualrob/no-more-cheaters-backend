@@ -2,7 +2,9 @@
 from django.urls import path
 
 from .views import (
+    AlertReviewView,
     AllWorkspaceMembersView,
+    AnalysisSessionsView,
     AnalyzeVideoView,
     AutoSessionDetailView,
     AutoSessionListCreateView,
@@ -11,6 +13,7 @@ from .views import (
     DeleteUserView,
     DismissAllNotificationsView,
     DismissNotificationView,
+    ExamDetailView,
     ExamListView,
     ExamResolveView,
     GlobalThresholdsView,
@@ -20,6 +23,7 @@ from .views import (
     MarkNotificationsReadView,
     MyPreferencesView,
     MyThresholdsView,
+    MyWorkspacesView,
     NotificationListView,
     SessionReportView,
     SessionVideoStatusView,
@@ -46,6 +50,7 @@ from .views import (
 urlpatterns = [
     path('', UsersListView.as_view(), name='users_list'),
     path('me/preferences/', MyPreferencesView.as_view(), name='my_preferences'),
+    path('me/workspaces/', MyWorkspacesView.as_view(), name='my_workspaces'),
     path('users/lookup/', UserLookupView.as_view(), name='users_lookup'),
     path('students/', StudentListCreateView.as_view(), name='students_list'),
     path('students/<uuid:pk>/', StudentDetailView.as_view(), name='students_detail'),
@@ -54,6 +59,7 @@ urlpatterns = [
     path('videos/<uuid:pk>/', VideoDetailView.as_view(), name='videos_detail'),
     path('videos/<uuid:pk>/analyze/', AnalyzeVideoView.as_view(), name='videos_analyze'),
     path('history/', VideoHistoryView.as_view(), name='videos_history'),
+    path('analysis/sessions/', AnalysisSessionsView.as_view(), name='analysis_sessions'),
     path('dashboard/stats/', DashboardStatsView.as_view(), name='dashboard_stats'),
     path('dashboard/activity/', DashboardActivityView.as_view(), name='dashboard_activity'),
     path('thresholds/', ThresholdsView.as_view(), name='thresholds'),
@@ -80,8 +86,11 @@ urlpatterns = [
     path('auto-sessions/<uuid:pk>/', AutoSessionDetailView.as_view(), name='auto_session_detail'),
     path('exams/', ExamListView.as_view(), name='exams_list'),
     path('exams/resolve/', ExamResolveView.as_view(), name='exams_resolve'),
+    path('exams/<uuid:pk>/', ExamDetailView.as_view(), name='exam_detail'),
     path('sessions/<uuid:exam_id>/video-status/', SessionVideoStatusView.as_view(), name='session_video_status'),
     path('sessions/<uuid:session_id>/report/', SessionReportView.as_view(), name='session_report'),
+    path('alerts/<uuid:alert_id>/dismiss/', AlertReviewView.as_view(action='dismiss'), name='alert_dismiss'),
+    path('alerts/<uuid:alert_id>/flag/', AlertReviewView.as_view(action='flag'), name='alert_flag'),
     path('<uuid:pk>/activity/', UserActivityView.as_view(), name='user_activity'),
     path('<uuid:pk>/', DeleteUserView.as_view(), name='delete_user'),
 ]

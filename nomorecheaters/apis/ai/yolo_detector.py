@@ -30,34 +30,38 @@ class ObjectDetector:
         self,
         model_path: str = config.OBJECT_MODEL,
         confidence: float = config.OBJECT_CONFIDENCE,
-        device: str = config.DEVICE,
+        device=None,
         class_map: dict | None = None,
     ):
         self.model_path = model_path
         self.confidence = confidence
-        self.device = device
+        # Resolved lazily here (analysis time), so importing the package never
+        # touches torch/CUDA. `0` means GPU; `'cpu'` means CPU.
+        self.device = device if device is not None else config.resolve_device()
         self.class_map = class_map if class_map is not None else config.COCO_CLASS_MAP
         self._model = None
 
     @property
     def model(self):
-        """Lazily load (and on first run, download) the YOLO weights."""
+        """Lazily load (and on first run, download) the YOLO weights onto the device."""
         if self._model is None:
             from ultralytics import YOLO
 
             self._model = YOLO(self.model_path)
+            self._model.to(self.device)
         return self._model
 
     def detect(self, frame) -> list[Detection]:
         """Return the kept phone/laptop detections in a single BGR frame."""
         target_classes = list(self.class_map.keys())
+        # Pass device explicitly every time. Note `self.device` may be `0` (GPU),
+        # which is falsy — so this must NOT be gated behind `if self.device`.
         predict_kwargs = {
             'conf': self.confidence,
             'classes': target_classes,
             'verbose': False,
+            'device': self.device,
         }
-        if self.device:
-            predict_kwargs['device'] = self.device
 
         results = self.model(frame, **predict_kwargs)
 
