@@ -323,16 +323,34 @@ def respond_to_workspace_invite(invite, accepted):
     return invite
 
 
+def _coerce_threshold(values, key):
+    """Read threshold *key* from *values* as a float, falling back to default.
+
+    ``SystemSettings.setting_value`` is a free-form CharField and
+    ``UserPreferences.metadata`` is arbitrary JSON, so a stored value can be
+    non-numeric (corruption, a hand-edited row, a bad migration). float() on
+    such a value used to raise ValueError and crash the entire thresholds read
+    path (M2). Here we fall back to the documented default and log the bad
+    value instead, so one corrupt setting degrades gracefully to the default
+    rather than taking down the whole endpoint.
+    """
+    default = THRESHOLD_DEFAULTS[key]
+    raw = values.get(key, default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning('Ignoring non-numeric stored threshold %s=%r; using default %s',
+                       key, raw, default)
+        return float(default)
+
+
 def threshold_payload(values, updated_at=None):
     """Normalise threshold values to the frontend API contract."""
     timestamp = (updated_at or timezone.now()).isoformat()
     return {
-        'gaze_threshold': float(values.get('gaze_threshold', THRESHOLD_DEFAULTS['gaze_threshold'])),
-        'noise_threshold': float(values.get('noise_threshold', THRESHOLD_DEFAULTS['noise_threshold'])),
-        'multiple_faces_threshold': float(values.get(
-            'multiple_faces_threshold',
-            THRESHOLD_DEFAULTS['multiple_faces_threshold'],
-        )),
+        'gaze_threshold': _coerce_threshold(values, 'gaze_threshold'),
+        'noise_threshold': _coerce_threshold(values, 'noise_threshold'),
+        'multiple_faces_threshold': _coerce_threshold(values, 'multiple_faces_threshold'),
         'updated_at': timestamp,
     }
 

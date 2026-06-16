@@ -898,6 +898,41 @@ class ValidateThresholdsTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
+class ThresholdPayloadCoercionTests(TestCase):
+    """M2: threshold_payload tolerates non-numeric stored values."""
+
+    def test_non_numeric_stored_value_falls_back_to_default(self):
+        from apis.services import THRESHOLD_DEFAULTS, threshold_payload
+
+        payload = threshold_payload({'gaze_threshold': 'corrupt'})
+        self.assertEqual(payload['gaze_threshold'],
+                         float(THRESHOLD_DEFAULTS['gaze_threshold']))
+
+    def test_none_stored_value_falls_back_to_default(self):
+        from apis.services import THRESHOLD_DEFAULTS, threshold_payload
+
+        payload = threshold_payload({'noise_threshold': None})
+        self.assertEqual(payload['noise_threshold'],
+                         float(THRESHOLD_DEFAULTS['noise_threshold']))
+
+    def test_numeric_string_is_preserved(self):
+        from apis.services import threshold_payload
+
+        payload = threshold_payload({'gaze_threshold': '0.42'})
+        self.assertEqual(payload['gaze_threshold'], 0.42)
+
+    def test_get_global_thresholds_survives_corrupt_setting(self):
+        from apis.services import get_global_thresholds
+
+        SystemSettings.objects.update_or_create(
+            setting_key='gaze_threshold',
+            defaults={'setting_value': 'not-a-number'},
+        )
+        # Must not raise; the corrupt value degrades to the default.
+        payload = get_global_thresholds()
+        self.assertIsInstance(payload['gaze_threshold'], float)
+
+
 class DuplicateVideoHashTests(TestCase):
     """Issue 7 / FR4: duplicate video uploads must be rejected cleanly."""
 
