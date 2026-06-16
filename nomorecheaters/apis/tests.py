@@ -908,6 +908,61 @@ class ReportProbabilityTests(TestCase):
         self.assertLessEqual(_report_probability(certain), 0.99)
 
 
+class ClearSessionEvidenceTests(TestCase):
+    """C5: re-analysis wipes a session's prior clip/snapshot files on disk."""
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
+
+    def _seed_evidence(self, session_id):
+        root = Path(self.media_root)
+        files = []
+        for subdir in ('clips', 'snapshots'):
+            target = root / subdir / str(session_id)
+            target.mkdir(parents=True, exist_ok=True)
+            artifact = target / 'old-alert.bin'
+            artifact.write_bytes(b'stale')
+            files.append(artifact)
+        return files
+
+    def test_removes_prior_session_evidence(self):
+        from apis.services import clear_session_evidence
+
+        session = make_session()
+        files = self._seed_evidence(session.id)
+        self.assertTrue(all(f.exists() for f in files))
+
+        clear_session_evidence(session)
+
+        for subdir in ('clips', 'snapshots'):
+            self.assertFalse((Path(self.media_root) / subdir / str(session.id)).exists())
+
+    def test_leaves_other_sessions_untouched(self):
+        from apis.services import clear_session_evidence
+
+        target = make_session()
+        other = make_session()
+        self._seed_evidence(target.id)
+        other_files = self._seed_evidence(other.id)
+
+        clear_session_evidence(target)
+
+        self.assertTrue(all(f.exists() for f in other_files))
+
+    def test_missing_directories_is_a_noop(self):
+        from apis.services import clear_session_evidence
+
+        session = make_session()
+        # No evidence ever written — must not raise.
+        clear_session_evidence(session)
+
+
 class ReportModelTests(TestCase):
     """Issue 2 / FR11: Report model validation."""
 

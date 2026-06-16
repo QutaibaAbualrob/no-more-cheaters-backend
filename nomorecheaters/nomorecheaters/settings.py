@@ -288,8 +288,16 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
-STATIC_URL = 'static/'
-MEDIA_URL = 'media/'
+# Leading slashes are required so FileField.url / build_absolute_uri emit
+# root-relative paths ('/media/...') instead of paths resolved against the
+# current request (e.g. '/api/videos/media/...'), and so they line up with the
+# reverse-proxy `location /media/` and `location /static/` blocks in production
+# (see deploy/nginx.conf — C3).
+STATIC_URL = '/static/'
+# Absolute filesystem dir that `collectstatic` writes to and Nginx serves from.
+# Unused in DEBUG (Django serves app/admin static itself) but required in prod.
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
 # Default primary key field type

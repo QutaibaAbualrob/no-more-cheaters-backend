@@ -218,6 +218,26 @@ def delete_exam_media(exam):
             shutil.rmtree(media_root / subdir / str(session.id), ignore_errors=True)
 
 
+def clear_session_evidence(session):
+    """Delete a session's on-disk evidence (clip + snapshot) directories.
+
+    Evidence files are named by alert UUID, so a re-analysis writes a fresh set
+    under new names and never overwrites the old ones — left alone, every re-run
+    accumulates orphaned snapshots/<session>/ and clips/<session>/ artifacts on
+    disk even though their Alert rows were deleted (C5). Called before the new
+    evidence is written, so wiping the whole per-session directory is safe.
+    Best-effort: any IO error is logged and skipped so a locked/missing file
+    never blocks the analysis.
+    """
+    media_root = Path(settings.MEDIA_ROOT)
+    for subdir in ('clips', 'snapshots'):
+        target = media_root / subdir / str(session.id)
+        try:
+            shutil.rmtree(target, ignore_errors=True)
+        except Exception:  # noqa: BLE001 — best-effort file cleanup
+            logger.exception('Failed to clear %s for session %s', subdir, session.id)
+
+
 def notify_users(users, notif_type, title, body, metadata=None):
     """In-app notification + best-effort email for each user in *users*."""
     for user in users:
@@ -777,6 +797,12 @@ def build_ai_report(session, job=None):
     with transaction.atomic():
         session.alerts.all().delete()
         Alert.objects.bulk_create(alerts)
+
+    # The deleted alerts' evidence files (named by old alert UUID) would survive
+    # the row delete above; wipe the per-session clip/snapshot dirs before the
+    # new evidence is written so re-runs don't accumulate orphans on disk (C5).
+    # File I/O, so it runs outside any transaction (C4).
+    clear_session_evidence(session)
 
     # Enrich each alert with a face crop, a 3-second clip, and a person id. This
     # is filesystem/ffmpeg I/O (minutes for long videos) and deliberately runs
