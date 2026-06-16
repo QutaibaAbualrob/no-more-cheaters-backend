@@ -141,7 +141,17 @@ def send_workspace_invite(dean, instructor, exam=None, workspace=None):
     supervisor assignment); at least one should be supplied. Returns the created
     :class:`WorkspaceInvite`. A failing mail server is logged but does not abort
     the invite — the row and notification are still saved.
+
+    Inviting an instructor who already belongs to *workspace* is rejected here
+    (M13). The HTTP view pre-checks this, but the guard lives at the service
+    layer so callers that bypass the view — management commands, scripts, the
+    pre-analyze importer — cannot create a duplicate invite for an existing
+    member either.
     """
+    if workspace is not None and WorkspaceMembership.objects.filter(
+            workspace=workspace, instructor=instructor).exists():
+        raise ValidationError('This user is already a member of this workspace')
+
     invite = WorkspaceInvite.objects.create(
         dean=dean, instructor=instructor, exam=exam, workspace=workspace,
     )

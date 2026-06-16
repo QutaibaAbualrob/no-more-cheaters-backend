@@ -933,6 +933,53 @@ class ThresholdPayloadCoercionTests(TestCase):
         self.assertIsInstance(payload['gaze_threshold'], float)
 
 
+class SendWorkspaceInviteMembershipTests(TestCase):
+    """M13: send_workspace_invite refuses to re-invite an existing member."""
+
+    def _setup(self):
+        from apis.models import Workspace
+
+        dean = make_user(username='dean13', email='dean13@example.com',
+                         role=User.Role.DEAN)
+        instructor = make_user(username='inst13', email='inst13@example.com')
+        workspace = Workspace.objects.create(name='Physics Dept', owner=dean)
+        return dean, instructor, workspace
+
+    def test_invite_rejected_for_existing_member(self):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        from apis.models import WorkspaceInvite, WorkspaceMembership
+        from apis.services import send_workspace_invite
+
+        dean, instructor, workspace = self._setup()
+        WorkspaceMembership.objects.create(workspace=workspace, instructor=instructor)
+
+        with self.assertRaises(DRFValidationError):
+            send_workspace_invite(dean, instructor, workspace=workspace)
+        # No duplicate invite row created for the existing member.
+        self.assertFalse(WorkspaceInvite.objects.filter(
+            workspace=workspace, instructor=instructor).exists())
+
+    def test_invite_allowed_for_non_member(self):
+        from apis.models import WorkspaceInvite
+        from apis.services import send_workspace_invite
+
+        dean, instructor, workspace = self._setup()
+        invite = send_workspace_invite(dean, instructor, workspace=workspace)
+
+        self.assertEqual(invite.workspace_id, workspace.id)
+        self.assertTrue(WorkspaceInvite.objects.filter(id=invite.id).exists())
+
+    def test_exam_only_invite_not_blocked_by_membership(self):
+        from apis.services import send_workspace_invite
+
+        dean, instructor, _workspace = self._setup()
+        exam = make_exam(instructor=dean)
+        # No workspace target → membership guard does not apply.
+        invite = send_workspace_invite(dean, instructor, exam=exam)
+        self.assertEqual(invite.exam_id, exam.id)
+
+
 class DuplicateVideoHashTests(TestCase):
     """Issue 7 / FR4: duplicate video uploads must be rejected cleanly."""
 
