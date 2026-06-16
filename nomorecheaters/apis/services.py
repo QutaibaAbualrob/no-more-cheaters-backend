@@ -695,16 +695,25 @@ def _attach_alert_evidence(video, session, alerts, person_index=None):
     Best-effort and fully isolated: any OpenCV/IO failure simply leaves that
     artifact empty and never aborts the analysis. URLs are stored as
     ``/media/...`` web paths; the report view turns them into absolute URLs.
+
+    Returns the number of alerts whose evidence was **incomplete** — i.e. an
+    extractor raised (a disk-full or OpenCV error, as opposed to legitimately
+    finding nothing to extract). Each such alert is also stamped with
+    ``metadata['evidence_incomplete'] = True`` (and the failing artifact names in
+    ``metadata['evidence_errors']``) so the partial state is visible rather than
+    silently swallowed (M1). Each alert is processed independently, so a failure
+    midway through never starves the remaining alerts of evidence.
     """
     if not alerts or not getattr(video, 'file', None):
-        return
+        return 0
 
     try:
         from .ai.face_tracker import (
             extract_annotated_frame, extract_clip, extract_face_crop, track_persons,
         )
     except Exception:  # noqa: BLE001 — OpenCV missing → skip evidence entirely
-        return
+        logger.warning('OpenCV/face_tracker unavailable; skipping evidence for session %s', session.id)
+        return len(alerts)
 
     video_path = video.file.path
     media_root = Path(settings.MEDIA_ROOT)
@@ -723,66 +732,93 @@ def _attach_alert_evidence(video, session, alerts, person_index=None):
     # used as-is.
     head_fraction = 0.45 if getattr(index, 'box_kind', 'face') == 'person' else None
 
+    incomplete_alerts = 0
     for alert in alerts:
-        person_id, bbox, others = 'person_1', None, {}
-        if index is not None:
+        # Each alert is fully isolated: an unexpected error here (a disk-full
+        # OSError, a corrupt frame) marks just this alert incomplete and moves
+        # on, so a failure partway through can never starve later alerts of
+        # evidence the way an un-caught exception would (M1).
+        failed_artifacts: list[str] = []
+        try:
+            person_id, bbox, others = 'person_1', None, {}
+            if index is not None:
+                try:
+                    person_id, bbox = index.query(alert.timestamp_sec)
+                    others = index.persons_at(alert.timestamp_sec)
+                except Exception:  # noqa: BLE001
+                    person_id, bbox, others = 'person_1', None, {}
+
+            # Human-readable behaviour ("Phone Detected", "Looking Away", …).
+            behavior_label = alert.get_behavior_type_display()
+
+            # All people in the frame, with the flagged person's precise bbox.
+            boxes = dict(others)
+            if bbox is not None:
+                boxes[person_id] = bbox
+            boxes_list = list(boxes.items())
+
+            metadata = dict(alert.metadata or {})
+            metadata['person_id'] = person_id
+            if bbox is not None:
+                x1, y1, x2, y2 = bbox
+                metadata['bbox'] = [
+                    int(round(x1)), int(round(y1)),
+                    int(round(x2 - x1)), int(round(y2 - y1)),
+                ]
+
+            crop_rel = f'snapshots/{session.id}/{alert.id}_crop.jpg'
+            frame_rel = f'snapshots/{session.id}/{alert.id}_frame.jpg'
+            clip_rel = f'clips/{session.id}/{alert.id}.mp4'
+
+            # 1. Clean face crop → avatar (stored in metadata).
             try:
-                person_id, bbox = index.query(alert.timestamp_sec)
-                others = index.persons_at(alert.timestamp_sec)
+                if extract_face_crop(video_path, alert.timestamp_sec, bbox,
+                                      str(media_root / crop_rel), head_fraction=head_fraction):
+                    metadata['crop_url'] = f'{media_url}/{crop_rel}'
             except Exception:  # noqa: BLE001
-                person_id, bbox, others = 'person_1', None, {}
+                failed_artifacts.append('crop')
+                logger.exception('Evidence crop failed for alert %s', alert.id)
+            # 2. Full annotated frame → main evidence image (snapshot_url).
+            try:
+                if extract_annotated_frame(
+                    video_path, alert.timestamp_sec, boxes_list, person_id,
+                    behavior_label, str(media_root / frame_rel),
+                ):
+                    alert.snapshot_url = f'{media_url}/{frame_rel}'
+            except Exception:  # noqa: BLE001
+                failed_artifacts.append('snapshot')
+                logger.exception('Evidence snapshot failed for alert %s', alert.id)
+            # 3. 3-second clip with the overlay on every frame (clip_url).
+            try:
+                if extract_clip(
+                    video_path, alert.timestamp_sec, str(media_root / clip_rel),
+                    boxes=boxes_list, flagged_person_id=person_id, behavior_label=behavior_label,
+                ):
+                    alert.clip_url = f'{media_url}/{clip_rel}'
+            except Exception:  # noqa: BLE001
+                failed_artifacts.append('clip')
+                logger.exception('Evidence clip failed for alert %s', alert.id)
 
-        # Human-readable behaviour ("Phone Detected", "Looking Away", …).
-        behavior_label = alert.get_behavior_type_display()
+            if failed_artifacts:
+                metadata['evidence_incomplete'] = True
+                metadata['evidence_errors'] = failed_artifacts
+                incomplete_alerts += 1
 
-        # All people in the frame, with the flagged person's precise bbox.
-        boxes = dict(others)
-        if bbox is not None:
-            boxes[person_id] = bbox
-        boxes_list = list(boxes.items())
+            alert.metadata = metadata
+        except Exception:  # noqa: BLE001 — one alert must never abort the rest
+            logger.exception('Evidence generation aborted for alert %s', alert.id)
+            aborted_metadata = dict(alert.metadata or {})
+            aborted_metadata['evidence_incomplete'] = True
+            alert.metadata = aborted_metadata
+            incomplete_alerts += 1
 
-        metadata = dict(alert.metadata or {})
-        metadata['person_id'] = person_id
-        if bbox is not None:
-            x1, y1, x2, y2 = bbox
-            metadata['bbox'] = [
-                int(round(x1)), int(round(y1)),
-                int(round(x2 - x1)), int(round(y2 - y1)),
-            ]
+    try:
+        Alert.objects.bulk_update(alerts, ['snapshot_url', 'clip_url', 'metadata'])
+    except Exception:  # noqa: BLE001 — persistence itself failed: nothing saved
+        logger.exception('Failed to persist alert evidence for session %s', session.id)
+        return len(alerts)
 
-        crop_rel = f'snapshots/{session.id}/{alert.id}_crop.jpg'
-        frame_rel = f'snapshots/{session.id}/{alert.id}_frame.jpg'
-        clip_rel = f'clips/{session.id}/{alert.id}.mp4'
-
-        # 1. Clean face crop → avatar (stored in metadata).
-        try:
-            if extract_face_crop(video_path, alert.timestamp_sec, bbox,
-                                  str(media_root / crop_rel), head_fraction=head_fraction):
-                metadata['crop_url'] = f'{media_url}/{crop_rel}'
-        except Exception:  # noqa: BLE001
-            pass
-        # 2. Full annotated frame → main evidence image (snapshot_url).
-        try:
-            if extract_annotated_frame(
-                video_path, alert.timestamp_sec, boxes_list, person_id,
-                behavior_label, str(media_root / frame_rel),
-            ):
-                alert.snapshot_url = f'{media_url}/{frame_rel}'
-        except Exception:  # noqa: BLE001
-            pass
-        # 3. 3-second clip with the overlay on every frame (clip_url).
-        try:
-            if extract_clip(
-                video_path, alert.timestamp_sec, str(media_root / clip_rel),
-                boxes=boxes_list, flagged_person_id=person_id, behavior_label=behavior_label,
-            ):
-                alert.clip_url = f'{media_url}/{clip_rel}'
-        except Exception:  # noqa: BLE001
-            pass
-
-        alert.metadata = metadata
-
-    Alert.objects.bulk_update(alerts, ['snapshot_url', 'clip_url', 'metadata'])
+    return incomplete_alerts
 
 
 def build_ai_report(session, job=None):
@@ -866,9 +902,14 @@ def build_ai_report(session, job=None):
     # OUTSIDE a transaction; it commits its own per-alert bulk_update at the end.
     # Reuse the person index the analysis pass already built from YOLO boxes (H6)
     # so the video is not swept a third time.
-    _attach_alert_evidence(
+    incomplete_evidence = _attach_alert_evidence(
         video, session, alerts, person_index=getattr(result, 'person_index', None),
     )
+    if incomplete_evidence:
+        logger.warning(
+            'Evidence incomplete for %d of %d alert(s) in session %s',
+            incomplete_evidence, len(alerts), session.id,
+        )
 
     # Aggregate from the persisted alerts (now enriched with person ids), so the
     # report reflects exactly what was saved.
@@ -921,6 +962,11 @@ def build_ai_report(session, job=None):
                 'analysis': result.metadata,
                 'annotated_video_path': result.annotated_video_path,
                 'annotated_video_url': _media_url_for(result.annotated_video_path),
+                # Surface partial-evidence runs so the frontend can flag that some
+                # alerts are missing their snapshot/clip rather than implying the
+                # absence means "nothing happened" (M1).
+                'evidence_incomplete': bool(incomplete_evidence),
+                'evidence_incomplete_count': incomplete_evidence,
             })
             job.metadata = job_metadata
             # Stamp the model that actually ran (H3): provenance, not a client

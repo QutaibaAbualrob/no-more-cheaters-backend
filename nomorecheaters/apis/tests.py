@@ -1697,6 +1697,123 @@ class PersonCountFallbackTests(APITestCase):
         self.assertIn('across 1 person(s)', report.summary)
 
 
+class IncompleteEvidenceSignalTests(APITestCase):
+    """M1: partial evidence failures are recorded, not silently swallowed.
+
+    ``_attach_alert_evidence`` processes alerts in a loop writing three artifacts
+    each. If an extractor raises midway (e.g. disk fills), the old code left the
+    artifact empty with no trace and — worse — an error outside the per-artifact
+    guards could abort the loop, starving every later alert. Now each alert is
+    isolated, failing artifacts are stamped onto ``metadata['evidence_incomplete']``
+    /``evidence_errors``, and the count of affected alerts is returned and stamped
+    onto the job so the partial state is visible.
+    """
+
+    def _make(self):
+        media_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, media_root, ignore_errors=True)
+        user = make_user(username='m1', email='m1@example.com')
+        session = make_session(exam=make_exam(instructor=user))
+        video_path = Path(media_root) / 'm1.mp4'
+        video_path.write_bytes(fake_video_bytes(b'm1'))
+        video = SimpleNamespace(file=SimpleNamespace(path=str(video_path)))
+        index = SimpleNamespace(
+            box_kind='person',
+            query=lambda ts: ('person_1', None),
+            persons_at=lambda ts: {},
+        )
+        return media_root, session, video, index
+
+    def _alert(self, session, ts):
+        return Alert.objects.create(
+            session=session,
+            timestamp_sec=ts,
+            behavior_type=Alert.BehaviorType.LOOKING_AWAY,
+            severity=Alert.Severity.MEDIUM,
+            confidence_score=0.6,
+            metadata={'source': 'ai-pipeline'},
+        )
+
+    def test_failed_artifact_is_recorded_and_counted(self):
+        from apis import services
+
+        media_root, session, video, index = self._make()
+        alert = self._alert(session, 5)
+
+        with override_settings(MEDIA_ROOT=media_root), \
+                mock.patch('apis.ai.face_tracker.extract_face_crop', side_effect=OSError('disk full')), \
+                mock.patch('apis.ai.face_tracker.extract_annotated_frame', return_value=False), \
+                mock.patch('apis.ai.face_tracker.extract_clip', return_value=False):
+            incomplete = services._attach_alert_evidence(
+                video, session, [alert], person_index=index,
+            )
+
+        self.assertEqual(incomplete, 1)
+        alert.refresh_from_db()
+        self.assertTrue(alert.metadata.get('evidence_incomplete'))
+        self.assertIn('crop', alert.metadata.get('evidence_errors', []))
+
+    def test_one_alert_failure_does_not_starve_the_others(self):
+        """A raising extractor on alert #1 must not block alert #2's evidence."""
+        from apis import services
+
+        media_root, session, video, index = self._make()
+        first = self._alert(session, 1)
+        second = self._alert(session, 2)
+
+        # extract_clip raises only for the first alert (matched by timestamp);
+        # the snapshot extractor succeeds for both.
+        def clip_side_effect(video_path, ts, out, **kwargs):
+            if ts == 1:
+                raise OSError('disk full')
+            return True
+
+        with override_settings(MEDIA_ROOT=media_root), \
+                mock.patch('apis.ai.face_tracker.extract_face_crop', return_value=False), \
+                mock.patch('apis.ai.face_tracker.extract_annotated_frame', return_value=True), \
+                mock.patch('apis.ai.face_tracker.extract_clip', side_effect=clip_side_effect):
+            incomplete = services._attach_alert_evidence(
+                video, session, [first, second], person_index=index,
+            )
+
+        self.assertEqual(incomplete, 1)  # only the first alert
+        first.refresh_from_db()
+        second.refresh_from_db()
+        # The first alert is flagged incomplete; the second still got its evidence.
+        self.assertTrue(first.metadata.get('evidence_incomplete'))
+        self.assertFalse(second.metadata.get('evidence_incomplete', False))
+        self.assertTrue(second.clip_url)
+        self.assertTrue(second.snapshot_url)
+
+    def test_job_metadata_flags_incomplete_evidence(self):
+        from apis import services
+
+        media_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, media_root, ignore_errors=True)
+
+        with override_settings(MEDIA_ROOT=media_root):
+            user = make_user(username='m1b', email='m1b@example.com')
+            session = make_session(exam=make_exam(instructor=user))
+            upload = SimpleUploadedFile(
+                'm1b.mp4', fake_video_bytes(b'm1b'), content_type='video/mp4',
+            )
+            serializer = VideoUploadSerializer(
+                data={'session': str(session.id), 'file': upload},
+                context={'request': request_for(user)},
+            )
+            self.assertTrue(serializer.is_valid(), serializer.errors)
+            serializer.save()
+            job = AnalysisJob.objects.create(session=session)
+
+            with mock.patch('apis.ai.analyze_video', return_value=fake_analysis_result()), \
+                    mock.patch('apis.services._attach_alert_evidence', return_value=2):
+                services.build_ai_report(session, job=job)
+
+        job.refresh_from_db()
+        self.assertTrue(job.metadata.get('evidence_incomplete'))
+        self.assertEqual(job.metadata.get('evidence_incomplete_count'), 2)
+
+
 class ActivitySeriesQueryTests(APITestCase):
     """H7: the activity chart is two grouped queries, not 2·N per-day COUNTs.
 
