@@ -338,11 +338,19 @@ def threshold_payload(values, updated_at=None):
 
 
 def validate_thresholds(payload):
-    """Accept only known threshold keys with numeric values between 0 and 1."""
+    """Accept only known threshold keys with numeric values between 0 and 1.
+
+    Unknown keys are rejected rather than silently dropped (M3): a typo'd key
+    (e.g. ``gaze_treshold``) used to be discarded, so the save "succeeded"
+    while the intended threshold never changed. Surfacing it as a validation
+    error lets the caller fix the key instead of trusting a phantom write.
+    """
     cleaned = {}
     for key, value in payload.items():
         if key not in THRESHOLD_DEFAULTS:
-            continue
+            raise ValidationError(
+                {key: f'Unknown threshold key. Allowed keys: '
+                      f'{", ".join(sorted(THRESHOLD_DEFAULTS))}.'})
         try:
             numeric = float(value)
         except (TypeError, ValueError):

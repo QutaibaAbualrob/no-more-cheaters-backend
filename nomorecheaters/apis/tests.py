@@ -854,6 +854,50 @@ class ThresholdsAndSystemAPITests(APITestCase):
         self.assertEqual(logs_response.data['count'], 1)
 
 
+class ValidateThresholdsTests(APITestCase):
+    """M3: validate_thresholds rejects unknown keys instead of dropping them."""
+
+    def test_unknown_key_is_rejected(self):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        from apis.services import validate_thresholds
+
+        with self.assertRaises(DRFValidationError) as ctx:
+            validate_thresholds({'gaze_treshold': 0.5})  # typo'd key
+        self.assertIn('gaze_treshold', ctx.exception.detail)
+
+    def test_unknown_key_rejected_even_alongside_valid_keys(self):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        from apis.services import validate_thresholds
+
+        with self.assertRaises(DRFValidationError):
+            validate_thresholds({'gaze_threshold': 0.5, 'bogus': 0.5})
+
+    def test_known_keys_pass_through_as_floats(self):
+        from apis.services import validate_thresholds
+
+        cleaned = validate_thresholds({'gaze_threshold': '0.5', 'noise_threshold': 0.7})
+        self.assertEqual(cleaned, {'gaze_threshold': 0.5, 'noise_threshold': 0.7})
+
+    def test_out_of_range_and_non_numeric_still_rejected(self):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        from apis.services import validate_thresholds
+
+        with self.assertRaises(DRFValidationError):
+            validate_thresholds({'gaze_threshold': 2.0})
+        with self.assertRaises(DRFValidationError):
+            validate_thresholds({'gaze_threshold': 'abc'})
+
+    def test_unknown_key_returns_400_from_api(self):
+        instructor = make_user(username='m3user', email='m3@example.com')
+        self.client.force_authenticate(instructor)
+        response = self.client.patch(
+            reverse('my_thresholds'), {'gaze_treshold': 0.5}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
 class DuplicateVideoHashTests(TestCase):
     """Issue 7 / FR4: duplicate video uploads must be rejected cleanly."""
 
