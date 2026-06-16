@@ -1101,6 +1101,72 @@ class UploadSessionBoundTests(TestCase):
         )
 
 
+class UploadRewindHardeningTests(TestCase):
+    """N5: the post-hash rewind must be verified so a stuck descriptor can't
+    silently store a truncated video."""
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
+
+    def test_full_content_is_stored_after_rewind(self):
+        """The happy path: hashing consumes the stream, yet the saved file holds
+        every byte — proof the rewind put the descriptor back to the start."""
+        instructor = make_user()
+        session = make_session(exam=make_exam(instructor=instructor))
+        content = fake_video_bytes(b'the complete payload must survive hashing')
+        upload = SimpleUploadedFile('exam.mp4', content, content_type='video/mp4')
+        serializer = VideoUploadSerializer(
+            data={'session': str(session.id), 'file': upload},
+            context={'request': request_for(instructor)},
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        video = serializer.save()
+
+        video.file.open('rb')
+        try:
+            stored = video.file.read()
+        finally:
+            video.file.close()
+        self.assertEqual(stored, content)
+
+    def test_unverified_rewind_is_rejected_without_writing_a_row(self):
+        """A descriptor left at EOF (a seek that didn't take) must raise rather
+        than persist a truncated file."""
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        instructor = make_user()
+        session = make_session(exam=make_exam(instructor=instructor))
+        content = fake_video_bytes(b'stuck stream')
+
+        class _StuckFile:
+            """File-like whose seek(0) silently fails to rewind."""
+            name = 'exam.mp4'
+            content_type = 'video/mp4'
+            size = len(content)
+
+            def chunks(self):
+                yield content
+
+            def seek(self, _pos):
+                pass  # no-op: the rewind does not take effect
+
+            def tell(self):
+                return len(content)  # still at EOF
+
+        serializer = VideoUploadSerializer(
+            context={'request': request_for(instructor)})
+        with self.assertRaises(DRFValidationError):
+            serializer.create({'file': _StuckFile(), 'session': session})
+
+        self.assertFalse(Video.objects.filter(session=session).exists())
+
+
 class DuplicateVideoHashTests(TestCase):
     """Issue 7 / FR4: duplicate video uploads must be rejected cleanly."""
 

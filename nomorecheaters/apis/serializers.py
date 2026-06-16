@@ -715,6 +715,30 @@ class VideoUploadSerializer(serializers.ModelSerializer):
             return True
         return False
 
+    @staticmethod
+    def _rewind_for_save(file):
+        """Seek *file* back to the start and confirm the rewind actually took.
+
+        Hashing in :meth:`create` consumes the stream to EOF, and Django's
+        ``FileField.save()`` writes from the descriptor's *current* position —
+        so a handle left mid-stream stores a TRUNCATED video. ``seek(0)`` fixes
+        that, but a non-seekable stream, or any signal/middleware that advanced
+        the descriptor after we rewound, would corrupt the file silently. We
+        verify with ``tell()`` and turn a would-be silent truncation into a
+        clean, retriable error (N5).
+        """
+        try:
+            file.seek(0)
+            position = file.tell()
+        except (OSError, ValueError) as exc:
+            raise serializers.ValidationError(
+                {'file': 'Could not rewind the uploaded file for storage; '
+                         'please retry the upload.'}) from exc
+        if position != 0:
+            raise serializers.ValidationError(
+                {'file': 'The uploaded file could not be read from the start; '
+                         'please retry the upload.'})
+
     def create(self, validated_data):
         """Compute the file hash, reject a per-session duplicate, then persist.
 
@@ -725,7 +749,6 @@ class VideoUploadSerializer(serializers.ModelSerializer):
         digest = hashlib.sha256()
         for chunk in file.chunks():
             digest.update(chunk)
-        file.seek(0)
 
         file_hash = digest.hexdigest()
         session = validated_data['session']
@@ -734,6 +757,9 @@ class VideoUploadSerializer(serializers.ModelSerializer):
                 {'file': 'This video has already been uploaded for this session.'}
             )
 
+        # Rewind immediately before persisting — the smallest possible window
+        # between the reset and FileField.save()'s read — and verify it held.
+        self._rewind_for_save(file)
         request = self.context.get('request')
         return Video.objects.create(
             **validated_data,
