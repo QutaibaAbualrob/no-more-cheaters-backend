@@ -63,11 +63,40 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == '':
+        return default
+    value = raw.strip().lower()
+    if value in ('1', 'true', 'yes', 'on'):
+        return True
+    if value in ('0', 'false', 'no', 'off'):
+        return False
+    return default
+
+
 # --- Model weights -----------------------------------------------------------
 # ultralytics resolves these names and downloads the weights on first use
 # (~220MB total), caching them on disk for subsequent runs.
 OBJECT_MODEL = os.getenv('AI_OBJECT_MODEL', 'yolo11x.pt')
 POSE_MODEL = os.getenv('AI_POSE_MODEL', 'yolo11x-pose.pt')
+
+# --- Inference resolution ----------------------------------------------------
+# Source recordings are typically 1280x720. The ultralytics default (imgsz=640)
+# downscales the frame ~2x linearly, which destroys the few pixels a small,
+# distant phone occupies — so phones are essentially never detected at 640.
+# 960 keeps far more of that detail at ~2-2.5x the compute of 640; bump to 1280
+# for the best small-object recall (~3.5-4x). Box coordinates are unaffected:
+# ultralytics rescales every box back to ORIGINAL source-frame pixels regardless
+# of imgsz.
+OBJECT_IMGSZ = max(32, _env_int('AI_OBJECT_IMGSZ', 960))
+POSE_IMGSZ = max(32, _env_int('AI_POSE_IMGSZ', 960))
+# FP16 inference — GPU-only (errors on CPU), passed to predict() only when the
+# resolved device is not the CPU. Opt-in.
+OBJECT_HALF = _env_bool('AI_OBJECT_HALF', False)
+# Class-agnostic NMS. Near-inert because the detector is restricted to classes
+# {phone, laptop}; opt-in only, default off.
+OBJECT_AGNOSTIC_NMS = _env_bool('AI_AGNOSTIC_NMS', False)
 
 # --- Inference device --------------------------------------------------------
 # AI_DEVICE controls where YOLO runs:
@@ -113,7 +142,22 @@ def resolve_device():
 SAMPLE_EVERY_N_FRAMES = max(1, _env_int('AI_SAMPLE_RATE', 15))
 
 # --- Confidence thresholds ---------------------------------------------------
+# OBJECT_CONFIDENCE is the coarse predict() floor (in the live pipeline it is
+# overridden by the instructor's AIThresholds sensitivity — see
+# services.build_ai_report). On TOP of that floor each class has its own keep
+# threshold (CLASS_CONFIDENCE), applied post-inference in the detector as
+# max(floor, class_keep):
+#   * LAPTOP is kept HIGH (0.85) because YOLO reads bright rectangular exam
+#     paper/books as "laptop" with confidence reaching ~0.79; 0.85 rejects them
+#     regardless of the slider. This is the paper-false-positive fix.
+#   * PHONE keeps the floor (>=0.30 minimum) — phones are the real target and
+#     are hard to see, so recall is governed by the slider + imgsz, not a high
+#     per-class bar.
 OBJECT_CONFIDENCE = _env_float('AI_OBJECT_CONFIDENCE', 0.40)
+CLASS_CONFIDENCE = {
+    PHONE_DETECTED: _env_float('AI_PHONE_CONFIDENCE', 0.30),
+    LAPTOPS: _env_float('AI_LAPTOP_CONFIDENCE', 0.85),
+}
 # Minimum person/keypoint confidence required before head-pose is trusted.
 POSE_CONFIDENCE = _env_float('AI_POSE_CONFIDENCE', 0.50)
 # Nose offset from the eye midpoint, as a fraction of inter-eye distance.
@@ -130,6 +174,38 @@ LOOKING_AWAY_ANGLE_DEG = _env_float('AI_HEAD_TURN_ANGLE_DEG', 45.0)
 # ~0.55 is a typical adult-face value; it is an approximation from 2D keypoints,
 # not a true 3D pose solve. Lower → the same offset reads as a larger angle.
 NOSE_DEPTH_RATIO = _env_float('AI_NOSE_DEPTH_RATIO', 0.55)
+
+# --- Head-pose (looking-away) v2 heuristic -----------------------------------
+# Replaces the brittle nose-vs-eye-midpoint yaw (above, kept for back-compat).
+# Up to three votes; LOOKING_AWAY is flagged only when at least
+# LOOKING_AWAY_MIN_VOTES fire AND the mandatory horizontal-offset vote (V2) is
+# among them — so a purely vertical pitch (looking down to write) never flags.
+#   V1  ear asymmetry — only one ear confidently visible (a profile); the
+#       visible-ear side also gives turn direction.
+#   V2  horizontal offset (MANDATORY) — nose displaced sideways from the
+#       shoulder midpoint, normalised by shoulder width (scale-invariant), so it
+#       reads pure yaw and ignores pitch.
+#   V3  corroborating — a horizontal offset large enough to be self-evident.
+EAR_VISIBLE_CONF = _env_float('AI_EAR_VISIBLE_CONF', 0.60)
+EAR_HIDDEN_CONF = _env_float('AI_EAR_HIDDEN_CONF', 0.35)
+EAR_CONF_RATIO = _env_float('AI_EAR_CONF_RATIO', 2.5)
+NOSE_SHOULDER_SIDEWAYS = _env_float('AI_NOSE_SHOULDER_SIDEWAYS', 0.35)
+NOSE_SHOULDER_TURNED = _env_float('AI_NOSE_SHOULDER_TURNED', 0.55)
+LOOKING_AWAY_MIN_VOTES = max(1, _env_int('AI_LOOKING_AWAY_VOTES', 2))
+
+# Master switch for looking-away detection. DEFAULT OFF.
+#
+# The heuristic is sound for a FRONTAL (student-facing) camera, but NOT for an
+# oblique/ceiling/wide camera: perspective alone displaces the nose horizontally
+# and hides one ear for *forward-facing* students, so the whole class trips it
+# (this footage flagged 7 of 12 forward/down-facing students). Enable it
+# (AI_ENABLE_LOOKING_AWAY=true) only with a roughly frontal camera; for an
+# oblique camera a dedicated 3D head-pose model (6DRepNet / L2CS-Net) is the
+# proper path. The pose pass still runs when this is off (it harvests the YOLO
+# person boxes used for evidence, H6) — only the looking-away *alerts* are
+# suppressed.
+ENABLE_LOOKING_AWAY = _env_bool('AI_ENABLE_LOOKING_AWAY', False)
+
 # A looking-away event must contain at least this many *consecutive* sampled
 # frames before it becomes an alert — a single momentary glance never counts.
 LOOKING_AWAY_MIN_CONSECUTIVE = max(1, _env_int('AI_CONSECUTIVE_DETECTIONS', 3))

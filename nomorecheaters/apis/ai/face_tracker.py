@@ -332,7 +332,7 @@ def _draw_person_boxes(cv2, frame, boxes, flagged_person_id, behavior_label: str
         if person_id == flagged_person_id:
             label = person_label(person_id)
             if behavior_label:
-                label = f'{label} — {behavior_label}'
+                label = f'{label} - {behavior_label}'
             _draw_box_with_label(cv2, frame, bbox, _FLAGGED_COLOR, label)
         else:
             _draw_box_with_label(cv2, frame, bbox, _OTHER_COLOR, person_label(person_id))
@@ -421,7 +421,7 @@ def extract_annotated_frame(video_path: str, timestamp_sec: float, boxes,
             h, w = annotated.shape[:2]
             label = person_label(flagged_person_id)
             if behavior_label:
-                label = f'{label} — {behavior_label}'
+                label = f'{label} - {behavior_label}'
             _draw_box_with_label(cv2, annotated, _fallback_bbox(w, h), _FLAGGED_COLOR, label)
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         return bool(cv2.imwrite(out_path, annotated))

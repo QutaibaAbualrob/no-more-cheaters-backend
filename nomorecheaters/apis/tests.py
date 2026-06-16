@@ -1332,8 +1332,9 @@ class AIPipelineIntegrationTests(TestCase):
 
         sample_ts, obj_script, pose_script, person_script = _scripted_pipeline_io()
 
-        with mock.patch('apis.ai.detector.read_metadata',
-                        return_value=_fake_video_metadata()), \
+        with mock.patch('apis.ai.config.ENABLE_LOOKING_AWAY', True), \
+                mock.patch('apis.ai.detector.read_metadata',
+                           return_value=_fake_video_metadata()), \
                 mock.patch('apis.ai.detector.iter_sampled_frames',
                            side_effect=lambda *a, **k: iter(_fake_frame_samples(sample_ts))):
             result = analyze_video(
@@ -1367,6 +1368,31 @@ class AIPipelineIntegrationTests(TestCase):
         self.assertEqual(result.metadata['raw_detections'], 12)  # 1 phone + 1 + 5*2 pose
         self.assertEqual(result.metadata['model']['object'], 'fake-object-model.pt')
         self.assertIsNone(result.annotated_video_path)  # annotate=False
+
+    def test_looking_away_suppressed_when_disabled_by_default(self):
+        """With ENABLE_LOOKING_AWAY off (the default), looking-away alerts are
+        suppressed while object evidence still flags — and the YOLO person index
+        is still built (H6 person tracking is independent of the gate)."""
+        from apis.ai import analyze_video
+
+        sample_ts, obj_script, pose_script, person_script = _scripted_pipeline_io()
+
+        with mock.patch('apis.ai.detector.read_metadata',
+                        return_value=_fake_video_metadata()), \
+                mock.patch('apis.ai.detector.iter_sampled_frames',
+                           side_effect=lambda *a, **k: iter(_fake_frame_samples(sample_ts))):
+            result = analyze_video(
+                '/does/not/exist.mp4',
+                annotate=False,
+                object_detector=_FakeObjectDetector(obj_script),
+                pose_analyzer=_FakePoseAnalyzer(pose_script, person_script),
+            )
+
+        # The phone (direct evidence) survives; every looking-away event is gone.
+        self.assertEqual(result.metadata['events_by_type'], {'PHONE_DETECTED': 1})
+        self.assertTrue(all(e.behavior_type != 'LOOKING_AWAY' for e in result.events))
+        # H6 person tracking is unaffected by the looking-away gate.
+        self.assertEqual(len(result.person_index.tracks), 2)
 
     def test_build_ai_report_end_to_end(self):
         import logging
@@ -1406,7 +1432,8 @@ class AIPipelineIntegrationTests(TestCase):
         # asserts (it checks the Alert/Report mapping), so quiet the noise.
         logging.disable(logging.CRITICAL)
         try:
-            with mock.patch('apis.ai.analyze_video', side_effect=fake_analyze), \
+            with mock.patch('apis.ai.config.ENABLE_LOOKING_AWAY', True), \
+                    mock.patch('apis.ai.analyze_video', side_effect=fake_analyze), \
                     mock.patch('apis.ai.detector.read_metadata',
                                return_value=_fake_video_metadata()), \
                     mock.patch('apis.ai.detector.iter_sampled_frames',

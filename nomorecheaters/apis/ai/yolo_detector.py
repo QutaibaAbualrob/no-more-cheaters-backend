@@ -32,9 +32,22 @@ class ObjectDetector:
         confidence: float = config.OBJECT_CONFIDENCE,
         device=None,
         class_map: dict | None = None,
+        imgsz: int = config.OBJECT_IMGSZ,
+        half: bool = config.OBJECT_HALF,
+        agnostic_nms: bool = config.OBJECT_AGNOSTIC_NMS,
+        class_confidence: dict | None = None,
     ):
         self.model_path = model_path
+        # `confidence` is the coarse predict() floor. Each class additionally has
+        # its own (higher) keep threshold in `class_confidence`, applied below as
+        # max(floor, class_keep).
         self.confidence = confidence
+        self.imgsz = imgsz
+        self.half = half
+        self.agnostic_nms = agnostic_nms
+        self.class_confidence = dict(
+            class_confidence if class_confidence is not None else config.CLASS_CONFIDENCE
+        )
         # Resolved lazily here (analysis time), so importing the package never
         # touches torch/CUDA. `0` means GPU; `'cpu'` means CPU.
         self.device = device if device is not None else config.resolve_device()
@@ -59,9 +72,15 @@ class ObjectDetector:
         predict_kwargs = {
             'conf': self.confidence,
             'classes': target_classes,
+            'imgsz': self.imgsz,
+            'agnostic_nms': self.agnostic_nms,
             'verbose': False,
             'device': self.device,
         }
+        # FP16 only works on GPU; passing half=True on CPU raises. Gate on the
+        # resolved device, NOT on `if self.half` alone (device 0 is falsy).
+        if self.half and self.device != 'cpu':
+            predict_kwargs['half'] = True
 
         results = self.model(frame, **predict_kwargs)
 
@@ -76,6 +95,17 @@ class ObjectDetector:
                 if behavior_type is None:
                     continue
                 confidence = float(box.conf[0])
+                # Per-class keep threshold on TOP of the predict floor: a laptop
+                # must clear a high bar (rejecting paper false positives) while a
+                # phone keeps the floor. max() so the slider-driven floor still
+                # applies when it is higher than the per-class minimum.
+                keep_threshold = max(
+                    self.confidence, self.class_confidence.get(behavior_type, 0.0)
+                )
+                if confidence < keep_threshold:
+                    continue
+                # ultralytics rescales box.xyxy back to ORIGINAL source-frame
+                # pixels regardless of imgsz, so this bbox is directly drawable.
                 x1, y1, x2, y2 = (float(v) for v in box.xyxy[0].tolist())
                 detections.append(
                     Detection(

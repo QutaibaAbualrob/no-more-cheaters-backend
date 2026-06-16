@@ -108,16 +108,21 @@ def _collect_frame_detections(
                 )
             )
         pose_detections, person_boxes = pose_analyzer.analyze_frame(sample.frame)
-        for pose in pose_detections:
-            detections.append(
-                FrameDetection(
-                    behavior_type=pose.behavior_type,
-                    confidence=pose.confidence,
-                    bbox=pose.bbox,
-                    frame_number=sample.frame_number,
-                    timestamp_sec=sample.timestamp_sec,
+        # Looking-away is opt-in (config.ENABLE_LOOKING_AWAY): its alerts are
+        # suppressed by default because the 2D heuristic is unreliable on oblique
+        # cameras. The pose pass still runs unconditionally — its person boxes are
+        # harvested below for evidence tracking (H6) regardless of the gate.
+        if config.ENABLE_LOOKING_AWAY:
+            for pose in pose_detections:
+                detections.append(
+                    FrameDetection(
+                        behavior_type=pose.behavior_type,
+                        confidence=pose.confidence,
+                        bbox=pose.bbox,
+                        frame_number=sample.frame_number,
+                        timestamp_sec=sample.timestamp_sec,
+                    )
                 )
-            )
         if person_boxes:
             person_frames.append(
                 (sample.timestamp_sec, [bbox for bbox, _conf in person_boxes])
