@@ -881,14 +881,25 @@ def build_ai_report(session, job=None):
             person_ids.add(person_id)
 
     total_alerts = len(alerts)
-    person_count = len(person_ids) or (1 if total_alerts else 0)
+    # Number of *distinct* people the alerts were attributed to. This is only
+    # known when person tracking/evidence actually ran and stamped a person_id
+    # onto the alert metadata; if that failed entirely, person_ids is empty and
+    # the count is genuinely unknown — we must not fabricate "1 person" (M12),
+    # which previously happened via a ``len(...) or 1`` fallback and made the
+    # report claim someone was identified when no one was.
+    person_count = len(person_ids)
     probability = _report_probability(alerts)
     processing_time = result.metadata.get('processing_time_seconds')
 
-    if total_alerts:
+    if not total_alerts:
+        summary = 'No suspicious activity detected in this session.'
+    elif person_count:
         summary = f'{total_alerts} alert(s) detected across {person_count} person(s).'
     else:
-        summary = 'No suspicious activity detected in this session.'
+        summary = (
+            f'{total_alerts} alert(s) detected; the number of people involved '
+            'could not be determined.'
+        )
 
     # Persist the aggregate report (and the job's analysis metadata) in a short
     # transaction — again, no I/O is held open here (C4).

@@ -1641,6 +1641,62 @@ class YoloPersonBoxReuseTests(APITestCase):
             self.assertIs(attach.call_args.kwargs.get('person_index'), sentinel_index)
 
 
+class PersonCountFallbackTests(APITestCase):
+    """M12: the report never fabricates "1 person" when attribution failed.
+
+    ``person_count`` for the summary is derived from the ``person_id`` stamped
+    onto each alert by ``_attach_alert_evidence``. If tracking/evidence fails
+    entirely, no alert carries a ``person_id`` and the count is genuinely
+    unknown — the old ``len(...) or 1`` fallback wrongly claimed one person was
+    identified. The summary must instead say the count could not be determined.
+    """
+
+    def _build_report(self, attach_side_effect):
+        from apis import services
+
+        media_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, media_root, ignore_errors=True)
+
+        with override_settings(MEDIA_ROOT=media_root):
+            user = make_user(username='m12', email='m12@example.com')
+            session = make_session(exam=make_exam(instructor=user))
+            upload = SimpleUploadedFile(
+                'm12.mp4', fake_video_bytes(b'm12'), content_type='video/mp4',
+            )
+            serializer = VideoUploadSerializer(
+                data={'session': str(session.id), 'file': upload},
+                context={'request': request_for(user)},
+            )
+            self.assertTrue(serializer.is_valid(), serializer.errors)
+            serializer.save()
+
+            with mock.patch('apis.ai.analyze_video', return_value=fake_analysis_result()), \
+                    mock.patch(
+                        'apis.services._attach_alert_evidence',
+                        side_effect=attach_side_effect,
+                    ):
+                return services.build_ai_report(session)
+
+    def test_summary_is_unknown_when_no_person_attributed(self):
+        # Evidence ran but stamped no person_id at all (tracking failed).
+        report = self._build_report(lambda *a, **k: None)
+
+        self.assertEqual(report.total_alerts, 1)
+        self.assertIn('could not be determined', report.summary)
+        self.assertNotIn('person(s).', report.summary)  # no fabricated count
+
+    def test_summary_counts_distinct_attributed_people(self):
+        def stamp_people(video, session, alerts, **kwargs):
+            # Simulate evidence attributing each alert to its own person.
+            for idx, alert in enumerate(alerts, start=1):
+                alert.metadata = {**(alert.metadata or {}), 'person_id': f'person_{idx}'}
+
+        report = self._build_report(stamp_people)
+
+        self.assertEqual(report.total_alerts, 1)
+        self.assertIn('across 1 person(s)', report.summary)
+
+
 class ActivitySeriesQueryTests(APITestCase):
     """H7: the activity chart is two grouped queries, not 2·N per-day COUNTs.
 
