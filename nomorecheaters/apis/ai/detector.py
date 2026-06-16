@@ -67,6 +67,11 @@ class AnalysisResult:
     events: list[AlertEvent]
     annotated_video_path: str | None
     metadata: dict = field(default_factory=dict)
+    # Per-person tracks built from the YOLO person boxes harvested during the
+    # analysis pass (H6). The service layer uses this to attribute and box people
+    # in evidence images without re-scanning the video. ``None`` only when the
+    # caller cannot build one; the evidence layer then falls back to its own scan.
+    person_index: object | None = None
 
 
 def _collect_frame_detections(
@@ -74,14 +79,21 @@ def _collect_frame_detections(
     object_detector: ObjectDetector,
     pose_analyzer: PoseAnalyzer,
     sample_every_n: int,
-) -> tuple[list[FrameDetection], int]:
+) -> tuple[list[FrameDetection], int, list[tuple]]:
     """Run both detectors over every sampled frame.
 
     The two detectors are independent per frame; they are invoked back to back
     here. (They could be fanned out to threads, but sharing a single CUDA model
     across threads is fragile, so the pipeline keeps them sequential.)
+
+    Alongside the behaviour detections this also harvests, per sampled frame, the
+    full set of person bounding boxes the pose model already produced — returned
+    as ``person_frames`` (``[(timestamp_sec, [bbox_xyxy, …]), …]``). The evidence
+    layer tracks people from these YOLO boxes rather than scanning the video a
+    third time with a Haar cascade (H6).
     """
     detections: list[FrameDetection] = []
+    person_frames: list[tuple] = []
     frames_analyzed = 0
     for sample in iter_sampled_frames(video_path, sample_every_n=sample_every_n):
         frames_analyzed += 1
@@ -95,7 +107,8 @@ def _collect_frame_detections(
                     timestamp_sec=sample.timestamp_sec,
                 )
             )
-        for pose in pose_analyzer.analyze(sample.frame):
+        pose_detections, person_boxes = pose_analyzer.analyze_frame(sample.frame)
+        for pose in pose_detections:
             detections.append(
                 FrameDetection(
                     behavior_type=pose.behavior_type,
@@ -105,7 +118,11 @@ def _collect_frame_detections(
                     timestamp_sec=sample.timestamp_sec,
                 )
             )
-    return detections, frames_analyzed
+        if person_boxes:
+            person_frames.append(
+                (sample.timestamp_sec, [bbox for bbox, _conf in person_boxes])
+            )
+    return detections, frames_analyzed, person_frames
 
 
 def _bbox_center(bbox) -> tuple[float, float, float] | None:
@@ -375,10 +392,16 @@ def analyze_video(
     pose_analyzer = pose_analyzer or PoseAnalyzer(keypoint_confidence=pose_confidence)
 
     meta = read_metadata(video_path)
-    detections, frames_analyzed = _collect_frame_detections(
+    detections, frames_analyzed, person_frames = _collect_frame_detections(
         video_path, object_detector, pose_analyzer, sample_every_n
     )
     events = consolidate_events(detections)
+
+    # Build the per-person index from the YOLO boxes already gathered above, so
+    # evidence attribution reuses this pass instead of a separate Haar sweep (H6).
+    from .face_tracker import index_from_person_boxes
+
+    person_index = index_from_person_boxes(person_frames, meta.width, meta.height)
 
     annotated_path = None
     if annotate and events:
@@ -425,4 +448,5 @@ def analyze_video(
         events=events,
         annotated_video_path=annotated_path,
         metadata=metadata,
+        person_index=person_index,
     )

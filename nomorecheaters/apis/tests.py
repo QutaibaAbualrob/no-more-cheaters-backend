@@ -1429,6 +1429,139 @@ class DeadJobFieldsWiringTests(APITestCase):
         self.assertEqual(job.ai_model_version, 'yolo11x.pt')
 
 
+class _Arr(list):
+    """List that quacks like an ultralytics tensor row (``.tolist()``)."""
+
+    def tolist(self):
+        return list(self)
+
+
+class _FakeBox:
+    """Minimal stand-in for one ultralytics detection box."""
+
+    def __init__(self, xyxy, conf):
+        self.xyxy = [_Arr(xyxy)]
+        self.conf = [conf]
+
+
+class YoloPersonBoxReuseTests(APITestCase):
+    """H6: evidence reuses the YOLO person boxes instead of a Haar sweep.
+
+    The pose pass already detects every person per frame; those boxes are
+    harvested into a :class:`PersonIndex` and reused, so the video is not scanned
+    a third time with the Haar cascade.
+    """
+
+    def test_pose_analyzer_surfaces_person_boxes_without_looking_away(self):
+        """``analyze_frame`` returns person boxes even when nobody is flagged."""
+        from apis.ai.pose_analyzer import PoseAnalyzer
+
+        analyzer = PoseAnalyzer()
+        # keypoints=None → no looking-away detection, but boxes still present.
+        result = SimpleNamespace(
+            boxes=[_FakeBox([10, 20, 60, 200], 0.91), _FakeBox([300, 30, 360, 210], 0.82)],
+            keypoints=None,
+        )
+        analyzer._model = lambda frame, **kwargs: [result]
+
+        detections, person_boxes = analyzer.analyze_frame(object())
+
+        self.assertEqual(detections, [])  # nobody looking away
+        self.assertEqual(len(person_boxes), 2)  # both persons still tracked
+        self.assertEqual(person_boxes[0][0], (10.0, 20.0, 60.0, 200.0))
+        # The backward-compatible wrapper still returns just the detections.
+        self.assertEqual(analyzer.analyze(object()), [])
+
+    def test_index_from_person_boxes_tracks_and_labels_left_to_right(self):
+        """YOLO boxes build a queryable, left-to-right-labelled PersonIndex."""
+        from apis.ai.face_tracker import index_from_person_boxes
+
+        # Two people, each sighted in two consecutive sampled frames.
+        frames = [
+            (0.0, [(100, 50, 160, 200), (400, 60, 470, 210)]),
+            (1.0, [(104, 52, 164, 202), (398, 58, 468, 208)]),
+        ]
+        index = index_from_person_boxes(frames, 640, 480)
+
+        self.assertEqual(index.box_kind, 'person')
+        self.assertEqual(index.person_count, 2)
+        # person_1 is the leftmost track; person_2 the rightmost.
+        self.assertEqual(set(index.persons_at(0.0)), {'person_1', 'person_2'})
+        left_bbox = index.persons_at(0.0)['person_1']
+        right_bbox = index.persons_at(0.0)['person_2']
+        self.assertLess(left_bbox[0], right_bbox[0])
+
+    def test_evidence_consumes_pipeline_index_and_skips_haar_sweep(self):
+        """``_attach_alert_evidence`` uses the supplied index; never calls track_persons."""
+        from apis import services
+
+        media_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, media_root, ignore_errors=True)
+
+        with override_settings(MEDIA_ROOT=media_root):
+            user = make_user(username='h6', email='h6@example.com')
+            session = make_session(exam=make_exam(instructor=user))
+            video_path = Path(media_root) / 'h6.mp4'
+            video_path.write_bytes(fake_video_bytes(b'h6'))
+            video = SimpleNamespace(file=SimpleNamespace(path=str(video_path)))
+
+            alert = Alert.objects.create(
+                session=session,
+                timestamp_sec=5,
+                behavior_type=Alert.BehaviorType.LOOKING_AWAY,
+                severity=Alert.Severity.MEDIUM,
+                confidence_score=0.6,
+                metadata={'source': 'ai-pipeline'},
+            )
+
+            # A YOLO-derived index: person boxes, queryable like the real one.
+            person_index = SimpleNamespace(
+                box_kind='person',
+                query=lambda ts: ('person_2', (300.0, 30.0, 360.0, 210.0)),
+                persons_at=lambda ts: {'person_2': (300.0, 30.0, 360.0, 210.0)},
+            )
+
+            with mock.patch('apis.ai.face_tracker.track_persons') as haar:
+                services._attach_alert_evidence(
+                    video, session, [alert], person_index=person_index,
+                )
+
+            haar.assert_not_called()  # H6: no redundant Haar sweep
+
+        alert.refresh_from_db()
+        self.assertEqual(alert.metadata.get('person_id'), 'person_2')
+        # The flagged person's bbox (x, y, w, h) is recorded from the YOLO box.
+        self.assertEqual(alert.metadata.get('bbox'), [300, 30, 60, 180])
+
+    def test_build_ai_report_passes_person_index_into_evidence(self):
+        """The pipeline result's ``person_index`` reaches the evidence layer (H6)."""
+        from apis import services
+
+        media_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, media_root, ignore_errors=True)
+
+        with override_settings(MEDIA_ROOT=media_root):
+            user = make_user(username='h6b', email='h6b@example.com')
+            session = make_session(exam=make_exam(instructor=user))
+            upload = SimpleUploadedFile('h6b.mp4', fake_video_bytes(b'h6b'), content_type='video/mp4')
+            serializer = VideoUploadSerializer(
+                data={'session': str(session.id), 'file': upload},
+                context={'request': request_for(user)},
+            )
+            self.assertTrue(serializer.is_valid(), serializer.errors)
+            serializer.save()
+
+            sentinel_index = SimpleNamespace(box_kind='person', tracks={})
+            result = fake_analysis_result()
+            result.person_index = sentinel_index
+
+            with mock.patch('apis.ai.analyze_video', return_value=result), \
+                    mock.patch('apis.services._attach_alert_evidence') as attach:
+                services.build_ai_report(session)
+
+            self.assertIs(attach.call_args.kwargs.get('person_index'), sentinel_index)
+
+
 class PreanalyzeDemosCommandTests(TestCase):
     """Task 1.5: the ``preanalyze_demos`` management command.
 

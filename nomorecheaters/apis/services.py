@@ -645,11 +645,16 @@ def _report_probability(alerts):
     return round(min(0.99, 1.0 - surviving_risk), 2)
 
 
-def _attach_alert_evidence(video, session, alerts):
+def _attach_alert_evidence(video, session, alerts, person_index=None):
     """Attach per-alert visual evidence with a green-boxed flagged person.
 
-    Tracks faces across the recording once (see :mod:`apis.ai.face_tracker`),
-    then for each alert resolves the flagged person near its timestamp and saves
+    *person_index* is the per-person track index the analysis pass already built
+    from YOLO boxes (H6); it is reused as-is so the video is not scanned again.
+    Only when it is ``None`` (a direct evidence call outside the pipeline) does
+    this fall back to :func:`apis.ai.face_tracker.track_persons`, the standalone
+    Haar-cascade sweep.
+
+    For each alert it resolves the flagged person near its timestamp and saves
     three artifacts:
 
     * **crop** (``metadata['crop_url']``) — the flagged face only, no overlay;
@@ -678,10 +683,18 @@ def _attach_alert_evidence(video, session, alerts):
     media_root = Path(settings.MEDIA_ROOT)
     media_url = '/' + settings.MEDIA_URL.strip('/')
 
-    try:
-        index = track_persons(video_path)
-    except Exception:  # noqa: BLE001
-        index = None
+    # Reuse the pipeline's YOLO-derived index when present; otherwise sweep the
+    # video once with the Haar fallback (H6).
+    index = person_index
+    if index is None:
+        try:
+            index = track_persons(video_path)
+        except Exception:  # noqa: BLE001
+            index = None
+
+    # Person boxes (YOLO) need a head crop for the avatar; face boxes (Haar) are
+    # used as-is.
+    head_fraction = 0.45 if getattr(index, 'box_kind', 'face') == 'person' else None
 
     for alert in alerts:
         person_id, bbox, others = 'person_1', None, {}
@@ -716,7 +729,8 @@ def _attach_alert_evidence(video, session, alerts):
 
         # 1. Clean face crop → avatar (stored in metadata).
         try:
-            if extract_face_crop(video_path, alert.timestamp_sec, bbox, str(media_root / crop_rel)):
+            if extract_face_crop(video_path, alert.timestamp_sec, bbox,
+                                  str(media_root / crop_rel), head_fraction=head_fraction):
                 metadata['crop_url'] = f'{media_url}/{crop_rel}'
         except Exception:  # noqa: BLE001
             pass
@@ -823,7 +837,11 @@ def build_ai_report(session, job=None):
     # Enrich each alert with a face crop, a 3-second clip, and a person id. This
     # is filesystem/ffmpeg I/O (minutes for long videos) and deliberately runs
     # OUTSIDE a transaction; it commits its own per-alert bulk_update at the end.
-    _attach_alert_evidence(video, session, alerts)
+    # Reuse the person index the analysis pass already built from YOLO boxes (H6)
+    # so the video is not swept a third time.
+    _attach_alert_evidence(
+        video, session, alerts, person_index=getattr(result, 'person_index', None),
+    )
 
     # Aggregate from the persisted alerts (now enriched with person ids), so the
     # report reflects exactly what was saved.
