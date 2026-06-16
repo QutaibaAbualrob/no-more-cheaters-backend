@@ -97,13 +97,24 @@ class UserReadSerializer(serializers.ModelSerializer):
     """Read-only representation of a user account.
 
     Exposes only non-sensitive fields; passwords and permissions are
-    intentionally excluded.
+    intentionally excluded. ``display_name`` is the real name the user entered at
+    signup (``get_full_name()``), falling back to the auto-generated username
+    only when no name was captured — so user cards never show the random
+    username suffix when a real name exists.
     """
+
+    display_name = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ['id', 'email', 'username', 'role', 'is_active', 'created_at']
+        fields = [
+            'id', 'email', 'username', 'first_name', 'last_name',
+            'display_name', 'role', 'is_active', 'created_at',
+        ]
         read_only_fields = fields
+
+    def get_display_name(self, obj):
+        return (obj.get_full_name() or '').strip() or obj.username
 
 
 class UserCreateSerializer(serializers.ModelSerializer):
@@ -125,12 +136,15 @@ class UserCreateSerializer(serializers.ModelSerializer):
 class UserUpdateSerializer(serializers.ModelSerializer):
     """Update an existing user's profile fields (admin only).
 
-    Password changes are handled separately by dj-rest-auth.
+    The real name is stored in ``first_name`` / ``last_name`` (shown as
+    ``display_name``); the admin edit form writes those, not the username, so
+    renaming a user never corrupts their login username. Password changes are
+    handled separately by dj-rest-auth.
     """
 
     class Meta:
         model = User
-        fields = ['email', 'username', 'role', 'is_active']
+        fields = ['email', 'username', 'first_name', 'last_name', 'role', 'is_active']
 
 
 class NotificationSerializer(serializers.ModelSerializer):
@@ -286,10 +300,17 @@ class WorkspaceWriteSerializer(serializers.ModelSerializer):
 
 
 class AutoExamSessionReadSerializer(serializers.ModelSerializer):
-    """Read-only representation of a scheduled auto recording session."""
+    """Read-only representation of a scheduled auto recording session.
+
+    ``has_video`` reports whether this scheduled recording actually produced an
+    uploaded video — i.e. any video exists under the same exam uploaded at or
+    after the scheduled start. The frontend uses it so a completed recording is
+    shown as COMPLETED and never falsely as "Missed" once its window passes.
+    """
 
     exam_name = serializers.CharField(source='exam.name', read_only=True)
     instructor_email = serializers.EmailField(source='instructor.email', read_only=True)
+    has_video = serializers.SerializerMethodField()
 
     class Meta:
         model = AutoExamSession
@@ -302,9 +323,17 @@ class AutoExamSessionReadSerializer(serializers.ModelSerializer):
             'scheduled_start',
             'scheduled_end',
             'is_auto',
+            'has_video',
             'created_at',
         ]
         read_only_fields = fields
+
+    def get_has_video(self, obj):
+        """True when a video for this exam was uploaded at/after the scheduled start."""
+        return Video.objects.filter(
+            session__exam_id=obj.exam_id,
+            uploaded_at__gte=obj.scheduled_start,
+        ).exists()
 
 
 class AutoExamSessionCreateSerializer(serializers.ModelSerializer):
@@ -449,9 +478,16 @@ class StudentSerializer(serializers.ModelSerializer):
 
 
 class ExamReadSerializer(serializers.ModelSerializer):
-    """Read-only representation of an exam, including the instructor's email."""
+    """Read-only representation of an exam, including schedule and supervisors.
+
+    ``supervisor_ids`` / ``supervisors`` are the instructors with an ACCEPTED
+    per-exam invite (the calendar's assigned supervisors), resolved live so the
+    list always reflects the current assignment.
+    """
 
     instructor_email = serializers.EmailField(source='instructor.email', read_only=True)
+    supervisor_ids = serializers.SerializerMethodField()
+    supervisors = serializers.SerializerMethodField()
 
     class Meta:
         model = Exam
@@ -461,10 +497,41 @@ class ExamReadSerializer(serializers.ModelSerializer):
             'description',
             'instructor',
             'instructor_email',
+            'course',
+            'scheduled_date',
+            'start_time',
+            'end_time',
+            'hall',
+            'color',
+            'recording_mode',
+            'supervisor_ids',
+            'supervisors',
             'created_at',
             'updated_at',
         ]
         read_only_fields = fields
+
+    def _accepted_invites(self, obj):
+        return (
+            WorkspaceInvite.objects
+            .filter(exam=obj, status=WorkspaceInvite.Status.ACCEPTED)
+            .select_related('instructor')
+        )
+
+    def get_supervisor_ids(self, obj):
+        return [str(inv.instructor_id) for inv in self._accepted_invites(obj)]
+
+    def get_supervisors(self, obj):
+        rows = []
+        for inv in self._accepted_invites(obj):
+            instructor = inv.instructor
+            display_name = (instructor.get_full_name() or '').strip() or instructor.username
+            rows.append({
+                'id': str(instructor.id),
+                'email': instructor.email,
+                'display_name': display_name,
+            })
+        return rows
 
 
 class ExamCreateSerializer(serializers.ModelSerializer):

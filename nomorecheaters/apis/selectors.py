@@ -112,6 +112,29 @@ def can_supervise_exam(user, exam):
     return user.id in assigned_supervisor_ids(exam)
 
 
+def calendar_exams(user):
+    """Exams that should appear on *user*'s calendar.
+
+    * **ADMIN** — every exam.
+    * **DEAN** — exams the dean owns plus exams owned by anyone who shares one of
+      the dean's workspaces (so a dean sees the schedule across their members).
+    * **INSTRUCTOR** — exams they own plus every exam they are an accepted
+      supervisor of (an accepted per-exam :class:`WorkspaceInvite`). This is what
+      makes a dean's assignment show up on the instructor's calendar.
+    """
+    queryset = Exam.objects.select_related('instructor')
+    if is_admin(user):
+        return queryset
+    if is_dean(user):
+        return queryset.filter(instructor_id__in=workspace_related_user_ids(user))
+    invited_exam_ids = (
+        WorkspaceInvite.objects
+        .filter(instructor=user, status=WorkspaceInvite.Status.ACCEPTED, exam__isnull=False)
+        .values_list('exam_id', flat=True)
+    )
+    return queryset.filter(Q(instructor=user) | Q(id__in=invited_exam_ids)).distinct()
+
+
 def actionable_exams(user):
     """Exams a user can act on: owned + accepted-invite (every exam for dean/admin)."""
     queryset = Exam.objects.select_related('instructor')
