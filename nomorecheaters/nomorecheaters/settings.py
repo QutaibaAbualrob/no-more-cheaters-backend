@@ -288,9 +288,24 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
-STATIC_URL = 'static/'
-MEDIA_URL = 'media/'
+# Leading slashes are required so FileField.url / build_absolute_uri emit
+# root-relative paths ('/media/...') instead of paths resolved against the
+# current request (e.g. '/api/videos/media/...'), and so they line up with the
+# reverse-proxy `location /media/` and `location /static/` blocks in production
+# (see deploy/nginx.conf — C3).
+STATIC_URL = '/static/'
+# Absolute filesystem dir that `collectstatic` writes to and Nginx serves from.
+# Unused in DEBUG (Django serves app/admin static itself) but required in prod.
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
+# Hard cap on the size of an uploaded video, enforced in VideoUploadSerializer
+# (N2). Mirrors `client_max_body_size 1024m` in deploy/nginx.conf so the proxy
+# and the application reject the same threshold — Nginx rejects oversized
+# bodies before they reach Gunicorn, this catches anything that bypasses it
+# (e.g. the dev server, or a misconfigured proxy).
+MAX_UPLOAD_SIZE_BYTES = 1024 * 1024 * 1024  # 1 GiB
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field

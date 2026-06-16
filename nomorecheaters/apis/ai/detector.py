@@ -336,6 +336,7 @@ def analyze_video(
     *,
     sample_every_n: int = config.SAMPLE_EVERY_N_FRAMES,
     object_confidence: float = config.OBJECT_CONFIDENCE,
+    pose_confidence: float = config.POSE_CONFIDENCE,
     annotate: bool = True,
     output_path: str | None = None,
     object_detector: ObjectDetector | None = None,
@@ -350,7 +351,11 @@ def analyze_video(
     sample_every_n:
         Frame-sampling stride (defaults to the configured rate).
     object_confidence:
-        Minimum confidence for object detections.
+        Minimum confidence for object (phone/laptop) detections.
+    pose_confidence:
+        Minimum keypoint confidence before a head-pose is trusted for the
+        looking-away heuristic. Together with *object_confidence* this is how the
+        caller's AIThresholds sensitivity reaches the detectors.
     annotate:
         When ``True`` (default) an annotated MP4 is written next to the source
         (or to *output_path*) and its path is returned in the result.
@@ -367,7 +372,7 @@ def analyze_video(
     started = time.perf_counter()
 
     object_detector = object_detector or ObjectDetector(confidence=object_confidence)
-    pose_analyzer = pose_analyzer or PoseAnalyzer()
+    pose_analyzer = pose_analyzer or PoseAnalyzer(keypoint_confidence=pose_confidence)
 
     meta = read_metadata(video_path)
     detections, frames_analyzed = _collect_frame_detections(
@@ -397,7 +402,16 @@ def analyze_video(
         'frames_analyzed': frames_analyzed,
         'raw_detections': len(detections),
         'sample_every_n': sample_every_n,
+        'object_confidence': object_confidence,
+        'pose_confidence': pose_confidence,
         'processing_time_seconds': processing_time,
+        # Provenance: the model weights actually used this run, read from the
+        # (possibly injected) detector instances rather than assumed from config
+        # so the recorded version is always the one that ran (H3).
+        'model': {
+            'object': object_detector.model_path,
+            'pose': pose_analyzer.model_path,
+        },
         'video': {
             'fps': meta.fps,
             'total_frames': meta.total_frames,

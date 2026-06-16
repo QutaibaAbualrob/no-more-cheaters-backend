@@ -18,6 +18,7 @@ import hashlib
 from datetime import timedelta
 from pathlib import Path
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from dj_rest_auth.registration.serializers import RegisterSerializer
@@ -540,6 +541,7 @@ class VideoReadSerializer(serializers.ModelSerializer):
     """
 
     file_url = serializers.SerializerMethodField()
+    annotated_video_url = serializers.SerializerMethodField()
     analysis = serializers.SerializerMethodField()
     exam_name = serializers.CharField(source='session.exam.name', read_only=True)
     student_identifier = serializers.CharField(source='session.student_identifier', read_only=True)
@@ -555,6 +557,7 @@ class VideoReadSerializer(serializers.ModelSerializer):
             'student_identifier',
             'session_status',
             'file_url',
+            'annotated_video_url',
             'analysis',
             'original_filename',
             'content_type',
@@ -580,6 +583,21 @@ class VideoReadSerializer(serializers.ModelSerializer):
         if request is None:
             return obj.file.url
         return request.build_absolute_uri(obj.file.url)
+
+    def get_annotated_video_url(self, obj):
+        """Absolute URL to the annotated analysis video, or ``None``.
+
+        The pipeline writes a full-length copy of the video with detection
+        boxes/labels drawn on flagged frames and stores its ``/media/...`` URL
+        on the session's :class:`AnalysisJob` metadata (H8). Returns ``None``
+        until analysis has produced one.
+        """
+        job = getattr(obj.session, 'analysis_job', None)
+        url = (job.metadata or {}).get('annotated_video_url') if job else None
+        if not url:
+            return None
+        request = self.context.get('request')
+        return request.build_absolute_uri(url) if request is not None else url
 
     def get_analysis(self, obj):
         """Include the session report when analysis has completed."""
@@ -630,23 +648,72 @@ class VideoUploadSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('You can only upload videos for your own exam sessions.')
         return session
 
+    # Recognised video container extensions (allowlist).
+    ALLOWED_VIDEO_EXTENSIONS = {'.mp4', '.mov', '.m4v', '.webm', '.avi', '.mkv'}
+    # Top-level ISO Base Media / QuickTime atom types that legitimately begin
+    # an mp4/mov/m4v file (the type sits at byte offset 4). Modern files start
+    # with 'ftyp'; legacy/streamed QuickTime may lead with another atom.
+    _ISO_BMFF_ATOMS = {b'ftyp', b'moov', b'mdat', b'free', b'skip', b'wide', b'pnot'}
+
     def validate_file(self, file):
-        """Reject files that are not a recognised video format.
+        """Reject anything that is not a plausible video within the size limit.
 
-        Checks both the ``Content-Type`` header and the file extension.
-        Allowed formats: mp4, mov, m4v, webm, avi, mkv.
+        Three allowlist gates (N2/N6) — a positive match is required to pass,
+        rather than the previous "reject a few known-bad shapes" approach:
+
+        1. **Size** — empty files and anything larger than
+           ``settings.MAX_UPLOAD_SIZE_BYTES`` are rejected (mirrors the Nginx
+           ``client_max_body_size``).
+        2. **Extension** — must be one of :attr:`ALLOWED_VIDEO_EXTENSIONS`.
+        3. **Content sniff** — the file header must match a known container
+           signature. The ``Content-Type`` header is advisory and trivially
+           spoofed, so it is no longer trusted: previously a non-video renamed
+           to ``clip.mp4`` with no ``Content-Type`` sailed through to OpenCV.
         """
-        content_type = getattr(file, 'content_type', '') or ''
+        max_size = getattr(settings, 'MAX_UPLOAD_SIZE_BYTES', 1024 * 1024 * 1024)
+        size = getattr(file, 'size', 0) or 0
+        if size <= 0:
+            raise serializers.ValidationError('The uploaded file is empty.')
+        if size > max_size:
+            raise serializers.ValidationError(
+                f'Video exceeds the maximum upload size of {max_size // (1024 * 1024)} MB.'
+            )
+
         extension = Path(getattr(file, 'name', '')).suffix.lower()
-        allowed_extensions = {'.mp4', '.mov', '.m4v', '.webm', '.avi', '.mkv'}
-
-        if content_type and not content_type.startswith('video/') and content_type != 'application/octet-stream':
-            raise serializers.ValidationError('Upload a valid video file.')
-
-        if extension not in allowed_extensions:
+        if extension not in self.ALLOWED_VIDEO_EXTENSIONS:
             raise serializers.ValidationError('Supported video formats: mp4, mov, m4v, webm, avi, mkv.')
 
+        if not self._looks_like_video(file):
+            raise serializers.ValidationError('Upload a valid video file.')
+
         return file
+
+    @classmethod
+    def _looks_like_video(cls, file):
+        """Return True if the file header matches a known video container.
+
+        Reads the first 16 bytes and seeks back to 0 so the stream stays intact
+        for hashing/persistence. Recognises ISO-BMFF / QuickTime (mp4, mov,
+        m4v), Matroska / WebM (EBML magic), and RIFF/AVI.
+        """
+        try:
+            file.seek(0)
+            header = file.read(16)
+        finally:
+            file.seek(0)
+
+        if len(header) < 12:
+            return False
+        # ISO Base Media / QuickTime: atom type at bytes 4..8.
+        if header[4:8] in cls._ISO_BMFF_ATOMS:
+            return True
+        # Matroska / WebM: EBML magic number.
+        if header[:4] == b'\x1a\x45\xdf\xa3':
+            return True
+        # RIFF AVI: 'RIFF' .... 'AVI '.
+        if header[:4] == b'RIFF' and header[8:12] == b'AVI ':
+            return True
+        return False
 
     def create(self, validated_data):
         """Compute the file hash, reject a per-session duplicate, then persist.
@@ -856,7 +923,10 @@ class AnalysisJobCreateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = AnalysisJob
-        fields = ['session', 'ai_model_version', 'frame_sample_rate']
+        # ai_model_version is not a client input — the pipeline stamps it with
+        # the model that actually ran (H3). frame_sample_rate is client-tunable
+        # and wired into the pipeline (H2).
+        fields = ['session', 'frame_sample_rate']
 
     def validate_session(self, session):
         """Ensure the requesting user owns this session's exam."""

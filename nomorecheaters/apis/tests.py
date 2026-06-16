@@ -126,6 +126,17 @@ def request_for(user):
     return SimpleNamespace(user=user)
 
 
+def fake_video_bytes(unique=b''):
+    """Bytes that pass VideoUploadSerializer's container sniff (N2).
+
+    Begins with a minimal ISO-BMFF ``ftyp`` header so the content-sniff in
+    :meth:`VideoUploadSerializer._looks_like_video` accepts the fixture as a
+    real video. Append ``unique`` bytes to vary the SHA-256 hash between
+    uploads (dedup tests).
+    """
+    return b'\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00' + unique
+
+
 class UserModelTests(TestCase):
     """Verify the custom User model uses UUID primary keys."""
 
@@ -204,7 +215,7 @@ class AlertModelTests(TestCase):
         alert = Alert.objects.create(
             session=make_session(),
             timestamp_sec=30,
-            behavior_type=Alert.BehaviorType.MULTIPLE_FACES,
+            behavior_type=Alert.BehaviorType.LOOKING_AWAY,
             confidence_score=0.75,
         )
 
@@ -316,7 +327,7 @@ class VideoUploadSerializerTests(TestCase):
     def test_video_upload_serializer_populates_file_metadata(self):
         instructor = make_user()
         session = make_session(exam=make_exam(instructor=instructor))
-        content = b'fake video content'
+        content = fake_video_bytes(b'metadata content')
         upload = SimpleUploadedFile('exam.mp4', content, content_type='video/mp4')
         serializer = VideoUploadSerializer(
             data={'session': str(session.id), 'file': upload, 'duration_seconds': 42},
@@ -344,11 +355,78 @@ class VideoUploadSerializerTests(TestCase):
         self.assertFalse(serializer.is_valid())
         self.assertIn('file', serializer.errors)
 
+    def test_rejects_non_video_disguised_as_mp4(self):
+        """N2: a non-video renamed to .mp4 with no Content-Type must not pass.
+
+        The old check trusted the (absent) Content-Type and the extension, so
+        arbitrary bytes in a ``*.mp4`` would reach OpenCV/ffmpeg.
+        """
+        instructor = make_user()
+        session = make_session(exam=make_exam(instructor=instructor))
+        upload = SimpleUploadedFile(
+            'malware.mp4', b'MZ\x90\x00 not a real video at all', content_type=None,
+        )
+        serializer = VideoUploadSerializer(
+            data={'session': str(session.id), 'file': upload},
+            context={'request': request_for(instructor)},
+        )
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('file', serializer.errors)
+
+    def test_rejects_empty_file(self):
+        instructor = make_user()
+        session = make_session(exam=make_exam(instructor=instructor))
+        upload = SimpleUploadedFile('empty.mp4', b'', content_type='video/mp4')
+        serializer = VideoUploadSerializer(
+            data={'session': str(session.id), 'file': upload},
+            context={'request': request_for(instructor)},
+        )
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('empty', str(serializer.errors['file']).lower())
+
+    def test_rejects_video_exceeding_max_upload_size(self):
+        instructor = make_user()
+        session = make_session(exam=make_exam(instructor=instructor))
+        upload = SimpleUploadedFile(
+            'big.mp4', fake_video_bytes(b'x' * 200), content_type='video/mp4',
+        )
+        with override_settings(MAX_UPLOAD_SIZE_BYTES=16):
+            serializer = VideoUploadSerializer(
+                data={'session': str(session.id), 'file': upload},
+                context={'request': request_for(instructor)},
+            )
+            self.assertFalse(serializer.is_valid())
+        self.assertIn('maximum upload size', str(serializer.errors['file']).lower())
+
+    def test_accepts_webm_and_avi_container_signatures(self):
+        instructor = make_user()
+        exam = make_exam(instructor=instructor)
+
+        webm = SimpleUploadedFile(
+            'clip.webm', b'\x1a\x45\xdf\xa3' + b'\x00' * 12, content_type='video/webm',
+        )
+        ser_webm = VideoUploadSerializer(
+            data={'session': str(make_session(exam=exam, student_identifier='w').id), 'file': webm},
+            context={'request': request_for(instructor)},
+        )
+        self.assertTrue(ser_webm.is_valid(), ser_webm.errors)
+
+        avi = SimpleUploadedFile(
+            'clip.avi', b'RIFF\x00\x00\x00\x00AVI \x00\x00\x00\x00', content_type='video/x-msvideo',
+        )
+        ser_avi = VideoUploadSerializer(
+            data={'session': str(make_session(exam=exam, student_identifier='a').id), 'file': avi},
+            context={'request': request_for(instructor)},
+        )
+        self.assertTrue(ser_avi.is_valid(), ser_avi.errors)
+
     def test_instructor_cannot_upload_video_for_another_instructors_session(self):
         owner = make_user(email='owner@example.com', username='owner')
         other = make_user(email='other@example.com', username='other')
         session = make_session(exam=make_exam(instructor=owner))
-        upload = SimpleUploadedFile('exam.mp4', b'fake video', content_type='video/mp4')
+        upload = SimpleUploadedFile('exam.mp4', fake_video_bytes(b'owner'), content_type='video/mp4')
         serializer = VideoUploadSerializer(
             data={'session': str(session.id), 'file': upload},
             context={'request': request_for(other)},
@@ -360,7 +438,7 @@ class VideoUploadSerializerTests(TestCase):
     def test_negative_duration_is_rejected(self):
         instructor = make_user()
         session = make_session(exam=make_exam(instructor=instructor))
-        upload = SimpleUploadedFile('exam.mp4', b'fake video', content_type='video/mp4')
+        upload = SimpleUploadedFile('exam.mp4', fake_video_bytes(b'negdur'), content_type='video/mp4')
         serializer = VideoUploadSerializer(
             data={'session': str(session.id), 'file': upload, 'duration_seconds': -1},
             context={'request': request_for(instructor)},
@@ -368,6 +446,54 @@ class VideoUploadSerializerTests(TestCase):
 
         self.assertFalse(serializer.is_valid())
         self.assertIn('duration_seconds', serializer.errors)
+
+
+class VideoReadSerializerAnnotatedVideoTests(TestCase):
+    """H8: VideoReadSerializer exposes the annotated analysis video URL."""
+
+    def _video(self, session):
+        return Video.objects.create(
+            session=session,
+            file='exam-videos/test/test.mp4',
+            original_filename='test.mp4',
+            file_hash='a' * 64,
+        )
+
+    def test_annotated_video_url_from_job_metadata(self):
+        from apis.serializers import VideoReadSerializer
+
+        session = make_session()
+        video = self._video(session)
+        AnalysisJob.objects.create(
+            session=session,
+            metadata={'annotated_video_url': '/media/exam-videos/test/test.annotated.mp4'},
+        )
+
+        # No request in context → the raw stored URL is returned verbatim.
+        data = VideoReadSerializer(video, context={}).data
+        self.assertEqual(
+            data['annotated_video_url'],
+            '/media/exam-videos/test/test.annotated.mp4',
+        )
+
+    def test_annotated_video_url_none_without_metadata_key(self):
+        from apis.serializers import VideoReadSerializer
+
+        session = make_session()
+        video = self._video(session)
+        AnalysisJob.objects.create(session=session, metadata={})
+
+        data = VideoReadSerializer(video, context={}).data
+        self.assertIsNone(data['annotated_video_url'])
+
+    def test_annotated_video_url_none_without_job(self):
+        from apis.serializers import VideoReadSerializer
+
+        session = make_session()
+        video = self._video(session)
+
+        data = VideoReadSerializer(video, context={}).data
+        self.assertIsNone(data['annotated_video_url'])
 
 
 class AlertSerializerTests(TestCase):
@@ -378,7 +504,7 @@ class AlertSerializerTests(TestCase):
         alert = Alert.objects.create(
             session=make_session(),
             timestamp_sec=20,
-            behavior_type=Alert.BehaviorType.OTHER_PERSON,
+            behavior_type=Alert.BehaviorType.PHONE_DETECTED,
             confidence_score=0.8,
         )
         serializer = AlertReviewSerializer(
@@ -399,7 +525,7 @@ class AlertSerializerTests(TestCase):
         alert = Alert.objects.create(
             session=make_session(),
             timestamp_sec=20,
-            behavior_type=Alert.BehaviorType.OTHER_PERSON,
+            behavior_type=Alert.BehaviorType.PHONE_DETECTED,
             confidence_score=0.8,
         )
         alert.mark_reviewed(reviewer)
@@ -572,7 +698,7 @@ class VideoWorkflowAPITests(APITestCase):
         shutil.rmtree(self.media_root, ignore_errors=True)
 
     def test_upload_without_session_creates_default_domain_records(self):
-        upload = SimpleUploadedFile('student-one.mp4', b'video bytes', content_type='video/mp4')
+        upload = SimpleUploadedFile('student-one.mp4', fake_video_bytes(b'student-one'), content_type='video/mp4')
 
         response = self.client.post(reverse('videos_upload'), {'file': upload}, format='multipart')
 
@@ -585,7 +711,7 @@ class VideoWorkflowAPITests(APITestCase):
 
     def test_analyze_video_creates_job_alert_report_and_updates_history(self):
         session = make_session(exam=make_exam(instructor=self.user))
-        upload = SimpleUploadedFile('exam.mp4', b'unique workflow bytes', content_type='video/mp4')
+        upload = SimpleUploadedFile('exam.mp4', fake_video_bytes(b'workflow'), content_type='video/mp4')
         serializer = VideoUploadSerializer(
             data={'session': str(session.id), 'file': upload},
             context={'request': request_for(self.user)},
@@ -606,6 +732,34 @@ class VideoWorkflowAPITests(APITestCase):
         history_response = self.client.get(reverse('videos_history'))
         self.assertEqual(history_response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(history_response.data), 1)
+
+    def test_user_threshold_sensitivity_reaches_pipeline(self):
+        """The saved AIThresholds sensitivity is fed to analyze_video (C1 bridge).
+
+        Both detector confidence floors must reflect the exam owner's effective
+        gaze_threshold rather than the static pipeline defaults.
+        """
+        from apis.services import update_user_thresholds
+
+        update_user_thresholds(self.user, {'gaze_threshold': 0.3})
+
+        session = make_session(exam=make_exam(instructor=self.user))
+        upload = SimpleUploadedFile('exam-threshold.mp4', fake_video_bytes(b'threshold'), content_type='video/mp4')
+        serializer = VideoUploadSerializer(
+            data={'session': str(session.id), 'file': upload},
+            context={'request': request_for(self.user)},
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        video = serializer.save()
+
+        with mock.patch('apis.ai.analyze_video', return_value=fake_analysis_result()) as mocked:
+            response = self.client.post(reverse('videos_analyze', kwargs={'pk': video.id}), {}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(mocked.call_count, 1)
+        _args, kwargs = mocked.call_args
+        self.assertAlmostEqual(kwargs['object_confidence'], 0.3)
+        self.assertAlmostEqual(kwargs['pose_confidence'], 0.3)
 
     def test_dashboard_stats_include_owned_workflow_counts(self):
         session = make_session(exam=make_exam(instructor=self.user))
@@ -717,7 +871,7 @@ class DuplicateVideoHashTests(TestCase):
         exam = make_exam(instructor=instructor)
         session1 = make_session(exam=exam, student_identifier='s1')
         session2 = make_session(exam=exam, student_identifier='s2')
-        content = b'identical video bytes'
+        content = fake_video_bytes(b'identical')
 
         upload1 = SimpleUploadedFile('exam1.mp4', content, content_type='video/mp4')
         ser1 = VideoUploadSerializer(
@@ -826,6 +980,137 @@ class UserRoleTests(TestCase):
             user.full_clean()
 
 
+class ReportProbabilityTests(TestCase):
+    """C6 + N1: the overall cheating-probability formula.
+
+    Uses lightweight stand-ins (only ``behavior_type`` + ``confidence_score`` are
+    read) so the maths is tested in isolation from the ORM.
+    """
+
+    @staticmethod
+    def _alert(behavior_type, confidence):
+        return SimpleNamespace(behavior_type=behavior_type, confidence_score=confidence)
+
+    def test_no_alerts_is_zero(self):
+        from apis.services import _report_probability
+
+        self.assertEqual(_report_probability([]), 0.0)
+
+    def test_monotonic_more_evidence_never_lowers_score(self):
+        """C6: adding alerts must not decrease the probability."""
+        from apis.services import _report_probability
+
+        one = [self._alert(Alert.BehaviorType.LOOKING_AWAY, 0.5)]
+        many = one + [
+            self._alert(Alert.BehaviorType.LOOKING_AWAY, 0.5),
+            self._alert(Alert.BehaviorType.LOOKING_AWAY, 0.5),
+        ]
+        self.assertGreaterEqual(_report_probability(many), _report_probability(one))
+
+    def test_phone_alone_does_not_drop_when_glances_added(self):
+        """C6 regression: 1 phone + several glances >= 1 phone alone."""
+        from apis.services import _report_probability
+
+        phone = [self._alert(Alert.BehaviorType.PHONE_DETECTED, 1.0)]
+        phone_plus = phone + [
+            self._alert(Alert.BehaviorType.LOOKING_AWAY, 0.5) for _ in range(5)
+        ]
+        self.assertGreaterEqual(_report_probability(phone_plus), _report_probability(phone))
+
+    def test_behavior_type_aware_phone_outweighs_looking_away(self):
+        """N1: a saturated head-turn must score well below a phone."""
+        from apis.services import _report_probability
+
+        looking = [self._alert(Alert.BehaviorType.LOOKING_AWAY, 1.0)]
+        phone = [self._alert(Alert.BehaviorType.PHONE_DETECTED, 1.0)]
+        self.assertLess(_report_probability(looking), _report_probability(phone))
+        # A single sustained head-turn alone must never read as near-certain cheating.
+        self.assertLessEqual(_report_probability(looking), 0.5)
+
+    def test_capped_below_one(self):
+        from apis.services import _report_probability
+
+        certain = [self._alert(Alert.BehaviorType.PHONE_DETECTED, 1.0)]
+        self.assertLessEqual(_report_probability(certain), 0.99)
+
+    def test_scoring_uses_raw_confidence_not_severity_bucket(self):
+        """H1: two alerts in the *same* severity bucket but with different raw
+        confidences must score differently.
+
+        ``_severity_for`` collapses confidence into 3 buckets (LOW/MEDIUM/HIGH).
+        The old formula keyed scoring on that bucket, so 0.51 and 0.79 (both
+        MEDIUM) were indistinguishable. Scoring now reads ``confidence_score``
+        directly, so the raw precision must survive into the report.
+        """
+        from apis.services import _report_probability, _severity_for
+
+        low_mid = self._alert(Alert.BehaviorType.LOOKING_AWAY, 0.51)
+        high_mid = self._alert(Alert.BehaviorType.LOOKING_AWAY, 0.79)
+        # Both land in the same severity bucket...
+        self.assertEqual(_severity_for(0.51), _severity_for(0.79))
+        self.assertEqual(_severity_for(0.51), Alert.Severity.MEDIUM)
+        # ...yet the report distinguishes them by raw confidence.
+        self.assertNotEqual(
+            _report_probability([low_mid]), _report_probability([high_mid]),
+        )
+        self.assertLess(_report_probability([low_mid]), _report_probability([high_mid]))
+
+
+class ClearSessionEvidenceTests(TestCase):
+    """C5: re-analysis wipes a session's prior clip/snapshot files on disk."""
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
+
+    def _seed_evidence(self, session_id):
+        root = Path(self.media_root)
+        files = []
+        for subdir in ('clips', 'snapshots'):
+            target = root / subdir / str(session_id)
+            target.mkdir(parents=True, exist_ok=True)
+            artifact = target / 'old-alert.bin'
+            artifact.write_bytes(b'stale')
+            files.append(artifact)
+        return files
+
+    def test_removes_prior_session_evidence(self):
+        from apis.services import clear_session_evidence
+
+        session = make_session()
+        files = self._seed_evidence(session.id)
+        self.assertTrue(all(f.exists() for f in files))
+
+        clear_session_evidence(session)
+
+        for subdir in ('clips', 'snapshots'):
+            self.assertFalse((Path(self.media_root) / subdir / str(session.id)).exists())
+
+    def test_leaves_other_sessions_untouched(self):
+        from apis.services import clear_session_evidence
+
+        target = make_session()
+        other = make_session()
+        self._seed_evidence(target.id)
+        other_files = self._seed_evidence(other.id)
+
+        clear_session_evidence(target)
+
+        self.assertTrue(all(f.exists() for f in other_files))
+
+    def test_missing_directories_is_a_noop(self):
+        from apis.services import clear_session_evidence
+
+        session = make_session()
+        # No evidence ever written — must not raise.
+        clear_session_evidence(session)
+
+
 class ReportModelTests(TestCase):
     """Issue 2 / FR11: Report model validation."""
 
@@ -895,7 +1180,8 @@ class AsyncQueueWiringTests(APITestCase):
         self.settings_override.disable()
         shutil.rmtree(self.media_root, ignore_errors=True)
 
-    def _make_video(self, content=b'queue-wiring bytes'):
+    def _make_video(self, content=None):
+        content = content if content is not None else fake_video_bytes(b'queue-wiring')
         session = make_session(exam=make_exam(instructor=self.user))
         upload = SimpleUploadedFile('queue.mp4', content, content_type='video/mp4')
         serializer = VideoUploadSerializer(
@@ -969,6 +1255,178 @@ class AsyncQueueWiringTests(APITestCase):
             ExamSession.objects.get(id=video.session.id).status,
             ExamSession.Status.FAILED,
         )
+
+    def test_failure_is_audited_and_notified(self):
+        """H5/H12: a failed analysis writes an audit entry and notifies the owner."""
+        from apis.models import Notification
+
+        video = self._make_video()
+        job = AnalysisJob.objects.create(session=video.session, status=AnalysisJob.Status.QUEUED)
+
+        with mock.patch('apis.tasks.build_ai_report', side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                run_analysis(str(job.id), actor_id=str(self.user.id))
+
+        # An ANALYSIS_FAILED audit entry exists, attributed to the triggering user.
+        audit = AuditLog.objects.filter(action=AuditLog.ActionType.ANALYSIS_FAILED)
+        self.assertTrue(audit.exists())
+        self.assertEqual(audit.first().user_id, self.user.id)
+
+        # The exam's instructor (self.user) gets an in-app failure notification.
+        notif = Notification.objects.filter(
+            recipient=self.user,
+            notif_type=Notification.NotifType.ANALYSIS_FAILED,
+        )
+        self.assertTrue(notif.exists())
+        self.assertEqual(notif.first().metadata.get('session_id'), str(video.session.id))
+
+    def test_notification_failure_does_not_mask_original_error(self):
+        """H5/H12: a broken notification path must not swallow the analysis error."""
+        video = self._make_video()
+        job = AnalysisJob.objects.create(session=video.session, status=AnalysisJob.Status.QUEUED)
+
+        with mock.patch('apis.tasks.build_ai_report', side_effect=RuntimeError('boom')):
+            with mock.patch('apis.tasks.create_notification', side_effect=ValueError('notify down')):
+                # The ORIGINAL RuntimeError must still surface, not the ValueError.
+                with self.assertRaises(RuntimeError):
+                    run_analysis(str(job.id), actor_id=str(self.user.id))
+
+        # And the FAILED state is still persisted despite the notification error.
+        job.refresh_from_db()
+        self.assertEqual(job.status, AnalysisJob.Status.FAILED)
+
+    def test_run_analysis_skips_already_completed_job(self):
+        """C7: re-invoking run_analysis on a COMPLETED job is a no-op."""
+        video = self._make_video()
+        job = AnalysisJob.objects.create(session=video.session, status=AnalysisJob.Status.QUEUED)
+
+        with mock.patch('apis.ai.analyze_video', return_value=fake_analysis_result()):
+            report_id = run_analysis(str(job.id))
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, AnalysisJob.Status.COMPLETED)
+
+        # A duplicate enqueue / second worker must NOT re-run the pipeline; the
+        # existing report id is returned unchanged.
+        with mock.patch('apis.tasks.build_ai_report') as mocked_build:
+            skipped = run_analysis(str(job.id))
+
+        mocked_build.assert_not_called()
+        self.assertEqual(skipped, report_id)
+
+    def test_run_analysis_skips_job_already_processing(self):
+        """C7: a job another worker is already PROCESSING is not picked up again."""
+        video = self._make_video()
+        job = AnalysisJob.objects.create(session=video.session, status=AnalysisJob.Status.PROCESSING)
+
+        with mock.patch('apis.tasks.build_ai_report') as mocked_build:
+            result = run_analysis(str(job.id))
+
+        mocked_build.assert_not_called()
+        self.assertIsNone(result)
+        job.refresh_from_db()
+        self.assertEqual(job.status, AnalysisJob.Status.PROCESSING)
+
+
+class DeadJobFieldsWiringTests(APITestCase):
+    """H2/H3/M9: the previously-dead AnalysisJob fields are now real.
+
+    * ``frame_sample_rate`` is honoured by the pipeline (H2) and defaults to the
+      pipeline's truthful rate instead of a misleading 1 (M9).
+    * ``ai_model_version`` is provenance the pipeline stamps with the model that
+      actually ran, not an ignored client input (H3).
+    """
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+        self.user = make_user(username='wire', email='wire@example.com')
+        self.client.force_authenticate(self.user)
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
+
+    def _make_video(self):
+        session = make_session(exam=make_exam(instructor=self.user))
+        upload = SimpleUploadedFile('wire.mp4', fake_video_bytes(b'wire'), content_type='video/mp4')
+        serializer = VideoUploadSerializer(
+            data={'session': str(session.id), 'file': upload},
+            context={'request': request_for(self.user)},
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        return serializer.save()
+
+    @staticmethod
+    def _result_with_model():
+        result = fake_analysis_result()
+        result.metadata = dict(result.metadata)
+        result.metadata['model'] = {'object': 'yolo11x.pt', 'pose': 'yolo11x-pose.pt'}
+        return result
+
+    def test_enqueue_defaults_sample_rate_to_pipeline_default_not_one(self):
+        """M9: a job created without an explicit rate uses the truthful default (15)."""
+        video = self._make_video()
+        expected = AnalysisJob._meta.get_field('frame_sample_rate').default
+        self.assertEqual(expected, 15)
+
+        with mock.patch('apis.ai.analyze_video', return_value=self._result_with_model()):
+            self.client.post(reverse('videos_analyze', kwargs={'pk': video.id}), {}, format='json')
+
+        job = AnalysisJob.objects.get(session=video.session)
+        self.assertEqual(job.frame_sample_rate, expected)
+
+    def test_client_sample_rate_is_honoured_and_wired_to_pipeline(self):
+        """H2: a client-supplied rate is stored AND passed to analyze_video."""
+        video = self._make_video()
+
+        with mock.patch('apis.ai.analyze_video', return_value=self._result_with_model()) as mocked:
+            self.client.post(
+                reverse('videos_analyze', kwargs={'pk': video.id}),
+                {'frame_sample_rate': 5}, format='json',
+            )
+
+        job = AnalysisJob.objects.get(session=video.session)
+        self.assertEqual(job.frame_sample_rate, 5)
+        self.assertEqual(mocked.call_args.kwargs.get('sample_every_n'), 5)
+
+    def test_invalid_sample_rate_falls_back_to_default(self):
+        """A non-numeric or sub-1 rate must not break enqueue; it uses the default."""
+        video = self._make_video()
+        default = AnalysisJob._meta.get_field('frame_sample_rate').default
+
+        with mock.patch('apis.ai.analyze_video', return_value=self._result_with_model()):
+            self.client.post(
+                reverse('videos_analyze', kwargs={'pk': video.id}),
+                {'frame_sample_rate': 'not-a-number'}, format='json',
+            )
+
+        job = AnalysisJob.objects.get(session=video.session)
+        self.assertEqual(job.frame_sample_rate, default)
+
+    def test_pipeline_stamps_ai_model_version_as_provenance(self):
+        """H3: ai_model_version is filled from the model that actually ran."""
+        video = self._make_video()
+
+        with mock.patch('apis.ai.analyze_video', return_value=self._result_with_model()):
+            self.client.post(reverse('videos_analyze', kwargs={'pk': video.id}), {}, format='json')
+
+        job = AnalysisJob.objects.get(session=video.session)
+        self.assertEqual(job.ai_model_version, 'yolo11x.pt')
+
+    def test_ai_model_version_is_not_a_client_input(self):
+        """H3: a client cannot dictate ai_model_version; provenance wins."""
+        video = self._make_video()
+
+        with mock.patch('apis.ai.analyze_video', return_value=self._result_with_model()):
+            self.client.post(
+                reverse('videos_analyze', kwargs={'pk': video.id}),
+                {'ai_model_version': 'totally-fake-model'}, format='json',
+            )
+
+        job = AnalysisJob.objects.get(session=video.session)
+        self.assertEqual(job.ai_model_version, 'yolo11x.pt')
 
 
 class PreanalyzeDemosCommandTests(TestCase):

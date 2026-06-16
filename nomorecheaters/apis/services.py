@@ -30,9 +30,17 @@ THRESHOLD_DEFAULTS = {
     'multiple_faces_threshold': 0.8,
 }
 THRESHOLD_DESCRIPTIONS = {
-    'gaze_threshold': 'Confidence threshold for looking-away detections.',
-    'noise_threshold': 'Confidence threshold for suspicious-audio detections.',
-    'multiple_faces_threshold': 'Confidence threshold for multiple-face detections.',
+    'gaze_threshold': (
+        'Detection sensitivity (0-1): the minimum confidence floor applied to '
+        'both the object (phone/laptop) and looking-away detectors. Lower = more '
+        'sensitive (flags borderline cases).'
+    ),
+    # Reserved: audio analysis is not implemented yet, so this value is accepted
+    # and stored but does not affect analysis. See N3 in critical_problems.md.
+    'noise_threshold': 'Reserved for future suspicious-audio detection (not yet active).',
+    # Reserved: there is no multiple-face detector yet, so this value is accepted
+    # and stored but does not affect analysis. See N3/C2 in critical_problems.md.
+    'multiple_faces_threshold': 'Reserved for future multiple-face detection (not yet active).',
 }
 
 
@@ -210,6 +218,26 @@ def delete_exam_media(exam):
             shutil.rmtree(media_root / subdir / str(session.id), ignore_errors=True)
 
 
+def clear_session_evidence(session):
+    """Delete a session's on-disk evidence (clip + snapshot) directories.
+
+    Evidence files are named by alert UUID, so a re-analysis writes a fresh set
+    under new names and never overwrites the old ones — left alone, every re-run
+    accumulates orphaned snapshots/<session>/ and clips/<session>/ artifacts on
+    disk even though their Alert rows were deleted (C5). Called before the new
+    evidence is written, so wiping the whole per-session directory is safe.
+    Best-effort: any IO error is logged and skipped so a locked/missing file
+    never blocks the analysis.
+    """
+    media_root = Path(settings.MEDIA_ROOT)
+    for subdir in ('clips', 'snapshots'):
+        target = media_root / subdir / str(session.id)
+        try:
+            shutil.rmtree(target, ignore_errors=True)
+        except Exception:  # noqa: BLE001 — best-effort file cleanup
+            logger.exception('Failed to clear %s for session %s', subdir, session.id)
+
+
 def notify_users(users, notif_type, title, body, metadata=None):
     """In-app notification + best-effort email for each user in *users*."""
     for user in users:
@@ -339,6 +367,29 @@ def build_thresholds_response(user):
     }
 
 
+def effective_detection_confidence(user):
+    """Resolve the active detection-confidence floor (0-1) for *user*.
+
+    This is the bridge that makes the AIThresholds page real: it returns the
+    effective ``gaze_threshold`` (the global default, overridden by the user's
+    saved preference) so :func:`build_ai_report` can feed it to the AI pipeline
+    as the minimum-confidence floor for *both* the object and looking-away
+    detectors. Lower value → more sensitive.
+
+    The ``noise_threshold`` and ``multiple_faces_threshold`` knobs are
+    intentionally NOT consumed here: their features (audio analysis, multi-face
+    detection) do not exist yet, so feeding them to the pipeline would be
+    meaningless. They remain stored/returned as reserved settings.
+    """
+    effective = build_thresholds_response(user)['effective']
+    try:
+        value = float(effective.get('gaze_threshold', THRESHOLD_DEFAULTS['gaze_threshold']))
+    except (TypeError, ValueError):
+        value = THRESHOLD_DEFAULTS['gaze_threshold']
+    # Clamp into the detector's valid range; 0 would disable filtering entirely.
+    return min(1.0, max(0.0, value))
+
+
 def update_user_thresholds(user, payload):
     """Persist per-user threshold overrides."""
     cleaned = validate_thresholds(payload)
@@ -464,12 +515,24 @@ def enqueue_analysis(request, video):
     from .tasks import run_analysis
 
     session = video.session
+    # Frame-sampling stride: honour a client-supplied value, else fall back to
+    # the model's (now truthful) default rather than a misleading 1 (H2/M9).
+    # ai_model_version is no longer a client input — it is provenance the
+    # pipeline stamps with the model it actually ran (H3), so it starts blank.
+    default_rate = AnalysisJob._meta.get_field('frame_sample_rate').default
+    try:
+        sample_rate = int(request.data.get('frame_sample_rate', default_rate))
+    except (TypeError, ValueError):
+        sample_rate = default_rate
+    if sample_rate < 1:
+        sample_rate = default_rate
+
     job, _created = AnalysisJob.objects.update_or_create(
         session=session,
         defaults={
             'status': AnalysisJob.Status.QUEUED,
-            'ai_model_version': request.data.get('ai_model_version', 'yolo11x'),
-            'frame_sample_rate': request.data.get('frame_sample_rate', 1),
+            'ai_model_version': '',
+            'frame_sample_rate': sample_rate,
             'started_at': None,
             'completed_at': None,
             'error_message': '',
@@ -538,9 +601,6 @@ def build_demo_report(session):
 _BEHAVIOR_RISK_WEIGHTS = {
     Alert.BehaviorType.PHONE_DETECTED: 1.0,
     Alert.BehaviorType.LAPTOPS: 0.9,
-    Alert.BehaviorType.MULTIPLE_FACES: 0.8,
-    Alert.BehaviorType.OTHER_PERSON: 0.8,
-    Alert.BehaviorType.OBJECT_DETECTED: 0.6,
     Alert.BehaviorType.LOOKING_AWAY: 0.4,
 }
 
@@ -554,35 +614,34 @@ def _severity_for(confidence):
     return Alert.Severity.LOW
 
 
-# Severity → risk weight for the overall report probability (a simple average
-# of these, capped at 1.0).
-_SEVERITY_WEIGHTS = {
-    Alert.Severity.HIGH: 1.0,
-    Alert.Severity.MEDIUM: 0.6,
-    Alert.Severity.LOW: 0.3,
-}
-
-
 def _report_probability(alerts):
-    """Overall cheating probability: mean severity weight, capped at 1.0."""
-    if not alerts:
-        return 0.0
-    weights = [_SEVERITY_WEIGHTS.get(alert.severity, 0.3) for alert in alerts]
-    return round(min(1.0, sum(weights) / len(weights)), 2)
+    """Overall cheating probability from independent weighted evidence.
 
+    Each alert is treated as one independent piece of evidence contributing its
+    behaviour-weighted confidence (``confidence_score · behaviour_weight``); the
+    report score is the probability that *at least one* is a genuine violation:
 
-def _cheating_probability(events):
-    """Combine event confidences into an overall 0–1 cheating probability.
+        ``1 - ∏(1 - confidence·weight)``
 
-    Treats each event as an independent piece of (weighted) evidence and
-    returns the probability that *at least one* is genuine:
-    ``1 - ∏(1 - confidence·weight)``. More/stronger detections push the score
-    up while a single soft cue keeps it modest. Capped at 0.99.
+    This fixes two defects in the old severity-mean formula:
+
+    * **Monotonic (C6):** adding or strengthening evidence can only push the
+      score up, never down. The old arithmetic mean diluted a serious alert as
+      soon as minor ones were added (1 phone = 1.00, but 1 phone + 5 glances =
+      0.42).
+    * **Behaviour-aware (N1):** a phone (weight 1.0) genuinely outweighs a turned
+      head (weight 0.4), and the raw ``confidence_score`` is used directly rather
+      than a 3-bucket severity label. The old formula keyed on severity only, so
+      a sustained head-turn that saturated to HIGH scored an identical 1.00 to a
+      phone — fabricating cheating against honest students.
+
+    Capped at 0.99 (independent evidence never proves certainty).
     """
     surviving_risk = 1.0
-    for event in events:
-        weight = _BEHAVIOR_RISK_WEIGHTS.get(event.behavior_type, 0.5)
-        surviving_risk *= 1.0 - min(1.0, max(0.0, event.confidence) * weight)
+    for alert in alerts:
+        weight = _BEHAVIOR_RISK_WEIGHTS.get(alert.behavior_type, 0.5)
+        confidence = min(1.0, max(0.0, alert.confidence_score or 0.0))
+        surviving_risk *= 1.0 - confidence * weight
     return round(min(0.99, 1.0 - surviving_risk), 2)
 
 
@@ -685,7 +744,6 @@ def _attach_alert_evidence(video, session, alerts):
     Alert.objects.bulk_update(alerts, ['snapshot_url', 'clip_url', 'metadata'])
 
 
-@transaction.atomic
 def build_ai_report(session, job=None):
     """Run the real YOLO/OpenCV pipeline for *session* and persist findings.
 
@@ -699,6 +757,12 @@ def build_ai_report(session, job=None):
     Re-running replaces any prior alerts for the session so the report always
     reflects the latest analysis. Heavy dependencies (OpenCV, ultralytics) are
     imported lazily here so the service module stays cheap to import.
+
+    Transaction boundaries (C4): the multi-minute ``analyze_video`` pass and the
+    per-alert evidence I/O (face tracking, JPEG/MP4 writes, ffmpeg) run OUTSIDE
+    any database transaction. Only the quick row writes are wrapped in short
+    ``atomic`` blocks, so a DB connection and row locks are never held while the
+    CPU/GPU/ffmpeg work runs.
     """
     from .ai import analyze_video
 
@@ -706,10 +770,25 @@ def build_ai_report(session, job=None):
     if video is None or not video.file:
         raise ValueError('Session has no video file to analyze.')
 
-    result = analyze_video(video.file.path)
+    # Bridge the AIThresholds sensitivity into the pipeline: the exam owner's
+    # effective gaze_threshold becomes the minimum-confidence floor for both
+    # detectors, so the slider actually controls detection (fixes C1).
+    instructor = getattr(session.exam, 'instructor', None)
+    confidence_floor = (
+        effective_detection_confidence(instructor)
+        if instructor is not None
+        else THRESHOLD_DEFAULTS['gaze_threshold']
+    )
+    # Wire the job's frame-sampling stride into the pipeline (H2). Without a job
+    # (e.g. a direct service call) analyze_video uses its own configured default.
+    analyze_kwargs = {
+        'object_confidence': confidence_floor,
+        'pose_confidence': confidence_floor,
+    }
+    if job is not None and job.frame_sample_rate:
+        analyze_kwargs['sample_every_n'] = job.frame_sample_rate
+    result = analyze_video(video.file.path, **analyze_kwargs)
 
-    # Replace prior detections so a re-analysis is not double-counted.
-    session.alerts.all().delete()
     alerts = [
         Alert(
             session=session,
@@ -727,9 +806,23 @@ def build_ai_report(session, job=None):
         )
         for event in result.events
     ]
-    Alert.objects.bulk_create(alerts)
+    # Persist the alert rows in a short transaction. Replacing prior detections
+    # (so a re-analysis is not double-counted) and creating the new ones is the
+    # only DB work here; the analyze_video pass above ran with no transaction
+    # open, and the evidence I/O below runs with none open either (C4).
+    with transaction.atomic():
+        session.alerts.all().delete()
+        Alert.objects.bulk_create(alerts)
 
-    # Enrich each alert with a face crop, a 3-second clip, and a person id.
+    # The deleted alerts' evidence files (named by old alert UUID) would survive
+    # the row delete above; wipe the per-session clip/snapshot dirs before the
+    # new evidence is written so re-runs don't accumulate orphans on disk (C5).
+    # File I/O, so it runs outside any transaction (C4).
+    clear_session_evidence(session)
+
+    # Enrich each alert with a face crop, a 3-second clip, and a person id. This
+    # is filesystem/ffmpeg I/O (minutes for long videos) and deliberately runs
+    # OUTSIDE a transaction; it commits its own per-alert bulk_update at the end.
     _attach_alert_evidence(video, session, alerts)
 
     # Aggregate from the persisted alerts (now enriched with person ids), so the
@@ -752,26 +845,36 @@ def build_ai_report(session, job=None):
     else:
         summary = 'No suspicious activity detected in this session.'
 
-    report, _created = Report.objects.update_or_create(
-        session=session,
-        defaults={
-            'overall_cheating_probability': probability,
-            'total_alerts': total_alerts,
-            'alerts_by_type': alerts_by_type,
-            'processing_time_seconds': processing_time,
-            'summary': summary,
-        },
-    )
+    # Persist the aggregate report (and the job's analysis metadata) in a short
+    # transaction — again, no I/O is held open here (C4).
+    with transaction.atomic():
+        report, _created = Report.objects.update_or_create(
+            session=session,
+            defaults={
+                'overall_cheating_probability': probability,
+                'total_alerts': total_alerts,
+                'alerts_by_type': alerts_by_type,
+                'processing_time_seconds': processing_time,
+                'summary': summary,
+            },
+        )
 
-    if job is not None:
-        job_metadata = dict(job.metadata or {})
-        job_metadata.update({
-            'analysis': result.metadata,
-            'annotated_video_path': result.annotated_video_path,
-            'annotated_video_url': _media_url_for(result.annotated_video_path),
-        })
-        job.metadata = job_metadata
-        job.save(update_fields=['metadata'])
+        if job is not None:
+            job_metadata = dict(job.metadata or {})
+            job_metadata.update({
+                'analysis': result.metadata,
+                'annotated_video_path': result.annotated_video_path,
+                'annotated_video_url': _media_url_for(result.annotated_video_path),
+            })
+            job.metadata = job_metadata
+            # Stamp the model that actually ran (H3): provenance, not a client
+            # input. The object-detection weights identify the run.
+            object_model = ((result.metadata or {}).get('model') or {}).get('object')
+            update_fields = ['metadata']
+            if object_model:
+                job.ai_model_version = str(object_model)[:100]
+                update_fields.append('ai_model_version')
+            job.save(update_fields=update_fields)
 
     return report
 
