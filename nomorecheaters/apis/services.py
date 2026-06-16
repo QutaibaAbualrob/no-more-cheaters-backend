@@ -1041,7 +1041,20 @@ def _media_url_for(filesystem_path):
         rel = Path(filesystem_path).resolve().relative_to(Path(settings.MEDIA_ROOT).resolve())
     except (ValueError, OSError):
         return None
-    return '/' + settings.MEDIA_URL.strip('/') + '/' + str(rel).replace('\\', '/')
+
+    rel_url = str(rel).replace('\\', '/')
+    media_url = settings.MEDIA_URL or '/media/'
+
+    # A CDN/absolute base (has a scheme) is used verbatim. A path-style
+    # MEDIA_URL is normalised to exactly one leading and trailing slash —
+    # falling back to 'media' when it is empty or just '/'. The old code did
+    # '/' + MEDIA_URL.strip('/') + '/...', which collapsed to '//snapshots/...'
+    # for an empty MEDIA_URL: a protocol-relative URL a browser reads as a host
+    # and blocks as mixed content on an HTTPS page (M5).
+    if '://' in media_url:
+        return media_url.rstrip('/') + '/' + rel_url
+    prefix = media_url.strip('/') or 'media'
+    return '/' + prefix + '/' + rel_url
 
 
 def dashboard_stats_for(user):

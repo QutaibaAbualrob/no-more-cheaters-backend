@@ -1167,6 +1167,65 @@ class UploadRewindHardeningTests(TestCase):
         self.assertFalse(Video.objects.filter(session=session).exists())
 
 
+class MediaUrlForTests(TestCase):
+    """M5: _media_url_for must never emit a protocol-relative '//...' URL."""
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
+
+    def _path(self):
+        return str(Path(self.media_root) / 'clips' / 'sess' / 'x.mp4')
+
+    def test_standard_media_url(self):
+        from apis.services import _media_url_for
+
+        with override_settings(MEDIA_URL='/media/'):
+            self.assertEqual(_media_url_for(self._path()), '/media/clips/sess/x.mp4')
+
+    def test_empty_media_url_is_not_protocol_relative(self):
+        from apis.services import _media_url_for
+
+        with override_settings(MEDIA_URL=''):
+            url = _media_url_for(self._path())
+
+        self.assertFalse(url.startswith('//'))
+        self.assertEqual(url, '/media/clips/sess/x.mp4')
+
+    def test_bare_slash_media_url_is_not_protocol_relative(self):
+        from apis.services import _media_url_for
+
+        with override_settings(MEDIA_URL='/'):
+            url = _media_url_for(self._path())
+
+        self.assertFalse(url.startswith('//'))
+        self.assertEqual(url, '/media/clips/sess/x.mp4')
+
+    def test_absolute_cdn_media_url_is_used_verbatim(self):
+        from apis.services import _media_url_for
+
+        with override_settings(MEDIA_URL='https://cdn.example.com/media/'):
+            self.assertEqual(
+                _media_url_for(self._path()),
+                'https://cdn.example.com/media/clips/sess/x.mp4')
+
+    def test_path_outside_media_root_returns_none(self):
+        from apis.services import _media_url_for
+
+        outside = str(Path(self.media_root).parent / 'outside.mp4')
+        self.assertIsNone(_media_url_for(outside))
+
+    def test_empty_path_returns_none(self):
+        from apis.services import _media_url_for
+
+        self.assertIsNone(_media_url_for(''))
+
+
 class DuplicateVideoHashTests(TestCase):
     """Issue 7 / FR4: duplicate video uploads must be rejected cleanly."""
 
