@@ -515,12 +515,24 @@ def enqueue_analysis(request, video):
     from .tasks import run_analysis
 
     session = video.session
+    # Frame-sampling stride: honour a client-supplied value, else fall back to
+    # the model's (now truthful) default rather than a misleading 1 (H2/M9).
+    # ai_model_version is no longer a client input — it is provenance the
+    # pipeline stamps with the model it actually ran (H3), so it starts blank.
+    default_rate = AnalysisJob._meta.get_field('frame_sample_rate').default
+    try:
+        sample_rate = int(request.data.get('frame_sample_rate', default_rate))
+    except (TypeError, ValueError):
+        sample_rate = default_rate
+    if sample_rate < 1:
+        sample_rate = default_rate
+
     job, _created = AnalysisJob.objects.update_or_create(
         session=session,
         defaults={
             'status': AnalysisJob.Status.QUEUED,
-            'ai_model_version': request.data.get('ai_model_version', 'yolo11x'),
-            'frame_sample_rate': request.data.get('frame_sample_rate', 1),
+            'ai_model_version': '',
+            'frame_sample_rate': sample_rate,
             'started_at': None,
             'completed_at': None,
             'error_message': '',
@@ -767,11 +779,15 @@ def build_ai_report(session, job=None):
         if instructor is not None
         else THRESHOLD_DEFAULTS['gaze_threshold']
     )
-    result = analyze_video(
-        video.file.path,
-        object_confidence=confidence_floor,
-        pose_confidence=confidence_floor,
-    )
+    # Wire the job's frame-sampling stride into the pipeline (H2). Without a job
+    # (e.g. a direct service call) analyze_video uses its own configured default.
+    analyze_kwargs = {
+        'object_confidence': confidence_floor,
+        'pose_confidence': confidence_floor,
+    }
+    if job is not None and job.frame_sample_rate:
+        analyze_kwargs['sample_every_n'] = job.frame_sample_rate
+    result = analyze_video(video.file.path, **analyze_kwargs)
 
     alerts = [
         Alert(
@@ -851,7 +867,14 @@ def build_ai_report(session, job=None):
                 'annotated_video_url': _media_url_for(result.annotated_video_path),
             })
             job.metadata = job_metadata
-            job.save(update_fields=['metadata'])
+            # Stamp the model that actually ran (H3): provenance, not a client
+            # input. The object-detection weights identify the run.
+            object_model = ((result.metadata or {}).get('model') or {}).get('object')
+            update_fields = ['metadata']
+            if object_model:
+                job.ai_model_version = str(object_model)[:100]
+                update_fields.append('ai_model_version')
+            job.save(update_fields=update_fields)
 
     return report
 

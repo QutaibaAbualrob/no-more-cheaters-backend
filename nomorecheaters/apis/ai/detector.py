@@ -405,6 +405,13 @@ def analyze_video(
         'object_confidence': object_confidence,
         'pose_confidence': pose_confidence,
         'processing_time_seconds': processing_time,
+        # Provenance: the model weights actually used this run, read from the
+        # (possibly injected) detector instances rather than assumed from config
+        # so the recorded version is always the one that ran (H3).
+        'model': {
+            'object': object_detector.model_path,
+            'pose': pose_analyzer.model_path,
+        },
         'video': {
             'fps': meta.fps,
             'total_frames': meta.total_frames,

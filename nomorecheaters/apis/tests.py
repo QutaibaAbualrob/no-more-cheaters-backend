@@ -1328,6 +1328,107 @@ class AsyncQueueWiringTests(APITestCase):
         self.assertEqual(job.status, AnalysisJob.Status.PROCESSING)
 
 
+class DeadJobFieldsWiringTests(APITestCase):
+    """H2/H3/M9: the previously-dead AnalysisJob fields are now real.
+
+    * ``frame_sample_rate`` is honoured by the pipeline (H2) and defaults to the
+      pipeline's truthful rate instead of a misleading 1 (M9).
+    * ``ai_model_version`` is provenance the pipeline stamps with the model that
+      actually ran, not an ignored client input (H3).
+    """
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+        self.user = make_user(username='wire', email='wire@example.com')
+        self.client.force_authenticate(self.user)
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
+
+    def _make_video(self):
+        session = make_session(exam=make_exam(instructor=self.user))
+        upload = SimpleUploadedFile('wire.mp4', fake_video_bytes(b'wire'), content_type='video/mp4')
+        serializer = VideoUploadSerializer(
+            data={'session': str(session.id), 'file': upload},
+            context={'request': request_for(self.user)},
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        return serializer.save()
+
+    @staticmethod
+    def _result_with_model():
+        result = fake_analysis_result()
+        result.metadata = dict(result.metadata)
+        result.metadata['model'] = {'object': 'yolo11x.pt', 'pose': 'yolo11x-pose.pt'}
+        return result
+
+    def test_enqueue_defaults_sample_rate_to_pipeline_default_not_one(self):
+        """M9: a job created without an explicit rate uses the truthful default (15)."""
+        video = self._make_video()
+        expected = AnalysisJob._meta.get_field('frame_sample_rate').default
+        self.assertEqual(expected, 15)
+
+        with mock.patch('apis.ai.analyze_video', return_value=self._result_with_model()):
+            self.client.post(reverse('videos_analyze', kwargs={'pk': video.id}), {}, format='json')
+
+        job = AnalysisJob.objects.get(session=video.session)
+        self.assertEqual(job.frame_sample_rate, expected)
+
+    def test_client_sample_rate_is_honoured_and_wired_to_pipeline(self):
+        """H2: a client-supplied rate is stored AND passed to analyze_video."""
+        video = self._make_video()
+
+        with mock.patch('apis.ai.analyze_video', return_value=self._result_with_model()) as mocked:
+            self.client.post(
+                reverse('videos_analyze', kwargs={'pk': video.id}),
+                {'frame_sample_rate': 5}, format='json',
+            )
+
+        job = AnalysisJob.objects.get(session=video.session)
+        self.assertEqual(job.frame_sample_rate, 5)
+        self.assertEqual(mocked.call_args.kwargs.get('sample_every_n'), 5)
+
+    def test_invalid_sample_rate_falls_back_to_default(self):
+        """A non-numeric or sub-1 rate must not break enqueue; it uses the default."""
+        video = self._make_video()
+        default = AnalysisJob._meta.get_field('frame_sample_rate').default
+
+        with mock.patch('apis.ai.analyze_video', return_value=self._result_with_model()):
+            self.client.post(
+                reverse('videos_analyze', kwargs={'pk': video.id}),
+                {'frame_sample_rate': 'not-a-number'}, format='json',
+            )
+
+        job = AnalysisJob.objects.get(session=video.session)
+        self.assertEqual(job.frame_sample_rate, default)
+
+    def test_pipeline_stamps_ai_model_version_as_provenance(self):
+        """H3: ai_model_version is filled from the model that actually ran."""
+        video = self._make_video()
+
+        with mock.patch('apis.ai.analyze_video', return_value=self._result_with_model()):
+            self.client.post(reverse('videos_analyze', kwargs={'pk': video.id}), {}, format='json')
+
+        job = AnalysisJob.objects.get(session=video.session)
+        self.assertEqual(job.ai_model_version, 'yolo11x.pt')
+
+    def test_ai_model_version_is_not_a_client_input(self):
+        """H3: a client cannot dictate ai_model_version; provenance wins."""
+        video = self._make_video()
+
+        with mock.patch('apis.ai.analyze_video', return_value=self._result_with_model()):
+            self.client.post(
+                reverse('videos_analyze', kwargs={'pk': video.id}),
+                {'ai_model_version': 'totally-fake-model'}, format='json',
+            )
+
+        job = AnalysisJob.objects.get(session=video.session)
+        self.assertEqual(job.ai_model_version, 'yolo11x.pt')
+
+
 class PreanalyzeDemosCommandTests(TestCase):
     """Task 1.5: the ``preanalyze_demos`` management command.
 

@@ -923,7 +923,10 @@ class AnalysisJobCreateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = AnalysisJob
-        fields = ['session', 'ai_model_version', 'frame_sample_rate']
+        # ai_model_version is not a client input — the pipeline stamps it with
+        # the model that actually ran (H3). frame_sample_rate is client-tunable
+        # and wired into the pipeline (H2).
+        fields = ['session', 'frame_sample_rate']
 
     def validate_session(self, session):
         """Ensure the requesting user owns this session's exam."""

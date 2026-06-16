@@ -463,9 +463,15 @@ class AnalysisJob(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     session = models.OneToOneField(ExamSession, on_delete=models.CASCADE, related_name='analysis_job')
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.QUEUED)
+    # Stamped by the analysis pipeline with the model weights that actually ran
+    # (provenance); blank until the job completes (H3).
     ai_model_version = models.CharField(max_length=100, blank=True)
+    # Frame-sampling stride wired into analyze_video (H2). Default mirrors the
+    # pipeline's own default (apis.ai.config.SAMPLE_EVERY_N_FRAMES = 15); the old
+    # default of 1 was misleading — it read as "every frame" but the pipeline
+    # always sampled every 15th regardless (M9).
     frame_sample_rate = models.PositiveIntegerField(
-        default=1, help_text='Analyze every Nth frame.',
+        default=15, help_text='Analyze every Nth frame (1 = every frame).',
     )
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
