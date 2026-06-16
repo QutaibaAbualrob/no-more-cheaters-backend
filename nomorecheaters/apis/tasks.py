@@ -81,7 +81,7 @@ def run_analysis(job_id, actor_id=None):
     try:
         report = build_ai_report(session, job=job)
     except Exception as exc:  # noqa: BLE001 — record failure then re-raise
-        _mark_failed(job, session, str(exc))
+        _mark_failed(job, session, str(exc), actor=actor)
         raise
 
     # Flip job + session to COMPLETED in a short transaction.
@@ -109,11 +109,18 @@ def run_analysis(job_id, actor_id=None):
     return str(report.id)
 
 
-def _mark_failed(job, session, error_message):
-    """Flip a job and its session to FAILED, persisting the error message.
+def _mark_failed(job, session, error_message, actor=None):
+    """Flip a job and its session to FAILED, persist the error, and surface it.
 
     Runs outside the rolled-back analysis transaction so the failure state is
-    durably recorded even though the partial work was discarded.
+    durably recorded even though the partial work was discarded. Beyond the
+    status flip it now records an ANALYSIS_FAILED audit entry and notifies the
+    exam's instructor (H5/H12) — previously a failed analysis was completely
+    silent: the job sat in FAILED with no audit trail and no one was told.
+
+    The audit + notification are best-effort: any error raising from them is
+    swallowed (logged) so it can never mask the original analysis exception the
+    caller is about to re-raise, and so the FAILED state is always persisted.
     """
     job.status = AnalysisJob.Status.FAILED
     job.error_message = error_message
@@ -121,3 +128,28 @@ def _mark_failed(job, session, error_message):
     job.save(update_fields=['status', 'error_message', 'completed_at'])
     session.status = ExamSession.Status.FAILED
     session.save(update_fields=['status', 'updated_at'])
+
+    try:
+        video_id = str(session.video.id) if hasattr(session, 'video') else str(session.id)
+        # A raw exception string can be a multi-line CUDA/ffmpeg traceback; keep
+        # the surfaced copy short (the full text stays on job.error_message).
+        short_error = (error_message or 'Unknown error').strip().splitlines()[0][:200]
+        record_audit_log(
+            AuditLog.ActionType.ANALYSIS_FAILED,
+            user=actor,
+            target_resource=video_id,
+            metadata={'session_id': str(session.id), 'error': short_error},
+        )
+
+        instructor = session.exam.instructor
+        if instructor is not None:
+            create_notification(
+                instructor,
+                Notification.NotifType.ANALYSIS_FAILED,
+                f'Analysis failed for {session.exam.name}',
+                'We could not finish analyzing this session. '
+                'Please try running the analysis again.',
+                metadata={'session_id': str(session.id), 'error': short_error},
+            )
+    except Exception:  # noqa: BLE001 — never let notification mask the real error
+        logger.exception('Failed to record/notify analysis failure for job %s', job.id)

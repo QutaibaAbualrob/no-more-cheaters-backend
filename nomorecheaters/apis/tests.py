@@ -1155,6 +1155,45 @@ class AsyncQueueWiringTests(APITestCase):
             ExamSession.Status.FAILED,
         )
 
+    def test_failure_is_audited_and_notified(self):
+        """H5/H12: a failed analysis writes an audit entry and notifies the owner."""
+        from apis.models import Notification
+
+        video = self._make_video()
+        job = AnalysisJob.objects.create(session=video.session, status=AnalysisJob.Status.QUEUED)
+
+        with mock.patch('apis.tasks.build_ai_report', side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                run_analysis(str(job.id), actor_id=str(self.user.id))
+
+        # An ANALYSIS_FAILED audit entry exists, attributed to the triggering user.
+        audit = AuditLog.objects.filter(action=AuditLog.ActionType.ANALYSIS_FAILED)
+        self.assertTrue(audit.exists())
+        self.assertEqual(audit.first().user_id, self.user.id)
+
+        # The exam's instructor (self.user) gets an in-app failure notification.
+        notif = Notification.objects.filter(
+            recipient=self.user,
+            notif_type=Notification.NotifType.ANALYSIS_FAILED,
+        )
+        self.assertTrue(notif.exists())
+        self.assertEqual(notif.first().metadata.get('session_id'), str(video.session.id))
+
+    def test_notification_failure_does_not_mask_original_error(self):
+        """H5/H12: a broken notification path must not swallow the analysis error."""
+        video = self._make_video()
+        job = AnalysisJob.objects.create(session=video.session, status=AnalysisJob.Status.QUEUED)
+
+        with mock.patch('apis.tasks.build_ai_report', side_effect=RuntimeError('boom')):
+            with mock.patch('apis.tasks.create_notification', side_effect=ValueError('notify down')):
+                # The ORIGINAL RuntimeError must still surface, not the ValueError.
+                with self.assertRaises(RuntimeError):
+                    run_analysis(str(job.id), actor_id=str(self.user.id))
+
+        # And the FAILED state is still persisted despite the notification error.
+        job.refresh_from_db()
+        self.assertEqual(job.status, AnalysisJob.Status.FAILED)
+
     def test_run_analysis_skips_already_completed_job(self):
         """C7: re-invoking run_analysis on a COMPLETED job is a no-op."""
         video = self._make_video()
