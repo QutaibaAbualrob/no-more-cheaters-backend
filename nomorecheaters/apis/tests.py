@@ -607,6 +607,34 @@ class VideoWorkflowAPITests(APITestCase):
         self.assertEqual(history_response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(history_response.data), 1)
 
+    def test_user_threshold_sensitivity_reaches_pipeline(self):
+        """The saved AIThresholds sensitivity is fed to analyze_video (C1 bridge).
+
+        Both detector confidence floors must reflect the exam owner's effective
+        gaze_threshold rather than the static pipeline defaults.
+        """
+        from apis.services import update_user_thresholds
+
+        update_user_thresholds(self.user, {'gaze_threshold': 0.3})
+
+        session = make_session(exam=make_exam(instructor=self.user))
+        upload = SimpleUploadedFile('exam-threshold.mp4', b'threshold wiring bytes', content_type='video/mp4')
+        serializer = VideoUploadSerializer(
+            data={'session': str(session.id), 'file': upload},
+            context={'request': request_for(self.user)},
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        video = serializer.save()
+
+        with mock.patch('apis.ai.analyze_video', return_value=fake_analysis_result()) as mocked:
+            response = self.client.post(reverse('videos_analyze', kwargs={'pk': video.id}), {}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(mocked.call_count, 1)
+        _args, kwargs = mocked.call_args
+        self.assertAlmostEqual(kwargs['object_confidence'], 0.3)
+        self.assertAlmostEqual(kwargs['pose_confidence'], 0.3)
+
     def test_dashboard_stats_include_owned_workflow_counts(self):
         session = make_session(exam=make_exam(instructor=self.user))
         session.status = ExamSession.Status.COMPLETED

@@ -30,9 +30,17 @@ THRESHOLD_DEFAULTS = {
     'multiple_faces_threshold': 0.8,
 }
 THRESHOLD_DESCRIPTIONS = {
-    'gaze_threshold': 'Confidence threshold for looking-away detections.',
-    'noise_threshold': 'Confidence threshold for suspicious-audio detections.',
-    'multiple_faces_threshold': 'Confidence threshold for multiple-face detections.',
+    'gaze_threshold': (
+        'Detection sensitivity (0-1): the minimum confidence floor applied to '
+        'both the object (phone/laptop) and looking-away detectors. Lower = more '
+        'sensitive (flags borderline cases).'
+    ),
+    # Reserved: audio analysis is not implemented yet, so this value is accepted
+    # and stored but does not affect analysis. See N3 in critical_problems.md.
+    'noise_threshold': 'Reserved for future suspicious-audio detection (not yet active).',
+    # Reserved: there is no multiple-face detector yet, so this value is accepted
+    # and stored but does not affect analysis. See N3/C2 in critical_problems.md.
+    'multiple_faces_threshold': 'Reserved for future multiple-face detection (not yet active).',
 }
 
 
@@ -337,6 +345,29 @@ def build_thresholds_response(user):
         'user': user_thresholds,
         'effective': threshold_payload(effective),
     }
+
+
+def effective_detection_confidence(user):
+    """Resolve the active detection-confidence floor (0-1) for *user*.
+
+    This is the bridge that makes the AIThresholds page real: it returns the
+    effective ``gaze_threshold`` (the global default, overridden by the user's
+    saved preference) so :func:`build_ai_report` can feed it to the AI pipeline
+    as the minimum-confidence floor for *both* the object and looking-away
+    detectors. Lower value → more sensitive.
+
+    The ``noise_threshold`` and ``multiple_faces_threshold`` knobs are
+    intentionally NOT consumed here: their features (audio analysis, multi-face
+    detection) do not exist yet, so feeding them to the pipeline would be
+    meaningless. They remain stored/returned as reserved settings.
+    """
+    effective = build_thresholds_response(user)['effective']
+    try:
+        value = float(effective.get('gaze_threshold', THRESHOLD_DEFAULTS['gaze_threshold']))
+    except (TypeError, ValueError):
+        value = THRESHOLD_DEFAULTS['gaze_threshold']
+    # Clamp into the detector's valid range; 0 would disable filtering entirely.
+    return min(1.0, max(0.0, value))
 
 
 def update_user_thresholds(user, payload):
@@ -706,7 +737,20 @@ def build_ai_report(session, job=None):
     if video is None or not video.file:
         raise ValueError('Session has no video file to analyze.')
 
-    result = analyze_video(video.file.path)
+    # Bridge the AIThresholds sensitivity into the pipeline: the exam owner's
+    # effective gaze_threshold becomes the minimum-confidence floor for both
+    # detectors, so the slider actually controls detection (fixes C1).
+    instructor = getattr(session.exam, 'instructor', None)
+    confidence_floor = (
+        effective_detection_confidence(instructor)
+        if instructor is not None
+        else THRESHOLD_DEFAULTS['gaze_threshold']
+    )
+    result = analyze_video(
+        video.file.path,
+        object_confidence=confidence_floor,
+        pose_confidence=confidence_floor,
+    )
 
     # Replace prior detections so a re-analysis is not double-counted.
     session.alerts.all().delete()
