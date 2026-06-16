@@ -854,6 +854,60 @@ class UserRoleTests(TestCase):
             user.full_clean()
 
 
+class ReportProbabilityTests(TestCase):
+    """C6 + N1: the overall cheating-probability formula.
+
+    Uses lightweight stand-ins (only ``behavior_type`` + ``confidence_score`` are
+    read) so the maths is tested in isolation from the ORM.
+    """
+
+    @staticmethod
+    def _alert(behavior_type, confidence):
+        return SimpleNamespace(behavior_type=behavior_type, confidence_score=confidence)
+
+    def test_no_alerts_is_zero(self):
+        from apis.services import _report_probability
+
+        self.assertEqual(_report_probability([]), 0.0)
+
+    def test_monotonic_more_evidence_never_lowers_score(self):
+        """C6: adding alerts must not decrease the probability."""
+        from apis.services import _report_probability
+
+        one = [self._alert(Alert.BehaviorType.LOOKING_AWAY, 0.5)]
+        many = one + [
+            self._alert(Alert.BehaviorType.LOOKING_AWAY, 0.5),
+            self._alert(Alert.BehaviorType.LOOKING_AWAY, 0.5),
+        ]
+        self.assertGreaterEqual(_report_probability(many), _report_probability(one))
+
+    def test_phone_alone_does_not_drop_when_glances_added(self):
+        """C6 regression: 1 phone + several glances >= 1 phone alone."""
+        from apis.services import _report_probability
+
+        phone = [self._alert(Alert.BehaviorType.PHONE_DETECTED, 1.0)]
+        phone_plus = phone + [
+            self._alert(Alert.BehaviorType.LOOKING_AWAY, 0.5) for _ in range(5)
+        ]
+        self.assertGreaterEqual(_report_probability(phone_plus), _report_probability(phone))
+
+    def test_behavior_type_aware_phone_outweighs_looking_away(self):
+        """N1: a saturated head-turn must score well below a phone."""
+        from apis.services import _report_probability
+
+        looking = [self._alert(Alert.BehaviorType.LOOKING_AWAY, 1.0)]
+        phone = [self._alert(Alert.BehaviorType.PHONE_DETECTED, 1.0)]
+        self.assertLess(_report_probability(looking), _report_probability(phone))
+        # A single sustained head-turn alone must never read as near-certain cheating.
+        self.assertLessEqual(_report_probability(looking), 0.5)
+
+    def test_capped_below_one(self):
+        from apis.services import _report_probability
+
+        certain = [self._alert(Alert.BehaviorType.PHONE_DETECTED, 1.0)]
+        self.assertLessEqual(_report_probability(certain), 0.99)
+
+
 class ReportModelTests(TestCase):
     """Issue 2 / FR11: Report model validation."""
 

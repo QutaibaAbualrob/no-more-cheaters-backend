@@ -585,35 +585,34 @@ def _severity_for(confidence):
     return Alert.Severity.LOW
 
 
-# Severity → risk weight for the overall report probability (a simple average
-# of these, capped at 1.0).
-_SEVERITY_WEIGHTS = {
-    Alert.Severity.HIGH: 1.0,
-    Alert.Severity.MEDIUM: 0.6,
-    Alert.Severity.LOW: 0.3,
-}
-
-
 def _report_probability(alerts):
-    """Overall cheating probability: mean severity weight, capped at 1.0."""
-    if not alerts:
-        return 0.0
-    weights = [_SEVERITY_WEIGHTS.get(alert.severity, 0.3) for alert in alerts]
-    return round(min(1.0, sum(weights) / len(weights)), 2)
+    """Overall cheating probability from independent weighted evidence.
 
+    Each alert is treated as one independent piece of evidence contributing its
+    behaviour-weighted confidence (``confidence_score · behaviour_weight``); the
+    report score is the probability that *at least one* is a genuine violation:
 
-def _cheating_probability(events):
-    """Combine event confidences into an overall 0–1 cheating probability.
+        ``1 - ∏(1 - confidence·weight)``
 
-    Treats each event as an independent piece of (weighted) evidence and
-    returns the probability that *at least one* is genuine:
-    ``1 - ∏(1 - confidence·weight)``. More/stronger detections push the score
-    up while a single soft cue keeps it modest. Capped at 0.99.
+    This fixes two defects in the old severity-mean formula:
+
+    * **Monotonic (C6):** adding or strengthening evidence can only push the
+      score up, never down. The old arithmetic mean diluted a serious alert as
+      soon as minor ones were added (1 phone = 1.00, but 1 phone + 5 glances =
+      0.42).
+    * **Behaviour-aware (N1):** a phone (weight 1.0) genuinely outweighs a turned
+      head (weight 0.4), and the raw ``confidence_score`` is used directly rather
+      than a 3-bucket severity label. The old formula keyed on severity only, so
+      a sustained head-turn that saturated to HIGH scored an identical 1.00 to a
+      phone — fabricating cheating against honest students.
+
+    Capped at 0.99 (independent evidence never proves certainty).
     """
     surviving_risk = 1.0
-    for event in events:
-        weight = _BEHAVIOR_RISK_WEIGHTS.get(event.behavior_type, 0.5)
-        surviving_risk *= 1.0 - min(1.0, max(0.0, event.confidence) * weight)
+    for alert in alerts:
+        weight = _BEHAVIOR_RISK_WEIGHTS.get(alert.behavior_type, 0.5)
+        confidence = min(1.0, max(0.0, alert.confidence_score or 0.0))
+        surviving_risk *= 1.0 - confidence * weight
     return round(min(0.99, 1.0 - surviving_risk), 2)
 
 
