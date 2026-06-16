@@ -2188,21 +2188,24 @@ class ConsolidateEventsTrackingTests(APITestCase):
         self.assertFalse(_same_track(a, (400.0, 100.0, 60.0)))
 
     def test_two_degenerate_people_same_frames_stay_two_events(self):
-        """Two students with (0,0,0,0) boxes across two frames → two events."""
+        """Two students with (0,0,0,0) boxes across three frames → two events."""
         from apis.ai.detector import consolidate_events
 
         zero = (0.0, 0.0, 0.0, 0.0)
-        # Person A and person B both flagged at t=0 and t=3 (within the 5s merge
-        # window; 3s span clears the 2s min-duration so the events survive).
+        # Person A and person B both flagged at t=0, 2 and 4 (within the 5s merge
+        # window). Three consecutive sampled frames clear BOTH noise gates — the
+        # 2s min-duration and the LOOKING_AWAY_MIN_CONSECUTIVE=3 consecutive-frame
+        # gate — so the events survive and the H11 separation is what's under test.
         detections = [
             self._det(0.0, zero), self._det(0.0, zero),
-            self._det(3.0, zero), self._det(3.0, zero),
+            self._det(2.0, zero), self._det(2.0, zero),
+            self._det(4.0, zero), self._det(4.0, zero),
         ]
         events = consolidate_events(detections)
         self.assertEqual(len(events), 2)
         for event in events:
-            self.assertEqual(event.frame_count, 2)
-            self.assertAlmostEqual(event.duration_sec, 3.0)
+            self.assertEqual(event.frame_count, 3)
+            self.assertAlmostEqual(event.duration_sec, 4.0)
 
     def test_single_degenerate_person_still_merges_across_frames(self):
         """One person's degenerate-box behaviour sustains into a single event."""
@@ -2220,9 +2223,12 @@ class ConsolidateEventsTrackingTests(APITestCase):
 
         left = (100, 50, 160, 200)
         right = (400, 60, 470, 210)
+        # Three consecutive sampled frames (t=0,2,4) clear the looking-away
+        # consecutive-frame gate; the well-separated boxes keep them two events.
         detections = [
             self._det(0.0, left), self._det(0.0, right),
-            self._det(3.0, left), self._det(3.0, right),
+            self._det(2.0, left), self._det(2.0, right),
+            self._det(4.0, left), self._det(4.0, right),
         ]
         events = consolidate_events(detections)
         self.assertEqual(len(events), 2)
