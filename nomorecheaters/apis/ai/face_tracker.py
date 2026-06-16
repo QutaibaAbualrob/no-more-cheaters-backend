@@ -16,8 +16,9 @@ with visual evidence for the analysis report:
    frontend).
 2. :func:`extract_face_crop` saves the cropped face of the flagged person at an
    alert's timestamp (falls back to a centred crop when no face is tracked).
-3. :func:`extract_clip` saves a short clip centred on an alert's timestamp
-   (1s before, 2s after by default).
+3. :func:`extract_clip` saves a short clip that STARTS at an alert's timestamp
+   (0s before, 3s after by default) so the clip shows the cheating itself, not
+   the lead-up to it.
 
 Everything degrades gracefully: any OpenCV/IO failure returns ``None``/``False``
 rather than raising, so a missing artifact never fails the whole analysis.
@@ -507,9 +508,14 @@ def _reencode_h264(src_path: str, dst_path: str, timeout: float = 120) -> bool:
 
 
 def extract_clip(video_path: str, timestamp_sec: float, out_path: str,
-                 before: float = 1.0, after: float = 2.0,
+                 before: float = 0.0, after: float = 3.0,
                  boxes=None, flagged_person_id=None, behavior_label: str = '') -> bool:
     """Save a clip spanning ``[t-before, t+after]`` to *out_path* (mp4).
+
+    Defaults capture ``[t, t+3s]`` — the clip starts exactly AT the detected
+    cheating moment and shows the 3 seconds of evidence after it, rather than
+    the second before it. The end is naturally clamped to the video duration
+    (the read loop stops when frames run out) and the start is clamped to 0.
 
     When *boxes* (an iterable of ``(person_id, bbox_xyxy)``) is supplied, the
     same overlay drawn on the snapshot is baked onto EVERY clip frame — a green

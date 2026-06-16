@@ -116,9 +116,23 @@ SAMPLE_EVERY_N_FRAMES = max(1, _env_int('AI_SAMPLE_RATE', 15))
 OBJECT_CONFIDENCE = _env_float('AI_OBJECT_CONFIDENCE', 0.40)
 # Minimum person/keypoint confidence required before head-pose is trusted.
 POSE_CONFIDENCE = _env_float('AI_POSE_CONFIDENCE', 0.50)
-# Nose offset from the eye midpoint, as a fraction of inter-eye distance,
-# beyond which the head is considered "turned away".
+# Nose offset from the eye midpoint, as a fraction of inter-eye distance.
+# Retained as a low-level input to the head-yaw estimate below.
 LOOKING_AWAY_RATIO = _env_float('AI_LOOKING_AWAY_RATIO', 0.35)
+
+# --- Head-pose (looking-away) gating -----------------------------------------
+# A person is only flagged LOOKING_AWAY when their head is turned SIDEWAYS by
+# more than this many degrees. Looking *down* (a vertical pitch — normal exam
+# behaviour) is never flagged because the estimate below is horizontal-only.
+LOOKING_AWAY_ANGLE_DEG = _env_float('AI_HEAD_TURN_ANGLE_DEG', 45.0)
+# Approximate nose-protrusion-to-inter-ocular-distance ratio used to convert the
+# 2D horizontal nose offset into a yaw angle: yaw ≈ atan(offset_ratio / this).
+# ~0.55 is a typical adult-face value; it is an approximation from 2D keypoints,
+# not a true 3D pose solve. Lower → the same offset reads as a larger angle.
+NOSE_DEPTH_RATIO = _env_float('AI_NOSE_DEPTH_RATIO', 0.55)
+# A looking-away event must contain at least this many *consecutive* sampled
+# frames before it becomes an alert — a single momentary glance never counts.
+LOOKING_AWAY_MIN_CONSECUTIVE = max(1, _env_int('AI_CONSECUTIVE_DETECTIONS', 3))
 
 # --- Temporal rules layer ----------------------------------------------------
 # Detections of the same class within this sliding window merge into one event.

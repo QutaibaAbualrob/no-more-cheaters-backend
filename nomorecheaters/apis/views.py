@@ -15,8 +15,8 @@ from .models import (
     UserPreferences, Video, Workspace, WorkspaceInvite, WorkspaceMembership,
 )
 from .selectors import (
-    actionable_exams, assigned_supervisor_ids, can_supervise_exam, can_view_report,
-    is_admin, is_dean, owned_sessions, owned_students, owned_videos,
+    actionable_exams, assigned_supervisor_ids, calendar_exams, can_supervise_exam,
+    can_view_report, is_admin, is_dean, owned_sessions, owned_students, owned_videos,
     recent_day_window, users_visible_to, visible_sessions, visible_videos,
 )
 from .serializers import (
@@ -51,6 +51,7 @@ from .services import (
     resolve_calendar_exam,
     respond_to_workspace_invite,
     send_workspace_invite,
+    sync_exam_supervisors,
     system_metrics,
     update_global_thresholds,
     update_user_thresholds,
@@ -1165,6 +1166,87 @@ class ExamListView(APIView):
         return Response(ExamReadSerializer(exams, many=True).data)
 
 
+def _apply_exam_schedule(exam, data):
+    """Set calendar schedule/presentation fields on *exam* from request *data*.
+
+    Only keys present in *data* are touched. Date/time arrive as ISO strings
+    ('YYYY-MM-DD' / 'HH:MM'); a blank value clears the field. Returns the list of
+    changed field names (so the caller can ``save(update_fields=...)``).
+    """
+    from django.utils.dateparse import parse_date, parse_time
+
+    changed = []
+    if 'course' in data:
+        exam.course = (data.get('course') or '')[:255]
+        changed.append('course')
+    if 'hall' in data:
+        exam.hall = (data.get('hall') or '')[:255]
+        changed.append('hall')
+    if data.get('color'):
+        exam.color = str(data['color'])[:20]
+        changed.append('color')
+    if data.get('recording_mode') in dict(Exam.RecordingMode.choices):
+        exam.recording_mode = data['recording_mode']
+        changed.append('recording_mode')
+    if 'date' in data or 'scheduled_date' in data:
+        raw = data.get('date') or data.get('scheduled_date')
+        exam.scheduled_date = parse_date(raw) if raw else None
+        changed.append('scheduled_date')
+    if 'start_time' in data:
+        raw = data.get('start_time')
+        exam.start_time = parse_time(raw) if raw else None
+        changed.append('start_time')
+    if 'end_time' in data:
+        raw = data.get('end_time')
+        exam.end_time = parse_time(raw) if raw else None
+        changed.append('end_time')
+    return changed
+
+
+class CalendarExamsView(APIView):
+    """The shared exam calendar: list visible exams, or schedule a new one.
+
+    * **GET** — every authenticated user gets the exams on their calendar
+      (:func:`calendar_exams`): a dean sees their workspace's exams; an instructor
+      sees their own plus every exam a dean has assigned them to supervise.
+    * **POST** — dean/admin only. Creates a scheduled exam owned by the dean and
+      assigns the given ``supervisor_ids`` immediately (each gets an
+      EXAM_ASSIGNED notification and the exam appears on their calendar at once).
+
+    This replaces the old client-cookie ("mock") calendar so exams are real,
+    shared backend records — visible across users and devices.
+    """
+
+    def get(self, request):
+        exams = calendar_exams(request.user).order_by('scheduled_date', 'start_time', '-created_at')
+        return Response(ExamReadSerializer(exams, many=True).data)
+
+    def post(self, request):
+        if not (is_admin(request.user) or is_dean(request.user)):
+            raise PermissionDenied('Only deans or administrators can schedule exams.')
+
+        name = (request.data.get('name') or '').strip()
+        if not name:
+            raise ValidationError({'name': 'Exam name is required.'})
+
+        exam = Exam(
+            instructor=request.user,
+            name=name,
+            description=request.data.get('description') or '',
+        )
+        _apply_exam_schedule(exam, request.data)
+        exam.save()
+
+        schedule = {
+            'date': request.data.get('date') or request.data.get('scheduled_date'),
+            'start_time': request.data.get('start_time'),
+            'end_time': request.data.get('end_time'),
+            'hall': request.data.get('hall'),
+        }
+        sync_exam_supervisors(request.user, exam, request.data.get('supervisor_ids'), schedule=schedule)
+        return Response(ExamReadSerializer(exam).data, status=status.HTTP_201_CREATED)
+
+
 class ExamDetailView(APIView):
     """Edit/delete an exam, notifying every assigned supervisor.
 
@@ -1190,14 +1272,35 @@ class ExamDetailView(APIView):
         if not can_edit:
             raise PermissionDenied('You do not have permission to edit this exam.')
 
+        changed = ['updated_at']
         name = request.data.get('name')
         if name is not None and str(name).strip():
             exam.name = str(name).strip()
+            changed.append('name')
         if 'description' in request.data:
             exam.description = request.data.get('description') or ''
-        exam.save(update_fields=['name', 'description', 'updated_at'])
+            changed.append('description')
+        # Persist any calendar schedule/presentation fields that were sent.
+        changed.extend(_apply_exam_schedule(exam, request.data))
+        exam.save(update_fields=list(dict.fromkeys(changed)))
 
-        supervisors = exam_supervisor_users(exam, request.data.get('supervisor_ids'))
+        # Re-assign supervisors (dean/admin only): newly-added supervisors get an
+        # EXAM_ASSIGNED notification from sync; everyone else gets EXAM_UPDATED.
+        added = []
+        if 'supervisor_ids' in request.data and (is_admin(request.user) or is_dean(request.user)):
+            schedule = {
+                'date': request.data.get('date') or request.data.get('scheduled_date'),
+                'start_time': request.data.get('start_time'),
+                'end_time': request.data.get('end_time'),
+                'hall': request.data.get('hall'),
+            }
+            added = sync_exam_supervisors(request.user, exam, request.data.get('supervisor_ids'), schedule=schedule)
+
+        added_ids = {u.id for u in added}
+        supervisors = [
+            u for u in exam_supervisor_users(exam, request.data.get('supervisor_ids'))
+            if u.id not in added_ids
+        ]
         new_date = request.data.get('date') or 'the same date'
         start_time = request.data.get('start_time') or request.data.get('time') or 'the same time'
         end_time = request.data.get('end_time') or ''

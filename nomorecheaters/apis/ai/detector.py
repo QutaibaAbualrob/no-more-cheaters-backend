@@ -162,6 +162,30 @@ def _same_track(center_a, center_b, factor: float = 0.75) -> bool:
     return distance <= factor * max(a_size, b_size)
 
 
+def _infer_sample_step(detections: list[FrameDetection]) -> int:
+    """Infer the frame-sampling stride from the smallest positive frame gap.
+
+    Frames are sampled every Nth frame, so adjacent samples differ by N. The
+    smallest positive difference between any two detection frame numbers is that
+    stride; falls back to 1 when it cannot be determined.
+    """
+    frames = sorted({d.frame_number for d in detections})
+    step = min((b - a for a, b in zip(frames, frames[1:])), default=0)
+    return step if step > 0 else 1
+
+
+def _longest_consecutive_run(frame_numbers: list[int], step: int) -> int:
+    """Length of the longest run of consecutive sampled frames (gap == *step*)."""
+    frames = sorted(set(frame_numbers))
+    if not frames:
+        return 0
+    best = run = 1
+    for prev, current in zip(frames, frames[1:]):
+        run = run + 1 if (current - prev) == step else 1
+        best = max(best, run)
+    return best
+
+
 def consolidate_events(
     detections: list[FrameDetection],
     merge_window_sec: float = config.MERGE_WINDOW_SEC,
@@ -174,21 +198,35 @@ def consolidate_events(
     (or two phones in different hands) become two events rather than collapsing
     into one. Within a track, detections whose gap is within *merge_window_sec*
     merge into a single event (max confidence across its frames); a gap larger
-    than the window starts a fresh event for that person. Events shorter than
-    *min_duration_sec* are dropped as noise. Returns events sorted by start time.
+    than the window starts a fresh event for that person.
+
+    Surviving events must clear two noise gates:
+
+    * **Duration** — soft pose cues (looking away) must last at least
+      *min_duration_sec*. Direct object evidence (phone/laptop) is always kept,
+      even a single sighting, since a momentary glimpse is a genuine violation.
+    * **Consecutive frames** — a ``LOOKING_AWAY`` event must additionally span at
+      least :data:`config.LOOKING_AWAY_MIN_CONSECUTIVE` *consecutive* sampled
+      frames, so a single momentary glance (or scattered jitter) never alerts.
+
+    Returns events sorted by start time.
     """
-    events: list[AlertEvent] = []
+    sample_step = _infer_sample_step(detections)
 
     by_type: dict[str, list[FrameDetection]] = {}
     for det in detections:
         by_type.setdefault(det.behavior_type, []).append(det)
 
+    # (event, [frame_numbers]) pairs, so the consecutive-frame gate can inspect
+    # exactly which sampled frames backed each consolidated event.
+    built: list[tuple[AlertEvent, list[int]]] = []
+
     for behavior_type, items in by_type.items():
         items.sort(key=lambda d: d.timestamp_sec)
-        # Each open track: {'event', 'last_ts', 'center'}. A detection extends an
-        # existing track only when it is within the merge window AND spatially on
-        # the same person; otherwise it opens a new event (new person or a
-        # resumed behaviour after a long gap).
+        # Each open track: {'event', 'frames', 'last_ts', 'center'}. A detection
+        # extends an existing track only when it is within the merge window AND
+        # spatially on the same person; otherwise it opens a new event (new
+        # person or a resumed behaviour after a long gap).
         tracks: list[dict] = []
         for det in items:
             center = _bbox_center(det.bbox)
@@ -222,25 +260,34 @@ def consolidate_events(
                     end_sec=det.timestamp_sec,
                     frame_count=1,
                 )
-                events.append(event)
-                tracks.append({'event': event, 'last_ts': det.timestamp_sec, 'center': center})
+                frames = [det.frame_number]
+                built.append((event, frames))
+                tracks.append({
+                    'event': event, 'frames': frames,
+                    'last_ts': det.timestamp_sec, 'center': center,
+                })
             else:
                 event = match['event']
                 event.end_sec = det.timestamp_sec
                 event.confidence = max(event.confidence, det.confidence)
                 event.frame_count += 1
+                match['frames'].append(det.frame_number)
                 match['last_ts'] = det.timestamp_sec
                 if center is not None:
                     match['center'] = center  # follow slow movement across frames
 
-    # Drop too-brief events as noise — but ONLY for soft pose cues. Direct
-    # object evidence (a phone/laptop in frame) is always kept, even a single
-    # sighting, since a momentary glimpse is still a genuine violation.
-    survivors = [
-        e for e in events
-        if e.behavior_type in config.DIRECT_EVIDENCE_BEHAVIORS
-        or e.duration_sec >= min_duration_sec
-    ]
+    survivors: list[AlertEvent] = []
+    for event, frames in built:
+        if event.behavior_type in config.DIRECT_EVIDENCE_BEHAVIORS:
+            survivors.append(event)  # objects bypass both noise gates
+            continue
+        if event.duration_sec < min_duration_sec:
+            continue
+        if event.behavior_type == config.LOOKING_AWAY:
+            if _longest_consecutive_run(frames, sample_step) < config.LOOKING_AWAY_MIN_CONSECUTIVE:
+                continue
+        survivors.append(event)
+
     survivors.sort(key=lambda e: e.start_sec)
     return survivors
 

@@ -1,18 +1,24 @@
 """Head-pose estimation with YOLO11x-pose.
 
 Loads the pretrained ``yolo11x-pose.pt`` model, extracts body keypoints for
-each detected person, and uses a simple geometric heuristic to decide whether a
-person is looking away from the screen: the horizontal offset of the nose from
-the midpoint between the eyes, normalised by the inter-eye distance. A large
-offset means the head is turned.
+each detected person, and estimates how far the head is turned **sideways**
+(yaw) from the screen. The horizontal offset of the nose from the midpoint
+between the eyes (normalised by the inter-eye distance) is converted into an
+approximate yaw angle; a person is flagged ``LOOKING_AWAY`` only when that angle
+exceeds :data:`config.LOOKING_AWAY_ANGLE_DEG` (45° by default).
+
+Because the estimate is purely horizontal, looking *down* (a vertical pitch —
+normal exam behaviour while writing) never triggers a flag. The angle is an
+approximation derived from 2D keypoints, not a true 3D pose solve.
 
 This is intentionally heuristic, not a trained gaze model. Momentary turns are
-expected; the temporal-rules layer in :mod:`apis.ai.detector` is what enforces
-that a ``LOOKING_AWAY`` posture must be *sustained* before it becomes an event.
+expected; the temporal-rules layer in :mod:`apis.ai.detector` additionally
+requires several *consecutive* sampled frames before a posture becomes an event.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from . import config
@@ -39,12 +45,15 @@ class PoseAnalyzer:
         self,
         model_path: str = config.POSE_MODEL,
         keypoint_confidence: float = config.POSE_CONFIDENCE,
-        looking_away_ratio: float = config.LOOKING_AWAY_RATIO,
+        angle_threshold_deg: float = config.LOOKING_AWAY_ANGLE_DEG,
+        nose_depth_ratio: float = config.NOSE_DEPTH_RATIO,
         device=None,
     ):
         self.model_path = model_path
         self.keypoint_confidence = keypoint_confidence
-        self.looking_away_ratio = looking_away_ratio
+        # Head must be yawed past this many degrees sideways to count as away.
+        self.angle_threshold_deg = angle_threshold_deg
+        self.nose_depth_ratio = max(1e-3, nose_depth_ratio)
         # `0` means GPU; `'cpu'` means CPU. Resolved at analysis time.
         self.device = device if device is not None else config.resolve_device()
         self._model = None
@@ -123,8 +132,13 @@ class PoseAnalyzer:
                     continue  # eyes coincident/undetected — can't judge pose
 
                 eye_midpoint_x = (left_eye_x + right_eye_x) / 2.0
+                # Horizontal-only offset → looking DOWN never registers here.
                 offset_ratio = abs(nose_x - eye_midpoint_x) / eye_distance
-                if offset_ratio <= self.looking_away_ratio:
+                # Convert the offset into an approximate sideways yaw angle:
+                # yaw ≈ atan(offset_ratio / nose_depth_ratio). Flag only when the
+                # head is turned past the configured threshold (45° by default).
+                yaw_deg = math.degrees(math.atan(offset_ratio / self.nose_depth_ratio))
+                if yaw_deg <= self.angle_threshold_deg:
                     continue
 
                 bbox = (0.0, 0.0, 0.0, 0.0)
@@ -133,15 +147,14 @@ class PoseAnalyzer:
                         float(v) for v in boxes[person_idx].xyxy[0].tolist()
                     )
 
-                # Map the offset onto a bounded confidence score: at the
-                # threshold it starts near 0, saturating toward 1.0 as the head
-                # turns further.
+                # Confidence scales from 0 at the threshold angle to 1.0 at a
+                # full 90° profile turn.
                 confidence = max(
                     0.0,
                     min(
                         1.0,
-                        (offset_ratio - self.looking_away_ratio)
-                        / max(self.looking_away_ratio, 1e-3),
+                        (yaw_deg - self.angle_threshold_deg)
+                        / max(90.0 - self.angle_threshold_deg, 1e-3),
                     ),
                 )
                 detections.append(

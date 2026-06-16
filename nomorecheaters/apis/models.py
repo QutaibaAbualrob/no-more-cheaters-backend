@@ -152,21 +152,42 @@ class Student(models.Model):
 
 
 class Exam(models.Model):
-    """An exam created by an instructor.
+    """An exam created by an instructor (or scheduled by a dean).
 
-    Acts as a logical container for one or more :class:`ExamSession` instances.
-    Each exam belongs to a single instructor (or admin).
+    Acts as a logical container for one or more :class:`ExamSession` instances,
+    and — when scheduled on the shared calendar — carries the schedule itself
+    (date / time / hall) plus presentation fields (course, colour) and the
+    recording mode. These fields are nullable so older exams created before the
+    calendar feature keep working. Supervisors are not stored here; they are the
+    accepted per-exam :class:`WorkspaceInvite` rows (see ``assigned_supervisor_ids``),
+    so a dean assigning a supervisor and an invited instructor act on the SAME exam.
     """
+
+    class RecordingMode(models.TextChoices):
+        MANUAL = 'manual', 'Manual analysis'
+        AUTO = 'auto', 'Auto recording'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     instructor = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name='exams',
-        limit_choices_to={'role__in': [User.Role.ADMIN, User.Role.INSTRUCTOR]},
+        limit_choices_to={'role__in': [User.Role.ADMIN, User.Role.INSTRUCTOR, User.Role.DEAN]},
     )
     name = models.CharField(max_length=255, null=False, blank=False)
     description = models.TextField(blank=True)
+
+    # --- Calendar schedule (all optional for pre-calendar exams) -------------
+    course = models.CharField(max_length=255, blank=True)
+    scheduled_date = models.DateField(null=True, blank=True)
+    start_time = models.TimeField(null=True, blank=True)
+    end_time = models.TimeField(null=True, blank=True)
+    hall = models.CharField(max_length=255, blank=True)
+    color = models.CharField(max_length=20, blank=True, default='blue')
+    recording_mode = models.CharField(
+        max_length=10, choices=RecordingMode.choices, default=RecordingMode.MANUAL,
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -174,6 +195,7 @@ class Exam(models.Model):
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['instructor', 'created_at']),
+            models.Index(fields=['scheduled_date']),
         ]
 
     def __str__(self):

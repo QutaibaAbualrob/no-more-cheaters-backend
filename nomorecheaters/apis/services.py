@@ -208,6 +208,66 @@ def exam_supervisor_users(exam, extra_user_ids=None):
     return list(User.objects.filter(id__in=ids))
 
 
+def _schedule_sentence(exam, schedule=None):
+    """Compose the 'on <date> at <time> in <hall>' tail for assignment notices."""
+    schedule = schedule or {}
+    date = schedule.get('date') or (exam.scheduled_date.isoformat() if exam.scheduled_date else 'the scheduled date')
+    start = schedule.get('start_time') or (exam.start_time.strftime('%H:%M') if exam.start_time else '')
+    end = schedule.get('end_time') or (exam.end_time.strftime('%H:%M') if exam.end_time else '')
+    time_range = f'{start}–{end}' if start and end else (start or 'the scheduled time')
+    hall = schedule.get('hall') or exam.hall or 'the assigned hall'
+    return f'on {date} at {time_range} in {hall}'
+
+
+def sync_exam_supervisors(dean, exam, instructor_ids, schedule=None):
+    """Make the ACCEPTED per-exam invites for *exam* match *instructor_ids*.
+
+    Assignment is immediate (the invite is created already ACCEPTED) so the exam
+    appears on each supervisor's calendar right away via ``calendar_exams`` —
+    there is no pending accept/decline step. Newly-assigned instructors get an
+    ``EXAM_ASSIGNED`` notification (bell badge); un-assigned instructors have
+    their exam invite removed so the exam drops off their calendar. Returns the
+    list of newly-assigned :class:`User` objects.
+    """
+    desired = {str(i) for i in (instructor_ids or []) if i}
+    existing = {
+        str(i) for i in WorkspaceInvite.objects
+        .filter(exam=exam, status=WorkspaceInvite.Status.ACCEPTED)
+        .values_list('instructor_id', flat=True)
+    }
+    to_add = desired - existing
+    to_remove = existing - desired
+
+    if to_remove:
+        WorkspaceInvite.objects.filter(exam=exam, instructor_id__in=to_remove).delete()
+
+    added_users = []
+    tail = _schedule_sentence(exam, schedule)
+    for instructor in User.objects.filter(id__in=to_add):
+        invite, _created = WorkspaceInvite.objects.get_or_create(
+            exam=exam, instructor=instructor,
+            defaults={'dean': dean, 'status': WorkspaceInvite.Status.ACCEPTED},
+        )
+        if invite.status != WorkspaceInvite.Status.ACCEPTED:
+            invite.status = WorkspaceInvite.Status.ACCEPTED
+            invite.responded_at = timezone.now()
+            invite.save(update_fields=['status', 'responded_at'])
+        create_notification(
+            instructor,
+            Notification.NotifType.EXAM_ASSIGNED,
+            f'New exam assigned: {exam.name}',
+            f'You have been assigned to supervise "{exam.name}" {tail}.',
+            metadata={
+                'exam_id': str(exam.id),
+                'exam_name': exam.name,
+                'date': (schedule or {}).get('date') or (exam.scheduled_date.isoformat() if exam.scheduled_date else ''),
+                'hall': (schedule or {}).get('hall') or exam.hall or '',
+            },
+        )
+        added_users.append(instructor)
+    return added_users
+
+
 def delete_exam_media(exam):
     """Delete all on-disk media for an exam's sessions before the DB cascade.
 
