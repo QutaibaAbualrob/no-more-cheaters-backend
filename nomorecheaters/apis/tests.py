@@ -1256,6 +1256,40 @@ class AsyncQueueWiringTests(APITestCase):
             ExamSession.Status.FAILED,
         )
 
+    def test_truncate_error_caps_long_tracebacks(self):
+        """M10: the helper bounds the stored text and marks the clip."""
+        from apis.tasks import _MAX_ERROR_MESSAGE_CHARS, _truncate_error
+
+        short = 'ValueError: boom'
+        self.assertEqual(_truncate_error(short), short)  # short text untouched
+        self.assertEqual(_truncate_error(''), '')
+        self.assertEqual(_truncate_error(None), '')
+
+        huge = 'x' * (_MAX_ERROR_MESSAGE_CHARS + 5000)
+        capped = _truncate_error(huge)
+        self.assertTrue(capped.startswith('x' * _MAX_ERROR_MESSAGE_CHARS))
+        self.assertTrue(capped.endswith('[truncated]'))
+        self.assertLess(len(capped), len(huge))
+
+    def test_worker_stores_truncated_error_message(self):
+        """M10: a multi-KB traceback is not persisted verbatim onto the job."""
+        from apis.tasks import _MAX_ERROR_MESSAGE_CHARS
+
+        video = self._make_video()
+        job = AnalysisJob.objects.create(session=video.session, status=AnalysisJob.Status.QUEUED)
+
+        giant = 'CUDA out of memory\n' + ('frame ' * 4000)
+        with mock.patch('apis.tasks.build_ai_report', side_effect=RuntimeError(giant)):
+            with self.assertRaises(RuntimeError):
+                run_analysis(str(job.id), actor_id=str(self.user.id))
+
+        job.refresh_from_db()
+        # Head preserved (the actual cause), total length bounded.
+        self.assertTrue(job.error_message.startswith('CUDA out of memory'))
+        self.assertLessEqual(
+            len(job.error_message), _MAX_ERROR_MESSAGE_CHARS + len('\n…[truncated]'),
+        )
+
     def test_failure_is_audited_and_notified(self):
         """H5/H12: a failed analysis writes an audit entry and notifies the owner."""
         from apis.models import Notification

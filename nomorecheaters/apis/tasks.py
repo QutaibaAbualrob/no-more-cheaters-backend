@@ -23,6 +23,27 @@ User = get_user_model()
 
 logger = logging.getLogger(__name__)
 
+# Cap on the error text persisted to AnalysisJob.error_message. A raw analysis
+# exception can be a several-hundred-line CUDA/ffmpeg traceback (~10KB); storing
+# it verbatim on every failure bloats the unbounded TextField (M10). 2000 chars
+# keeps the exception type and the first frames — where the cause usually is —
+# while bounding the row size.
+_MAX_ERROR_MESSAGE_CHARS = 2000
+
+
+def _truncate_error(message):
+    """Bound a stored error string to ``_MAX_ERROR_MESSAGE_CHARS`` (M10).
+
+    Keeps the head of the message (the exception and its first stack frames) and
+    appends a marker so it is clear the text was clipped. The short, single-line
+    summary used for the audit log / instructor notification is derived
+    separately and is unaffected.
+    """
+    text = message or ''
+    if len(text) <= _MAX_ERROR_MESSAGE_CHARS:
+        return text
+    return text[:_MAX_ERROR_MESSAGE_CHARS] + '\n…[truncated]'
+
 
 def _existing_report_id(job):
     """Return the str id of the session's report, or ``None`` if not generated yet."""
@@ -154,7 +175,7 @@ def _mark_failed(job, session, error_message, actor=None):
     caller is about to re-raise, and so the FAILED state is always persisted.
     """
     job.status = AnalysisJob.Status.FAILED
-    job.error_message = error_message
+    job.error_message = _truncate_error(error_message)
     job.completed_at = timezone.now()
     job.save(update_fields=['status', 'error_message', 'completed_at'])
     session.status = ExamSession.Status.FAILED
