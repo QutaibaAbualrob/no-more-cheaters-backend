@@ -14,6 +14,9 @@ python-dotenv
 ultralytics
 opencv-python-headless
 numpy
+# Ships a static ffmpeg binary so evidence clips can be re-encoded to
+# browser-playable H.264 even when no system ffmpeg is installed.
+imageio-ffmpeg
 dj-rest-auth
 # Background job queue (django-rq + Redis)
 # Analysis runs through this queue. Jobs execute synchronously in-process by

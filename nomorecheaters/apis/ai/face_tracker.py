@@ -377,11 +377,16 @@ def extract_annotated_frame(video_path: str, timestamp_sec: float, boxes,
 
 
 def _make_writer(cv2, out_path: str, fps: float, size):
-    """Create a VideoWriter, preferring H.264 (avc1) for browser playback.
+    """Create a VideoWriter for the temporary clip.
 
-    Falls back to mp4v if the H.264 encoder is unavailable in this OpenCV build.
+    ``mp4v`` is tried FIRST because it is always present in OpenCV's bundled
+    FFmpeg and never touches the (often broken on Windows) OpenH264 library that
+    ``avc1`` needs — attempting ``avc1`` first spams "Incorrect library version"
+    errors and fails to initialise. The clip written here is only an
+    intermediate: :func:`extract_clip` re-encodes it to real H.264 with ffmpeg
+    afterwards, so the temp codec just has to be reliable, not web-playable.
     """
-    for fourcc_name in ('avc1', 'mp4v'):
+    for fourcc_name in ('mp4v', 'avc1'):
         fourcc = cv2.VideoWriter_fourcc(*fourcc_name)
         writer = cv2.VideoWriter(str(out_path), fourcc, fps, size)
         if writer.isOpened():
@@ -390,19 +395,36 @@ def _make_writer(cv2, out_path: str, fps: float, size):
     return None
 
 
-def _reencode_h264(src_path: str, dst_path: str) -> bool:
-    """Re-encode *src_path* to a browser-playable H.264/AAC MP4 at *dst_path*.
+def _ffmpeg_exe():
+    """Locate an ffmpeg binary: system ``PATH`` first, then bundled imageio-ffmpeg.
 
-    OpenCV's bundled FFmpeg can rarely write H.264 (the ``avc1`` encoder is
-    usually absent for licensing reasons), so clips written by
-    :func:`extract_clip` fall back to ``mp4v`` — which Chrome/Firefox refuse to
-    play inside an HTML5 ``<video>`` tag. When the system ``ffmpeg`` binary is
-    available we transcode to ``libx264`` + ``yuv420p`` (the pixel format browsers
-    require) so the clip plays inline. Returns ``True`` only when a non-empty
-    output file was produced; the caller keeps the original clip otherwise, so a
-    missing ffmpeg never breaks analysis.
+    Returns the executable path, or ``None`` when neither is available. The
+    ``imageio-ffmpeg`` pip package ships a static ffmpeg, so the H.264 re-encode
+    works even on machines with no system ffmpeg installed.
     """
-    ffmpeg = shutil.which('ffmpeg')
+    exe = shutil.which('ffmpeg')
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001 — package missing/broken → no re-encode
+        return None
+
+
+def _reencode_h264(src_path: str, dst_path: str) -> bool:
+    """Re-encode *src_path* to a browser-playable H.264 MP4 at *dst_path*.
+
+    OpenCV writes the temp clip as ``mp4v`` (MPEG-4 Part 2), which Chrome/Firefox
+    play poorly or not at all (they show one frame then freeze). We transcode to
+    ``libx264`` + ``yuv420p`` (the pixel format browsers require) with
+    ``+faststart`` so the clip streams inline. ffmpeg comes from the system or
+    the bundled :func:`_ffmpeg_exe`. Returns ``True`` only when a non-empty output
+    file was produced; the caller keeps the mp4v clip otherwise, so a missing
+    ffmpeg never breaks analysis.
+    """
+    ffmpeg = _ffmpeg_exe()
     if not ffmpeg:
         return False
     try:

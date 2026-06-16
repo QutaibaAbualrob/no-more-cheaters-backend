@@ -14,9 +14,9 @@ from .models import (
     UserPreferences, Video, Workspace, WorkspaceInvite, WorkspaceMembership,
 )
 from .selectors import (
-    actionable_exams, assigned_supervisor_ids, can_supervise_exam,
+    actionable_exams, assigned_supervisor_ids, can_supervise_exam, can_view_report,
     is_admin, is_dean, owned_sessions, owned_students, owned_videos,
-    recent_day_window, users_visible_to,
+    recent_day_window, users_visible_to, visible_sessions, visible_videos,
 )
 from .serializers import (
     AutoExamSessionCreateSerializer,
@@ -40,6 +40,7 @@ from .services import (
     activity_series_for,
     build_thresholds_response,
     dashboard_stats_for,
+    delete_exam_media,
     email_workspace_invite,
     enqueue_analysis,
     exam_supervisor_users,
@@ -297,12 +298,47 @@ class AnalyzeVideoView(APIView):
 
 
 class VideoHistoryView(APIView):
-    """List analyzed videos for the History page."""
+    """List analyzed videos for the History page (workspace-scoped)."""
 
     def get(self, request):
-        queryset = owned_videos(request.user).filter(session__status=ExamSession.Status.COMPLETED)
+        queryset = visible_videos(request.user).filter(
+            session__status=ExamSession.Status.COMPLETED,
+        )
         serializer = VideoReadSerializer(queryset, many=True, context={'request': request})
         return Response(serializer.data)
+
+
+class AnalysisSessionsView(APIView):
+    """All analyzed sessions the user may view — drives the Analysis page exam list.
+
+    Returns sessions whose status is PROCESSING / COMPLETED / FAILED (anything
+    that has been or is being analyzed), workspace-scoped via
+    :func:`visible_sessions`. Ordered newest-first. Each row carries enough for
+    the frontend's grouped list and status dot.
+    """
+
+    def get(self, request):
+        sessions = (
+            visible_sessions(request.user)
+            .exclude(status=ExamSession.Status.PENDING)
+            .order_by('-created_at')
+        )
+        rows = []
+        for session in sessions:
+            report = getattr(session, 'report', None)
+            job = getattr(session, 'analysis_job', None)
+            rows.append({
+                'session_id': str(session.id),
+                'exam_name': session.exam.name,
+                # No scheduled date exists server-side (calendar schedule is
+                # client-only); the analysis date is the meaningful timestamp.
+                'exam_date': session.created_at,
+                'status': session.status,
+                'analysis_status': job.status if job else session.status,
+                'total_alerts': report.total_alerts if report else 0,
+                'created_at': session.created_at,
+            })
+        return Response(rows)
 
 
 def _person_sort_key(person_id):
@@ -362,8 +398,9 @@ class SessionReportView(APIView):
             ),
             pk=session_id,
         )
-        # Assigned supervisor (incl. the exam owner), dean, or admin may view.
-        if not can_supervise_exam(request.user, session.exam):
+        # Workspace-scoped: the exam owner, a co-member of a shared workspace, an
+        # accepted per-exam supervisor, the workspace's dean, or an admin may view.
+        if not can_view_report(request.user, session.exam):
             raise PermissionDenied('You do not have access to this session.')
 
         def absolute(url):
@@ -385,6 +422,9 @@ class SessionReportView(APIView):
             'error_message': job.error_message if job else '',
             'video_id': str(video.id) if video else None,
             'video_url': absolute(video.file.url) if video and video.file else None,
+            # The annotated full-length video (boxes/labels drawn on flagged
+            # frames), produced by the analysis pipeline. None until analysis runs.
+            'annotated_video_url': absolute((job.metadata or {}).get('annotated_video_url')) if job else None,
         }
 
         if report is None:
@@ -629,6 +669,34 @@ class AllWorkspaceMembersView(APIView):
         if not is_dean(request.user):
             raise PermissionDenied('Only deans can list workspace members.')
         return Response(accepted_instructor_rows(request.user))
+
+
+class MyWorkspacesView(APIView):
+    """Workspaces the CURRENT user belongs to (as an accepted member).
+
+    Powers the frontend's ``hasWorkspace`` gate: a freshly-registered instructor
+    with no accepted membership gets ``has_workspace: false`` and is shown the
+    "ask your dean for an invite" empty state instead of an empty dashboard.
+    Works for any authenticated user (unlike the dean-only members endpoint).
+    """
+
+    def get(self, request):
+        memberships = (
+            WorkspaceMembership.objects
+            .filter(instructor=request.user)
+            .select_related('workspace', 'workspace__owner')
+            .order_by('joined_at')
+        )
+        rows = [
+            {
+                'workspace_id': str(m.workspace_id),
+                'workspace_name': m.workspace.name,
+                'owner_email': m.workspace.owner.email if m.workspace.owner_id else None,
+                'joined_at': m.joined_at,
+            }
+            for m in memberships
+        ]
+        return Response({'has_workspace': len(rows) > 0, 'workspaces': rows})
 
 
 class HallManagementView(APIView):
@@ -1071,22 +1139,29 @@ class ExamListView(APIView):
 
 
 class ExamDetailView(APIView):
-    """Admin-only edit/delete of an exam, notifying every assigned supervisor.
+    """Edit/delete an exam, notifying every assigned supervisor.
 
-    Edit (PATCH) and cancel (DELETE) are restricted to administrators. After
-    either action, the exam owner, accepted invite supervisors, and any extra
-    ``supervisor_ids`` from the request are notified in-app and by email.
-    Schedule fields (date/time/hall) live in the calendar client; they are
-    accepted here only to compose the notification text.
+    * **PATCH (edit)** — the exam owner, a dean, or an admin. Updates the name
+      and notifies supervisors of the new schedule.
+    * **DELETE (cancel)** — a dean or an admin only (never a plain instructor).
+      Removes the exam (cascading to its sessions/videos/alerts/reports), clears
+      the media files from disk, audits the action, and notifies supervisors.
+
+    Schedule fields (date/start_time/end_time/hall) live in the calendar client;
+    they are accepted here only to compose the notification text. Recipients are
+    the exam owner, accepted-invite supervisors, auto-session instructors, and
+    any extra ``supervisor_ids`` the request supplies.
     """
 
-    def _get_exam(self, request, pk):
-        if not is_admin(request.user):
-            raise PermissionDenied('Only administrators can edit or delete exams.')
-        return get_object_or_404(Exam, pk=pk)
-
     def patch(self, request, pk):
-        exam = self._get_exam(request, pk)
+        exam = get_object_or_404(Exam, pk=pk)
+        can_edit = (
+            is_admin(request.user)
+            or is_dean(request.user)
+            or exam.instructor_id == request.user.id
+        )
+        if not can_edit:
+            raise PermissionDenied('You do not have permission to edit this exam.')
 
         name = request.data.get('name')
         if name is not None and str(name).strip():
@@ -1096,33 +1171,48 @@ class ExamDetailView(APIView):
         exam.save(update_fields=['name', 'description', 'updated_at'])
 
         supervisors = exam_supervisor_users(exam, request.data.get('supervisor_ids'))
-        old_date = request.data.get('old_date') or 'an earlier date'
         new_date = request.data.get('date') or 'the same date'
-        new_time = request.data.get('time') or 'the same time'
+        start_time = request.data.get('start_time') or request.data.get('time') or 'the same time'
+        end_time = request.data.get('end_time') or ''
+        hall = request.data.get('hall') or 'the same hall'
+        time_range = f'{start_time}–{end_time}' if end_time else start_time
         notify_users(
             supervisors,
             Notification.NotifType.EXAM_UPDATED,
             f'Exam updated: {exam.name}',
-            f'The exam scheduled for {old_date} has been updated. '
-            f'New date: {new_date}, New time: {new_time}',
+            f'"{exam.name}" has been updated. '
+            f'New date: {new_date}, time: {time_range}, hall: {hall}.',
             metadata={'exam_id': str(exam.id)},
         )
         return Response(ExamReadSerializer(exam).data)
 
     def delete(self, request, pk):
-        exam = self._get_exam(request, pk)
+        exam = get_object_or_404(Exam, pk=pk)
+        if not (is_admin(request.user) or is_dean(request.user)):
+            raise PermissionDenied('Only deans or administrators can delete exams.')
 
         # Resolve recipients and compose the message *before* deleting the exam.
         supervisors = exam_supervisor_users(exam, request.data.get('supervisor_ids'))
         name = exam.name
+        exam_id = str(exam.id)
         date = request.data.get('date') or 'its scheduled date'
         time = request.data.get('time') or 'its scheduled time'
         notify_users(
             supervisors,
             Notification.NotifType.EXAM_CANCELLED,
             f'Exam cancelled: {name}',
-            f'The exam scheduled for {date} at {time} has been cancelled by the administrator.',
+            f'The exam "{name}" scheduled for {date} at {time} has been deleted. '
+            f'All sessions and uploaded videos were removed. This cannot be undone.',
             metadata={'exam_name': name},
+        )
+        # Remove on-disk media (videos, clips, snapshots) before the DB cascade
+        # drops the rows that point at them.
+        delete_exam_media(exam)
+        write_audit_log(
+            request,
+            AuditLog.ActionType.EXAM_DELETED,
+            target_resource=f'exam:{exam_id}',
+            metadata={'name': name},
         )
         exam.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)

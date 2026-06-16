@@ -4,7 +4,10 @@ from django.contrib.auth import get_user_model
 from django.db.models import Q
 from django.utils import timezone
 
-from .models import Exam, ExamSession, Report, Student, Video, WorkspaceInvite
+from .models import (
+    Exam, ExamSession, Report, Student, Video, Workspace, WorkspaceInvite,
+    WorkspaceMembership,
+)
 
 
 User = get_user_model()
@@ -120,3 +123,82 @@ def actionable_exams(user):
         .values_list('exam_id', flat=True)
     )
     return queryset.filter(Q(instructor=user) | Q(id__in=invited_exam_ids)).distinct()
+
+
+# ─── Workspace-scoped report visibility ──────────────────────────────────────
+#
+# There is no Exam→Workspace foreign key. A workspace links a dean (owner) to
+# instructors (accepted memberships). So an exam "belongs" to a workspace when
+# its owner participates in that workspace. Report visibility therefore follows
+# the people who share a workspace, giving the required isolation: instructors
+# in different workspaces never see each other's reports.
+
+
+def _participating_workspace_ids(user):
+    """Workspace ids the user takes part in — as a member, or as the owning dean."""
+    member_ws = WorkspaceMembership.objects.filter(instructor=user).values_list('workspace_id', flat=True)
+    owned_ws = Workspace.objects.filter(owner=user).values_list('id', flat=True)
+    return set(member_ws) | set(owned_ws)
+
+
+def workspace_related_user_ids(user):
+    """User ids that share at least one workspace with *user* (co-members + dean)."""
+    ws_ids = _participating_workspace_ids(user)
+    related = {user.id}
+    related.update(
+        WorkspaceMembership.objects
+        .filter(workspace_id__in=ws_ids)
+        .values_list('instructor_id', flat=True)
+    )
+    related.update(
+        Workspace.objects.filter(id__in=ws_ids).values_list('owner_id', flat=True)
+    )
+    related.discard(None)
+    return related
+
+
+def visible_exams(user):
+    """Exams whose analysis reports *user* may view.
+
+    * **ADMIN** — every exam.
+    * **DEAN** — exams owned by the dean or by any member of the dean's workspaces.
+    * **INSTRUCTOR** — own exams, exams of co-members in shared workspaces (and the
+      workspace's dean), plus any exam the user is an accepted per-exam supervisor of.
+    """
+    queryset = Exam.objects.select_related('instructor')
+    if is_admin(user):
+        return queryset
+    related = workspace_related_user_ids(user)
+    invited_exam_ids = (
+        WorkspaceInvite.objects
+        .filter(instructor=user, status=WorkspaceInvite.Status.ACCEPTED, exam__isnull=False)
+        .values_list('exam_id', flat=True)
+    )
+    return queryset.filter(
+        Q(instructor_id__in=related) | Q(id__in=invited_exam_ids)
+    ).distinct()
+
+
+def can_view_report(user, exam):
+    """True when *user* may view the analysis report for *exam* (workspace-scoped)."""
+    if is_admin(user):
+        return True
+    return visible_exams(user).filter(pk=exam.pk).exists()
+
+
+def visible_sessions(user):
+    """Exam sessions whose reports *user* may view (Analysis page exam list)."""
+    return (
+        ExamSession.objects
+        .select_related('exam', 'exam__instructor', 'report', 'analysis_job')
+        .filter(exam__in=visible_exams(user))
+    )
+
+
+def visible_videos(user):
+    """Uploaded videos whose session reports *user* may view (History scope)."""
+    return (
+        Video.objects
+        .select_related('session', 'session__exam', 'session__exam__instructor')
+        .filter(session__exam__in=visible_exams(user))
+    )

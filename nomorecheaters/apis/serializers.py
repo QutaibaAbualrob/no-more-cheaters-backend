@@ -61,19 +61,36 @@ class CustomRegisterSerializer(RegisterSerializer):
         default=User.Role.INSTRUCTOR,
         required=False,
     )
+    # The real full name the user typed at signup. Persisted to first/last name
+    # so get_full_name() — and therefore every display_name in the app — shows
+    # the real name instead of the auto-generated username.
+    name = serializers.CharField(required=False, allow_blank=True, max_length=255)
 
     def get_cleaned_data(self):
         data = super().get_cleaned_data()
         data['role'] = self.validated_data.get('role', User.Role.INSTRUCTOR)
+        data['name'] = self.validated_data.get('name', '')
         return data
 
     def custom_signup(self, request, user):
+        changed = []
+
         role = self.validated_data.get('role') or User.Role.INSTRUCTOR
         if role not in (User.Role.DEAN, User.Role.INSTRUCTOR):
             role = User.Role.INSTRUCTOR
         if user.role != role:
             user.role = role
-            user.save(update_fields=['role'])
+            changed.append('role')
+
+        name = (self.validated_data.get('name') or '').strip()
+        if name:
+            first, _, last = name.partition(' ')
+            user.first_name = first[:150]
+            user.last_name = last.strip()[:150]
+            changed.extend(['first_name', 'last_name'])
+
+        if changed:
+            user.save(update_fields=changed)
 
 
 class UserReadSerializer(serializers.ModelSerializer):
@@ -127,6 +144,8 @@ class NotificationSerializer(serializers.ModelSerializer):
 
     invite_status = serializers.SerializerMethodField()
     invite_token = serializers.SerializerMethodField()
+    workspace_name = serializers.SerializerMethodField()
+    dean_email = serializers.SerializerMethodField()
 
     class Meta:
         model = Notification
@@ -139,6 +158,8 @@ class NotificationSerializer(serializers.ModelSerializer):
             'is_dismissed',
             'invite_status',
             'invite_token',
+            'workspace_name',
+            'dean_email',
             'metadata',
             'created_at',
         ]
@@ -154,6 +175,14 @@ class NotificationSerializer(serializers.ModelSerializer):
     def get_invite_token(self, obj):
         """The secret token for accept/decline, surfaced for invite notifications."""
         return (obj.metadata or {}).get('token')
+
+    def get_workspace_name(self, obj):
+        """The workspace this invite targets — null for non-invite notifications."""
+        return (obj.metadata or {}).get('workspace_name')
+
+    def get_dean_email(self, obj):
+        """Email of the dean who sent the invite — null for non-invite notifications."""
+        return (obj.metadata or {}).get('dean_email')
 
 
 class WorkspaceInviteSerializer(serializers.ModelSerializer):

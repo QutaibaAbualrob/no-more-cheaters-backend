@@ -1,5 +1,6 @@
 import logging
 import platform
+import shutil
 import sys
 from pathlib import Path
 
@@ -12,8 +13,8 @@ from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 from .models import (
-    Alert, AnalysisJob, AuditLog, Exam, ExamSession, Notification, Report,
-    SystemSettings, UserPreferences, Video, Workspace, WorkspaceInvite,
+    Alert, AnalysisJob, AuditLog, AutoExamSession, Exam, ExamSession, Notification,
+    Report, SystemSettings, UserPreferences, Video, Workspace, WorkspaceInvite,
     WorkspaceMembership,
 )
 from .selectors import is_admin, owned_reports, owned_sessions, owned_videos, recent_day_window
@@ -138,7 +139,13 @@ def send_workspace_invite(dean, instructor, exam=None, workspace=None):
     email_workspace_invite(invite)
 
     target = invite.target_name
-    metadata = {'invite_id': str(invite.id), 'token': str(invite.token)}
+    # dean_email + token are required by the frontend Alerts page so it can
+    # render the sender and call accept/decline.
+    metadata = {
+        'invite_id': str(invite.id),
+        'token': str(invite.token),
+        'dean_email': dean.email,
+    }
     if workspace is not None:
         metadata['workspace_id'] = str(workspace.id)
         metadata['workspace_name'] = workspace.name
@@ -160,8 +167,9 @@ def exam_supervisor_users(exam, extra_user_ids=None):
     """Resolve the people who supervise *exam* and should be notified of changes.
 
     That is the exam owner, every instructor with an ACCEPTED invite for the
-    exam, plus any extra user ids the caller supplies (e.g. the calendar's
-    selected supervisors). Returns a list of distinct :class:`User` objects.
+    exam, every instructor who scheduled an :class:`AutoExamSession` for it, plus
+    any extra user ids the caller supplies (e.g. the calendar's selected
+    supervisors). Returns a list of distinct :class:`User` objects.
     """
     ids = {exam.instructor_id}
     ids.update(
@@ -169,11 +177,37 @@ def exam_supervisor_users(exam, extra_user_ids=None):
         .filter(exam=exam, status=WorkspaceInvite.Status.ACCEPTED)
         .values_list('instructor_id', flat=True)
     )
+    ids.update(
+        AutoExamSession.objects
+        .filter(exam=exam)
+        .values_list('instructor_id', flat=True)
+    )
     for raw in (extra_user_ids or []):
         if raw:
             ids.add(raw)
     ids.discard(None)
     return list(User.objects.filter(id__in=ids))
+
+
+def delete_exam_media(exam):
+    """Delete all on-disk media for an exam's sessions before the DB cascade.
+
+    Django's FK cascade removes the Video/Alert/Report rows but never the files
+    they reference. This clears the uploaded video plus the per-session clip and
+    snapshot directories under ``MEDIA_ROOT``. Best-effort: any IO error is
+    logged and skipped so a locked/missing file never blocks the delete.
+    """
+    media_root = Path(settings.MEDIA_ROOT)
+    for session in exam.sessions.all():
+        video = getattr(session, 'video', None)
+        if video is not None and video.file:
+            try:
+                video.file.delete(save=False)
+            except Exception:  # noqa: BLE001 — best-effort file cleanup
+                logger.exception('Failed to delete video file for session %s', session.id)
+        # exam-videos/<session>, clips/<session>, snapshots/<session>
+        for subdir in ('exam-videos', 'clips', 'snapshots'):
+            shutil.rmtree(media_root / subdir / str(session.id), ignore_errors=True)
 
 
 def notify_users(users, notif_type, title, body, metadata=None):
@@ -734,11 +768,28 @@ def build_ai_report(session, job=None):
         job_metadata.update({
             'analysis': result.metadata,
             'annotated_video_path': result.annotated_video_path,
+            'annotated_video_url': _media_url_for(result.annotated_video_path),
         })
         job.metadata = job_metadata
         job.save(update_fields=['metadata'])
 
     return report
+
+
+def _media_url_for(filesystem_path):
+    """Turn an absolute path under ``MEDIA_ROOT`` into a ``/media/...`` web URL.
+
+    Used to expose the annotated analysis video (written next to the source
+    upload) to the frontend. Returns ``None`` for a missing path or one that
+    falls outside ``MEDIA_ROOT``.
+    """
+    if not filesystem_path:
+        return None
+    try:
+        rel = Path(filesystem_path).resolve().relative_to(Path(settings.MEDIA_ROOT).resolve())
+    except (ValueError, OSError):
+        return None
+    return '/' + settings.MEDIA_URL.strip('/') + '/' + str(rel).replace('\\', '/')
 
 
 def dashboard_stats_for(user):

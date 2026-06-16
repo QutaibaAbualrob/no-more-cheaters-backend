@@ -108,6 +108,39 @@ def _collect_frame_detections(
     return detections, frames_analyzed
 
 
+def _bbox_center(bbox) -> tuple[float, float, float] | None:
+    """Return ``(cx, cy, size)`` for a usable bbox, else ``None``.
+
+    ``size`` is the larger box edge, used to scale the "same person" distance
+    threshold. A zero/degenerate box (some pose detections report ``(0,0,0,0)``)
+    yields ``None`` so it never forces a track split.
+    """
+    if not bbox:
+        return None
+    x1, y1, x2, y2 = bbox
+    width = x2 - x1
+    height = y2 - y1
+    if width <= 0 or height <= 0:
+        return None
+    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0, max(width, height))
+
+
+def _same_track(center_a, center_b, factor: float = 0.75) -> bool:
+    """Whether two bbox centres are close enough to be the same person/object.
+
+    The distance threshold scales with box size so it adapts to camera distance.
+    Either centre being ``None`` (no usable box) returns ``True`` — such
+    detections fall back to pure temporal merging rather than spawning spurious
+    extra events.
+    """
+    if center_a is None or center_b is None:
+        return True
+    ax, ay, a_size = center_a
+    bx, by, b_size = center_b
+    distance = ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+    return distance <= factor * max(a_size, b_size)
+
+
 def consolidate_events(
     detections: list[FrameDetection],
     merge_window_sec: float = config.MERGE_WINDOW_SEC,
@@ -115,10 +148,13 @@ def consolidate_events(
 ) -> list[AlertEvent]:
     """Merge frame detections into events via the temporal rules layer.
 
-    Same-class detections whose gap is within *merge_window_sec* collapse into
-    one event; the event's confidence is the max across its frames. Events
-    shorter than *min_duration_sec* are discarded as noise. Returns events
-    sorted by start time.
+    Detections of the same class are first separated into **per-person tracks**
+    by spatial proximity of their bounding boxes, so two students looking away
+    (or two phones in different hands) become two events rather than collapsing
+    into one. Within a track, detections whose gap is within *merge_window_sec*
+    merge into a single event (max confidence across its frames); a gap larger
+    than the window starts a fresh event for that person. Events shorter than
+    *min_duration_sec* are dropped as noise. Returns events sorted by start time.
     """
     events: list[AlertEvent] = []
 
@@ -128,28 +164,48 @@ def consolidate_events(
 
     for behavior_type, items in by_type.items():
         items.sort(key=lambda d: d.timestamp_sec)
-        current: AlertEvent | None = None
-        last_ts = None
+        # Each open track: {'event', 'last_ts', 'center'}. A detection extends an
+        # existing track only when it is within the merge window AND spatially on
+        # the same person; otherwise it opens a new event (new person or a
+        # resumed behaviour after a long gap).
+        tracks: list[dict] = []
         for det in items:
-            if current is None or (det.timestamp_sec - last_ts) > merge_window_sec:
-                if current is not None:
-                    events.append(current)
-                current = AlertEvent(
+            center = _bbox_center(det.bbox)
+            match = None
+            for track in tracks:
+                if (det.timestamp_sec - track['last_ts']) > merge_window_sec:
+                    continue
+                if _same_track(center, track['center']):
+                    match = track
+                    break
+
+            if match is None:
+                event = AlertEvent(
                     behavior_type=behavior_type,
                     confidence=det.confidence,
                     start_sec=det.timestamp_sec,
                     end_sec=det.timestamp_sec,
                     frame_count=1,
                 )
+                events.append(event)
+                tracks.append({'event': event, 'last_ts': det.timestamp_sec, 'center': center})
             else:
-                current.end_sec = det.timestamp_sec
-                current.confidence = max(current.confidence, det.confidence)
-                current.frame_count += 1
-            last_ts = det.timestamp_sec
-        if current is not None:
-            events.append(current)
+                event = match['event']
+                event.end_sec = det.timestamp_sec
+                event.confidence = max(event.confidence, det.confidence)
+                event.frame_count += 1
+                match['last_ts'] = det.timestamp_sec
+                if center is not None:
+                    match['center'] = center  # follow slow movement across frames
 
-    survivors = [e for e in events if e.duration_sec >= min_duration_sec]
+    # Drop too-brief events as noise — but ONLY for soft pose cues. Direct
+    # object evidence (a phone/laptop in frame) is always kept, even a single
+    # sighting, since a momentary glimpse is still a genuine violation.
+    survivors = [
+        e for e in events
+        if e.behavior_type in config.DIRECT_EVIDENCE_BEHAVIORS
+        or e.duration_sec >= min_duration_sec
+    ]
     survivors.sort(key=lambda e: e.start_sec)
     return survivors
 
@@ -193,10 +249,18 @@ def _write_annotated_video(
 
     Boxes/labels are drawn on the frames whose detections back a surviving
     event; a small banner persists across each event window. Every original
-    frame is written exactly once so the duration is preserved. Returns the
-    output path, or ``None`` if the video could not be re-opened for writing.
+    frame is written exactly once so the duration is preserved.
+
+    OpenCV writes a ``mp4v`` intermediate (reliable, but Chrome plays it poorly);
+    it is then re-encoded to browser-friendly H.264 with ffmpeg when available
+    (system or the bundled ``imageio-ffmpeg``). Returns the output path, or
+    ``None`` if the video could not be re-opened for writing.
     """
+    import os
+
     import cv2
+
+    from .face_tracker import _reencode_h264, _safe_remove
 
     meta = read_metadata(video_path)
     capture = cv2.VideoCapture(str(video_path))
@@ -204,9 +268,12 @@ def _write_annotated_video(
         capture.release()
         return None
 
+    # Write mp4v first; ffmpeg transcodes it to H.264 afterwards. avc1 is avoided
+    # because the OpenH264 library it needs is often broken on Windows.
+    raw_path = f'{output_path}.raw.mp4'
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     writer = cv2.VideoWriter(
-        str(output_path), fourcc, meta.fps or 30.0, (meta.width, meta.height)
+        str(raw_path), fourcc, meta.fps or 30.0, (meta.width, meta.height)
     )
 
     by_frame = _surviving_detections_by_frame(detections, events)
@@ -231,6 +298,16 @@ def _write_annotated_video(
     finally:
         capture.release()
         writer.release()
+
+    if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+        _safe_remove(raw_path)
+        return None
+
+    if _reencode_h264(raw_path, str(output_path)):
+        _safe_remove(raw_path)
+    else:
+        # No ffmpeg (or it failed): keep the OpenCV mp4v output at the final path.
+        os.replace(raw_path, str(output_path))
     return str(output_path)
 
 

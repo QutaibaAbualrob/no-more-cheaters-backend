@@ -381,6 +381,7 @@ class AuditLog(models.Model):
         REPORT_GENERATED = 'REPORT_GENERATED', 'Report Generated'
         USER_CREATED = 'USER_CREATED', 'User Created'
         USER_DELETED = 'USER_DELETED', 'User Deleted'
+        EXAM_DELETED = 'EXAM_DELETED', 'Exam Deleted'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(

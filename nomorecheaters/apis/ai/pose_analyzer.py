@@ -40,28 +40,29 @@ class PoseAnalyzer:
         model_path: str = config.POSE_MODEL,
         keypoint_confidence: float = config.POSE_CONFIDENCE,
         looking_away_ratio: float = config.LOOKING_AWAY_RATIO,
-        device: str = config.DEVICE,
+        device=None,
     ):
         self.model_path = model_path
         self.keypoint_confidence = keypoint_confidence
         self.looking_away_ratio = looking_away_ratio
-        self.device = device
+        # `0` means GPU; `'cpu'` means CPU. Resolved at analysis time.
+        self.device = device if device is not None else config.resolve_device()
         self._model = None
 
     @property
     def model(self):
-        """Lazily load (and on first run, download) the pose weights."""
+        """Lazily load (and on first run, download) the pose weights onto the device."""
         if self._model is None:
             from ultralytics import YOLO
 
             self._model = YOLO(self.model_path)
+            self._model.to(self.device)
         return self._model
 
     def analyze(self, frame) -> list[PoseDetection]:
         """Return a looking-away flag per person whose head is turned."""
-        predict_kwargs = {'verbose': False}
-        if self.device:
-            predict_kwargs['device'] = self.device
+        # Pass device explicitly; `0` (GPU) is falsy so it must not be gated.
+        predict_kwargs = {'verbose': False, 'device': self.device}
 
         results = self.model(frame, **predict_kwargs)
 
