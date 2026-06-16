@@ -966,7 +966,13 @@ class InviteRespondView(APIView):
     permission_classes = [AllowAny]
     accepted = True  # overridden per-URL via .as_view(accepted=...)
 
-    def get(self, request, token):
+    def post(self, request, token):
+        # POST, not GET: responding to an invite mutates state (joins a
+        # workspace / sets the invite status), so it must not happen on a GET.
+        # Email security scanners and link-preview bots issue GET requests when
+        # they pre-fetch the link in the invite email; with a GET handler that
+        # silently accepted/declined the invite before the human ever clicked
+        # (RFC 7231 §4.2.1 — GET must be safe). The frontend page now POSTs.
         invite = get_object_or_404(
             WorkspaceInvite.objects.select_related('instructor', 'dean', 'exam', 'workspace'),
             token=token,

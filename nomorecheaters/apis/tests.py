@@ -980,6 +980,57 @@ class SendWorkspaceInviteMembershipTests(TestCase):
         self.assertEqual(invite.exam_id, exam.id)
 
 
+class InviteRespondMethodTests(APITestCase):
+    """Invite accept/decline must be POST, not a GET with side effects."""
+
+    def _invite(self):
+        from apis.models import Workspace, WorkspaceInvite
+
+        dean = make_user(username='deanIR', email='deanir@example.com',
+                         role=User.Role.DEAN)
+        instructor = make_user(username='instIR', email='instir@example.com')
+        workspace = Workspace.objects.create(name='Stats Dept', owner=dean)
+        invite = WorkspaceInvite.objects.create(
+            dean=dean, instructor=instructor, workspace=workspace)
+        return invite
+
+    def test_get_is_rejected_with_no_side_effect(self):
+        from apis.models import WorkspaceInvite
+
+        invite = self._invite()
+        response = self.client.get(
+            reverse('invite_accept', kwargs={'token': invite.token}))
+
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+        invite.refresh_from_db()
+        # The bot's GET prefetch must not have accepted the invite.
+        self.assertEqual(invite.status, WorkspaceInvite.Status.PENDING)
+
+    def test_post_accept_joins_workspace(self):
+        from apis.models import WorkspaceInvite, WorkspaceMembership
+
+        invite = self._invite()
+        response = self.client.post(
+            reverse('invite_accept', kwargs={'token': invite.token}))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        invite.refresh_from_db()
+        self.assertEqual(invite.status, WorkspaceInvite.Status.ACCEPTED)
+        self.assertTrue(WorkspaceMembership.objects.filter(
+            workspace=invite.workspace, instructor=invite.instructor).exists())
+
+    def test_post_decline_sets_declined(self):
+        from apis.models import WorkspaceInvite
+
+        invite = self._invite()
+        response = self.client.post(
+            reverse('invite_decline', kwargs={'token': invite.token}))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        invite.refresh_from_db()
+        self.assertEqual(invite.status, WorkspaceInvite.Status.DECLINED)
+
+
 class DuplicateVideoHashTests(TestCase):
     """Issue 7 / FR4: duplicate video uploads must be rejected cleanly."""
 
