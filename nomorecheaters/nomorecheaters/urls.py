@@ -39,9 +39,13 @@ urlpatterns = [
     ),
     # Password reset: the link in the reset email lands on the frontend's
     # /account/password/reset/key/<uid>/<token>/ page.
-    # ⚠ The frontend route uses :key (single segment) but the URL has two
-    # segments (uid/token). The frontend route needs to be changed to a splat
-    # (*) — tracked as FE-BUG-01.
+    #
+    # The frontend route is a splat — `/account/password/reset/key/*` (App.tsx)
+    # — so it captures BOTH the uid and token segments; PasswordResetLink reads
+    # the splat and api/auth.ts splits the trailing /<uid>/<token>/ back apart to
+    # POST the confirm endpoint. The two-segment format below therefore matches
+    # the SPA route (FE-BUG-01 / M14 resolved). PasswordResetRedirectTests pins
+    # this Location format so the two halves cannot silently drift again.
     #
     # dj-rest-auth reverses 'password_reset_confirm' to build the reset link.
     # We redirect that to the React SPA so the user lands on the frontend form.

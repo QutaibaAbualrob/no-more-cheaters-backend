@@ -1226,6 +1226,27 @@ class MediaUrlForTests(TestCase):
         self.assertIsNone(_media_url_for(''))
 
 
+class PasswordResetRedirectTests(TestCase):
+    """M14 / FE-BUG-01: the reset-email redirect must hand the SPA both the uid
+    and the token as path segments, matching the frontend's splat route."""
+
+    def test_confirm_redirect_carries_uid_and_token_segments(self):
+        from django.conf import settings
+
+        uid, token = 'MQ', 'set-abc123def'
+        response = self.client.get(
+            reverse('password_reset_confirm', kwargs={'uid': uid, 'token': token}))
+
+        self.assertEqual(response.status_code, 302)
+        expected = (settings.FRONTEND_URL.rstrip('/')
+                    + f'/account/password/reset/key/{uid}/{token}/')
+        self.assertEqual(response['Location'], expected)
+        # The frontend splat reads the last two '/'-segments as uid/token, so the
+        # tail must be exactly two segments — not one combined ':key'.
+        tail = response['Location'].split('/account/password/reset/key/', 1)[1]
+        self.assertEqual([p for p in tail.split('/') if p], [uid, token])
+
+
 class ExamDeleteOrderingTests(APITestCase):
     """M11: exam deletion must finish before the 'cancelled' emails go out."""
 
