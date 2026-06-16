@@ -97,13 +97,24 @@ class UserReadSerializer(serializers.ModelSerializer):
     """Read-only representation of a user account.
 
     Exposes only non-sensitive fields; passwords and permissions are
-    intentionally excluded.
+    intentionally excluded. ``display_name`` is the real name the user entered at
+    signup (``get_full_name()``), falling back to the auto-generated username
+    only when no name was captured — so user cards never show the random
+    username suffix when a real name exists.
     """
+
+    display_name = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ['id', 'email', 'username', 'role', 'is_active', 'created_at']
+        fields = [
+            'id', 'email', 'username', 'first_name', 'last_name',
+            'display_name', 'role', 'is_active', 'created_at',
+        ]
         read_only_fields = fields
+
+    def get_display_name(self, obj):
+        return (obj.get_full_name() or '').strip() or obj.username
 
 
 class UserCreateSerializer(serializers.ModelSerializer):
@@ -125,12 +136,15 @@ class UserCreateSerializer(serializers.ModelSerializer):
 class UserUpdateSerializer(serializers.ModelSerializer):
     """Update an existing user's profile fields (admin only).
 
-    Password changes are handled separately by dj-rest-auth.
+    The real name is stored in ``first_name`` / ``last_name`` (shown as
+    ``display_name``); the admin edit form writes those, not the username, so
+    renaming a user never corrupts their login username. Password changes are
+    handled separately by dj-rest-auth.
     """
 
     class Meta:
         model = User
-        fields = ['email', 'username', 'role', 'is_active']
+        fields = ['email', 'username', 'first_name', 'last_name', 'role', 'is_active']
 
 
 class NotificationSerializer(serializers.ModelSerializer):
