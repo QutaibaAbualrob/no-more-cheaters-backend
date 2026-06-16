@@ -74,17 +74,23 @@ def run_analysis(job_id, actor_id=None):
     session = job.session
     actor = User.objects.filter(id=actor_id).first() if actor_id else None
 
+    # build_ai_report runs the heavy pipeline and manages its own short DB
+    # transactions internally; it is deliberately NOT wrapped in an outer
+    # transaction here, so no connection/locks are held during the minutes of
+    # CPU/GPU/ffmpeg work (C4).
     try:
-        with transaction.atomic():
-            report = build_ai_report(session, job=job)
-            job.status = AnalysisJob.Status.COMPLETED
-            job.completed_at = timezone.now()
-            job.save(update_fields=['status', 'completed_at'])
-            session.status = ExamSession.Status.COMPLETED
-            session.save(update_fields=['status', 'updated_at'])
+        report = build_ai_report(session, job=job)
     except Exception as exc:  # noqa: BLE001 — record failure then re-raise
         _mark_failed(job, session, str(exc))
         raise
+
+    # Flip job + session to COMPLETED in a short transaction.
+    with transaction.atomic():
+        job.status = AnalysisJob.Status.COMPLETED
+        job.completed_at = timezone.now()
+        job.save(update_fields=['status', 'completed_at'])
+        session.status = ExamSession.Status.COMPLETED
+        session.save(update_fields=['status', 'updated_at'])
 
     video_id = str(session.video.id) if hasattr(session, 'video') else str(session.id)
     record_audit_log(AuditLog.ActionType.ANALYSIS_COMPLETED, user=actor, target_resource=video_id)

@@ -712,7 +712,6 @@ def _attach_alert_evidence(video, session, alerts):
     Alert.objects.bulk_update(alerts, ['snapshot_url', 'clip_url', 'metadata'])
 
 
-@transaction.atomic
 def build_ai_report(session, job=None):
     """Run the real YOLO/OpenCV pipeline for *session* and persist findings.
 
@@ -726,6 +725,12 @@ def build_ai_report(session, job=None):
     Re-running replaces any prior alerts for the session so the report always
     reflects the latest analysis. Heavy dependencies (OpenCV, ultralytics) are
     imported lazily here so the service module stays cheap to import.
+
+    Transaction boundaries (C4): the multi-minute ``analyze_video`` pass and the
+    per-alert evidence I/O (face tracking, JPEG/MP4 writes, ffmpeg) run OUTSIDE
+    any database transaction. Only the quick row writes are wrapped in short
+    ``atomic`` blocks, so a DB connection and row locks are never held while the
+    CPU/GPU/ffmpeg work runs.
     """
     from .ai import analyze_video
 
@@ -748,8 +753,6 @@ def build_ai_report(session, job=None):
         pose_confidence=confidence_floor,
     )
 
-    # Replace prior detections so a re-analysis is not double-counted.
-    session.alerts.all().delete()
     alerts = [
         Alert(
             session=session,
@@ -767,9 +770,17 @@ def build_ai_report(session, job=None):
         )
         for event in result.events
     ]
-    Alert.objects.bulk_create(alerts)
+    # Persist the alert rows in a short transaction. Replacing prior detections
+    # (so a re-analysis is not double-counted) and creating the new ones is the
+    # only DB work here; the analyze_video pass above ran with no transaction
+    # open, and the evidence I/O below runs with none open either (C4).
+    with transaction.atomic():
+        session.alerts.all().delete()
+        Alert.objects.bulk_create(alerts)
 
-    # Enrich each alert with a face crop, a 3-second clip, and a person id.
+    # Enrich each alert with a face crop, a 3-second clip, and a person id. This
+    # is filesystem/ffmpeg I/O (minutes for long videos) and deliberately runs
+    # OUTSIDE a transaction; it commits its own per-alert bulk_update at the end.
     _attach_alert_evidence(video, session, alerts)
 
     # Aggregate from the persisted alerts (now enriched with person ids), so the
@@ -792,26 +803,29 @@ def build_ai_report(session, job=None):
     else:
         summary = 'No suspicious activity detected in this session.'
 
-    report, _created = Report.objects.update_or_create(
-        session=session,
-        defaults={
-            'overall_cheating_probability': probability,
-            'total_alerts': total_alerts,
-            'alerts_by_type': alerts_by_type,
-            'processing_time_seconds': processing_time,
-            'summary': summary,
-        },
-    )
+    # Persist the aggregate report (and the job's analysis metadata) in a short
+    # transaction — again, no I/O is held open here (C4).
+    with transaction.atomic():
+        report, _created = Report.objects.update_or_create(
+            session=session,
+            defaults={
+                'overall_cheating_probability': probability,
+                'total_alerts': total_alerts,
+                'alerts_by_type': alerts_by_type,
+                'processing_time_seconds': processing_time,
+                'summary': summary,
+            },
+        )
 
-    if job is not None:
-        job_metadata = dict(job.metadata or {})
-        job_metadata.update({
-            'analysis': result.metadata,
-            'annotated_video_path': result.annotated_video_path,
-            'annotated_video_url': _media_url_for(result.annotated_video_path),
-        })
-        job.metadata = job_metadata
-        job.save(update_fields=['metadata'])
+        if job is not None:
+            job_metadata = dict(job.metadata or {})
+            job_metadata.update({
+                'analysis': result.metadata,
+                'annotated_video_path': result.annotated_video_path,
+                'annotated_video_url': _media_url_for(result.annotated_video_path),
+            })
+            job.metadata = job_metadata
+            job.save(update_fields=['metadata'])
 
     return report
 
