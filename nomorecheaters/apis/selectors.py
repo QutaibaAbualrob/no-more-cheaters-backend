@@ -68,6 +68,9 @@ def owned_videos(user):
         'session',
         'session__exam',
         'session__exam__instructor',
+        # OneToOne sources for VideoReadSerializer's annotated_video_url + analysis.
+        'session__analysis_job',
+        'session__report',
     )
     if is_admin(user):
         return queryset
@@ -222,6 +225,10 @@ def visible_videos(user):
     """Uploaded videos whose session reports *user* may view (History scope)."""
     return (
         Video.objects
-        .select_related('session', 'session__exam', 'session__exam__instructor')
+        .select_related(
+            'session', 'session__exam', 'session__exam__instructor',
+            # OneToOne sources for VideoReadSerializer's annotated_video_url + analysis.
+            'session__analysis_job', 'session__report',
+        )
         .filter(session__exam__in=visible_exams(user))
     )

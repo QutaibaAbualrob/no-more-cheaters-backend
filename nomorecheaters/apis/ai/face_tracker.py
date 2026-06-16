@@ -1,14 +1,19 @@
 """Per-person face tracking and per-alert evidence extraction.
 
 Built entirely on OpenCV (already a pipeline dependency) — no extra packages.
-It provides three capabilities used to enrich :class:`~apis.models.Alert` rows
+It provides capabilities used to enrich :class:`~apis.models.Alert` rows
 with visual evidence for the analysis report:
 
-1. :func:`track_persons` sweeps the video with a Haar-cascade face detector and
-   greedily links face detections across frames into persistent *tracks*. Tracks
-   are labelled ``person_1``, ``person_2`` … ordered left-to-right by mean
-   horizontal position, so the same person keeps the same label for the whole
-   video (matching the live-overlay convention on the frontend).
+1. :func:`index_from_person_boxes` builds the per-person tracks from boxes the
+   YOLO pose pass already produced (see :func:`apis.ai.detector.analyze_video`),
+   so the main pipeline never scans the video an extra time (H6).
+   :func:`track_persons` is the standalone fallback: it sweeps the video with a
+   Haar-cascade face detector when no YOLO boxes are available (e.g. a direct
+   evidence call outside the pipeline). Both greedily link detections across
+   frames into persistent *tracks* labelled ``person_1``, ``person_2`` … ordered
+   left-to-right by mean horizontal position, so the same person keeps the same
+   label for the whole video (matching the live-overlay convention on the
+   frontend).
 2. :func:`extract_face_crop` saves the cropped face of the flagged person at an
    alert's timestamp (falls back to a centred crop when no face is tracked).
 3. :func:`extract_clip` saves a short clip that STARTS at an alert's timestamp
@@ -60,6 +65,10 @@ class PersonIndex:
     tracks: dict
     frame_width: int
     frame_height: int
+    # Whether the stored boxes are whole-person boxes (from YOLO, H6) or face
+    # boxes (from the Haar fallback). The evidence layer crops a head region out
+    # of a person box for the avatar, but uses a face box as-is.
+    box_kind: str = 'face'
 
     @property
     def person_count(self) -> int:
@@ -167,13 +176,47 @@ def track_persons(video_path: str, sample_every_n: int = 15) -> PersonIndex:
     finally:
         capture.release()
 
-    # Relabel left-to-right so labels are stable and intuitive in the report.
+    return _index_from_tracks(tracks, width, height, box_kind='face')
+
+
+def index_from_person_boxes(frame_boxes, frame_width: int, frame_height: int) -> PersonIndex:
+    """Build a :class:`PersonIndex` from pre-detected per-frame person boxes.
+
+    *frame_boxes* is an iterable of ``(timestamp_sec, [bbox_xyxy, …])`` in
+    ascending time order — exactly what the YOLO pose pass harvests during the
+    main analysis (see :func:`apis.ai.detector.analyze_video`). The same greedy
+    centroid tracker and left-to-right labelling as :func:`track_persons` are
+    reused, but no video is opened: this consumes boxes the pipeline already has,
+    eliminating the redundant Haar-cascade sweep (H6). Requires no OpenCV, so it
+    also runs in tests without model weights or a real video.
+    """
+    diagonal = math.hypot(frame_width, frame_height) or 1.0
+    match_threshold = diagonal * _MATCH_DIST_FRACTION
+
+    tracks: list[_Track] = []
+    for timestamp, boxes in frame_boxes:
+        # Reuse the (x, y, w, h)-based matcher: convert each xyxy box first.
+        faces = [
+            (x1, y1, x2 - x1, y2 - y1)
+            for (x1, y1, x2, y2) in boxes
+            if x2 > x1 and y2 > y1
+        ]
+        _assign_faces(tracks, faces, float(timestamp), match_threshold)
+
+    return _index_from_tracks(tracks, frame_width, frame_height, box_kind='person')
+
+
+def _index_from_tracks(tracks: list[_Track], width: int, height: int,
+                       box_kind: str) -> PersonIndex:
+    """Relabel raw tracks left-to-right into a queryable :class:`PersonIndex`."""
     tracks.sort(key=lambda t: t.mean_cx)
     labelled = {
         f'person_{i + 1}': sorted(track.samples, key=lambda s: s[0])
         for i, track in enumerate(tracks)
     }
-    return PersonIndex(tracks=labelled, frame_width=width, frame_height=height)
+    return PersonIndex(
+        tracks=labelled, frame_width=width, frame_height=height, box_kind=box_kind,
+    )
 
 
 def _assign_faces(tracks: list[_Track], faces, timestamp: float, match_threshold: float) -> None:
@@ -296,13 +339,18 @@ def _draw_person_boxes(cv2, frame, boxes, flagged_person_id, behavior_label: str
 
 
 def extract_face_crop(video_path: str, timestamp_sec: float, bbox, out_path: str,
-                      pad: float = 0.3) -> bool:
+                      pad: float = 0.3, head_fraction: float | None = None) -> bool:
     """Save a cropped face JPEG at *timestamp_sec* to *out_path* (no overlay).
 
-    *bbox* is an ``(x1, y1, x2, y2)`` face box (typically from :func:`track_persons`);
-    when ``None`` a centred crop of the frame is used as a best-effort fallback.
-    The crop is taken from the unmodified frame so the avatar shows a clean face.
-    Returns ``True`` on success.
+    *bbox* is an ``(x1, y1, x2, y2)`` box; when ``None`` a centred crop of the
+    frame is used as a best-effort fallback. The crop is taken from the
+    unmodified frame so the avatar shows a clean face.
+
+    *head_fraction* handles whole-person boxes (from YOLO, H6): when set, the box
+    is first narrowed to its top fraction of height — the head/shoulders region —
+    so a tall full-body box still yields a face-like avatar rather than a tiny
+    standing figure. Leave it ``None`` for face boxes (the Haar fallback), which
+    are cropped as-is. Returns ``True`` on success.
     """
     import cv2
 
@@ -320,6 +368,10 @@ def extract_face_crop(video_path: str, timestamp_sec: float, bbox, out_path: str
         h, w = frame.shape[:2]
         if bbox is not None:
             x1, y1, x2, y2 = bbox
+            if head_fraction is not None:
+                # Person box → keep only the top slice (head/shoulders) so the
+                # avatar isn't a tiny full-body figure.
+                y2 = y1 + (y2 - y1) * max(0.05, min(1.0, head_fraction))
             bw, bh = (x2 - x1), (y2 - y1)
             x1 = int(max(0, x1 - bw * pad))
             y1 = int(max(0, y1 - bh * pad))
@@ -414,7 +466,7 @@ def _ffmpeg_exe():
         return None
 
 
-def _reencode_h264(src_path: str, dst_path: str) -> bool:
+def _reencode_h264(src_path: str, dst_path: str, timeout: float = 120) -> bool:
     """Re-encode *src_path* to a browser-playable H.264 MP4 at *dst_path*.
 
     OpenCV writes the temp clip as ``mp4v`` (MPEG-4 Part 2), which Chrome/Firefox
@@ -424,6 +476,13 @@ def _reencode_h264(src_path: str, dst_path: str) -> bool:
     the bundled :func:`_ffmpeg_exe`. Returns ``True`` only when a non-empty output
     file was produced; the caller keeps the mp4v clip otherwise, so a missing
     ffmpeg never breaks analysis.
+
+    *timeout* bounds the ffmpeg call so a wedged process can never hang the rq
+    worker forever (M7). The default suits the short evidence clips; the
+    full-length annotated-video re-encode passes a larger, duration-scaled
+    budget (see :func:`apis.ai.detector._reencode_timeout_for`) so a long but
+    healthy transcode is not killed prematurely. A timeout — like any ffmpeg
+    failure — returns ``False``, leaving the caller to fall back to the mp4v file.
     """
     ffmpeg = _ffmpeg_exe()
     if not ffmpeg:
@@ -441,7 +500,7 @@ def _reencode_h264(src_path: str, dst_path: str) -> bool:
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=120,
+            timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -504,37 +563,41 @@ def extract_clip(video_path: str, timestamp_sec: float, out_path: str,
     writer = _make_writer(cv2, raw_path, fps, (width, height))
     if writer is None:
         capture.release()
+        _safe_remove(raw_path)  # _make_writer may have left a 0-byte stub
         return False
 
-    written = 0
+    # Wrap the intermediate lifecycle so the ``.raw.mp4`` is never orphaned (M8):
+    # on success it is moved onto the final path; on a crash between writing and
+    # re-encoding the finally still removes it (``_safe_remove`` no-ops if gone).
     try:
-        capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        current = start_frame
-        while current <= end_frame:
-            grabbed, frame = capture.read()
-            if not grabbed:
-                break
-            if drawable:
-                _draw_person_boxes(cv2, frame, drawable, flagged_person_id, behavior_label)
-            elif fallback is not None:
-                _draw_box_with_label(cv2, frame, fallback[0], _FLAGGED_COLOR, fallback[1])
-            writer.write(frame)
-            written += 1
-            current += 1
+        written = 0
+        try:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            current = start_frame
+            while current <= end_frame:
+                grabbed, frame = capture.read()
+                if not grabbed:
+                    break
+                if drawable:
+                    _draw_person_boxes(cv2, frame, drawable, flagged_person_id, behavior_label)
+                elif fallback is not None:
+                    _draw_box_with_label(cv2, frame, fallback[0], _FLAGGED_COLOR, fallback[1])
+                writer.write(frame)
+                written += 1
+                current += 1
+        finally:
+            writer.release()
+            capture.release()
+
+        if written <= 0:
+            return False
+
+        if not _reencode_h264(raw_path, out_path):
+            # No ffmpeg (or it failed): keep the OpenCV clip at the final path.
+            os.replace(raw_path, out_path)
+        return os.path.exists(out_path) and os.path.getsize(out_path) > 0
     finally:
-        writer.release()
-        capture.release()
-
-    if written <= 0:
         _safe_remove(raw_path)
-        return False
-
-    if _reencode_h264(raw_path, out_path):
-        _safe_remove(raw_path)
-    else:
-        # No ffmpeg (or it failed): keep the OpenCV clip at the final path.
-        os.replace(raw_path, out_path)
-    return os.path.exists(out_path) and os.path.getsize(out_path) > 0
 
 
 def _safe_remove(path: str) -> None:

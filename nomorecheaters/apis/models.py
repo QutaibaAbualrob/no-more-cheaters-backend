@@ -317,11 +317,13 @@ class Alert(models.Model):
     """
 
     class BehaviorType(models.TextChoices):
+        # Only behaviours the AI pipeline can actually produce are listed.
+        # MULTIPLE_FACES, OTHER_PERSON, and OBJECT_DETECTED were removed (C2):
+        # there is no detector for them, so advertising them in the schema was
+        # misleading. Phone/laptop come from the object detector and looking-away
+        # from the pose heuristic (see apis/ai/config.py).
         PHONE_DETECTED = 'PHONE_DETECTED', 'Phone Detected'
-        MULTIPLE_FACES = 'MULTIPLE_FACES', 'Multiple Faces'
         LOOKING_AWAY = 'LOOKING_AWAY', 'Looking Away'
-        OTHER_PERSON = 'OTHER_PERSON', 'Other Person Detected'
-        OBJECT_DETECTED = 'OBJECT_DETECTED', 'Unauthorized Object Detected'
         LAPTOPS = 'LAPTOPS', 'Laptop Detected'
 
     class Severity(models.TextChoices):
@@ -398,6 +400,7 @@ class AuditLog(models.Model):
         VIDEO_DELETED = 'VIDEO_DELETED', 'Video Deleted'
         ANALYSIS_STARTED = 'ANALYSIS_STARTED', 'AI Analysis Started'
         ANALYSIS_COMPLETED = 'ANALYSIS_COMPLETED', 'AI Analysis Completed'
+        ANALYSIS_FAILED = 'ANALYSIS_FAILED', 'AI Analysis Failed'
         SETTINGS_CHANGED = 'SETTINGS_CHANGED', 'Settings Changed'
         ALERT_REVIEWED = 'ALERT_REVIEWED', 'Alert Reviewed'
         REPORT_GENERATED = 'REPORT_GENERATED', 'Report Generated'
@@ -482,9 +485,15 @@ class AnalysisJob(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     session = models.OneToOneField(ExamSession, on_delete=models.CASCADE, related_name='analysis_job')
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.QUEUED)
+    # Stamped by the analysis pipeline with the model weights that actually ran
+    # (provenance); blank until the job completes (H3).
     ai_model_version = models.CharField(max_length=100, blank=True)
+    # Frame-sampling stride wired into analyze_video (H2). Default mirrors the
+    # pipeline's own default (apis.ai.config.SAMPLE_EVERY_N_FRAMES = 15); the old
+    # default of 1 was misleading — it read as "every frame" but the pipeline
+    # always sampled every 15th regardless (M9).
     frame_sample_rate = models.PositiveIntegerField(
-        default=1, help_text='Analyze every Nth frame.',
+        default=15, help_text='Analyze every Nth frame (1 = every frame).',
     )
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
@@ -548,6 +557,7 @@ class Notification(models.Model):
         EXAM_ASSIGNED = 'EXAM_ASSIGNED', 'Exam Assigned'
         EXAM_UPDATED = 'EXAM_UPDATED', 'Exam Updated'
         EXAM_CANCELLED = 'EXAM_CANCELLED', 'Exam Cancelled'
+        ANALYSIS_FAILED = 'ANALYSIS_FAILED', 'Analysis Failed'
         WORKSPACE_INVITE = 'WORKSPACE_INVITE', 'Workspace Invite'
         INVITE_ACCEPTED = 'INVITE_ACCEPTED', 'Invite Accepted'
         INVITE_DECLINED = 'INVITE_DECLINED', 'Invite Declined'

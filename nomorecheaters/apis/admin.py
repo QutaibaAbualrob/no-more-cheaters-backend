@@ -2,8 +2,9 @@ from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 
 from .models import (
-    Alert, AnalysisJob, AuditLog, Exam, ExamSession, Report,
-    Student, SystemSettings, User, UserPreferences, Video,
+    Alert, AnalysisJob, AuditLog, AutoExamSession, Exam, ExamSession,
+    Notification, Report, Student, SystemSettings, User, UserPreferences,
+    Video, Workspace, WorkspaceInvite, WorkspaceMembership,
 )
 
 
@@ -152,3 +153,61 @@ class ReportAdmin(admin.ModelAdmin):
     readonly_fields = ['id', 'generated_at']
     list_select_related = ['session', 'session__exam']
     date_hierarchy = 'generated_at'
+
+
+@admin.register(Notification)
+class NotificationAdmin(admin.ModelAdmin):
+    list_display = ['notif_type', 'recipient', 'title', 'is_read', 'is_dismissed', 'created_at']
+    list_filter = ['notif_type', 'is_read', 'is_dismissed', 'created_at']
+    search_fields = ['recipient__email', 'recipient__username', 'title', 'body']
+    autocomplete_fields = ['recipient']
+    readonly_fields = ['id', 'created_at']
+    list_select_related = ['recipient']
+    date_hierarchy = 'created_at'
+
+
+@admin.register(Workspace)
+class WorkspaceAdmin(admin.ModelAdmin):
+    list_display = ['name', 'owner', 'created_at']
+    list_filter = ['created_at']
+    search_fields = ['name', 'owner__email', 'owner__username']
+    autocomplete_fields = ['owner']
+    readonly_fields = ['id', 'created_at']
+    list_select_related = ['owner']
+    date_hierarchy = 'created_at'
+
+
+@admin.register(WorkspaceMembership)
+class WorkspaceMembershipAdmin(admin.ModelAdmin):
+    list_display = ['workspace', 'instructor', 'joined_at']
+    list_filter = ['joined_at']
+    search_fields = ['workspace__name', 'instructor__email', 'instructor__username']
+    autocomplete_fields = ['workspace', 'instructor']
+    readonly_fields = ['id', 'joined_at']
+    list_select_related = ['workspace', 'instructor']
+    date_hierarchy = 'joined_at'
+
+
+@admin.register(WorkspaceInvite)
+class WorkspaceInviteAdmin(admin.ModelAdmin):
+    list_display = ['instructor', 'dean', 'target_name', 'status', 'created_at', 'responded_at']
+    list_filter = ['status', 'created_at', 'responded_at']
+    search_fields = [
+        'instructor__email', 'dean__email', 'workspace__name', 'exam__name',
+    ]
+    autocomplete_fields = ['dean', 'instructor', 'workspace', 'exam']
+    # token is a secret used by the public accept/decline links — never editable.
+    readonly_fields = ['id', 'token', 'created_at', 'responded_at']
+    list_select_related = ['dean', 'instructor', 'workspace', 'exam']
+    date_hierarchy = 'created_at'
+
+
+@admin.register(AutoExamSession)
+class AutoExamSessionAdmin(admin.ModelAdmin):
+    list_display = ['exam', 'instructor', 'scheduled_start', 'scheduled_end', 'is_auto', 'created_at']
+    list_filter = ['is_auto', 'scheduled_start', 'created_at']
+    search_fields = ['exam__name', 'instructor__email', 'instructor__username']
+    autocomplete_fields = ['exam', 'instructor']
+    readonly_fields = ['id', 'created_at']
+    list_select_related = ['exam', 'instructor']
+    date_hierarchy = 'scheduled_start'

@@ -70,20 +70,44 @@ class PoseAnalyzer:
 
     def analyze(self, frame) -> list[PoseDetection]:
         """Return a looking-away flag per person whose head is turned."""
+        return self.analyze_frame(frame)[0]
+
+    def analyze_frame(self, frame) -> tuple[list[PoseDetection], list[tuple]]:
+        """Run the pose model once; return ``(detections, person_boxes)``.
+
+        ``detections`` are the looking-away flags (as :meth:`analyze`).
+        ``person_boxes`` is ``[(bbox_xyxy, confidence), …]`` for **every** person
+        the model detected this frame — independent of head pose — so the
+        evidence layer can track people from these YOLO boxes instead of sweeping
+        the whole video again with a Haar cascade (H6). Both come from the *same*
+        inference, so collecting the boxes costs nothing extra.
+        """
         # Pass device explicitly; `0` (GPU) is falsy so it must not be gated.
         predict_kwargs = {'verbose': False, 'device': self.device}
 
         results = self.model(frame, **predict_kwargs)
 
         detections: list[PoseDetection] = []
+        person_boxes: list[tuple] = []
         for result in results:
+            boxes = getattr(result, 'boxes', None)
+            # Record every detected person's box for tracking, before any of the
+            # looking-away early-exits below can skip a person.
+            if boxes is not None:
+                for box in boxes:
+                    try:
+                        person_bbox = tuple(float(v) for v in box.xyxy[0].tolist())
+                        person_conf = float(box.conf[0])
+                    except (AttributeError, IndexError, TypeError, ValueError):
+                        continue
+                    person_boxes.append((person_bbox, person_conf))
+
             keypoints = getattr(result, 'keypoints', None)
             if keypoints is None or keypoints.xy is None:
                 continue
 
             xy = keypoints.xy  # (persons, 17, 2)
             conf = getattr(keypoints, 'conf', None)  # (persons, 17) or None
-            boxes = getattr(result, 'boxes', None)
 
             for person_idx in range(len(xy)):
                 person_kpts = xy[person_idx]
@@ -140,4 +164,4 @@ class PoseAnalyzer:
                         bbox=bbox,
                     )
                 )
-        return detections
+        return detections, person_boxes

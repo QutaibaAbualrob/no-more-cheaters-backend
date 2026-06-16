@@ -9,6 +9,7 @@ from django.contrib.auth import get_user_model
 from django.core.mail import send_mail
 from django.db import transaction
 from django.db.models import Count
+from django.db.models.functions import TruncDate
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
@@ -30,9 +31,17 @@ THRESHOLD_DEFAULTS = {
     'multiple_faces_threshold': 0.8,
 }
 THRESHOLD_DESCRIPTIONS = {
-    'gaze_threshold': 'Confidence threshold for looking-away detections.',
-    'noise_threshold': 'Confidence threshold for suspicious-audio detections.',
-    'multiple_faces_threshold': 'Confidence threshold for multiple-face detections.',
+    'gaze_threshold': (
+        'Detection sensitivity (0-1): the minimum confidence floor applied to '
+        'both the object (phone/laptop) and looking-away detectors. Lower = more '
+        'sensitive (flags borderline cases).'
+    ),
+    # Reserved: audio analysis is not implemented yet, so this value is accepted
+    # and stored but does not affect analysis. See N3 in critical_problems.md.
+    'noise_threshold': 'Reserved for future suspicious-audio detection (not yet active).',
+    # Reserved: there is no multiple-face detector yet, so this value is accepted
+    # and stored but does not affect analysis. See N3/C2 in critical_problems.md.
+    'multiple_faces_threshold': 'Reserved for future multiple-face detection (not yet active).',
 }
 
 
@@ -132,7 +141,17 @@ def send_workspace_invite(dean, instructor, exam=None, workspace=None):
     supervisor assignment); at least one should be supplied. Returns the created
     :class:`WorkspaceInvite`. A failing mail server is logged but does not abort
     the invite — the row and notification are still saved.
+
+    Inviting an instructor who already belongs to *workspace* is rejected here
+    (M13). The HTTP view pre-checks this, but the guard lives at the service
+    layer so callers that bypass the view — management commands, scripts, the
+    pre-analyze importer — cannot create a duplicate invite for an existing
+    member either.
     """
+    if workspace is not None and WorkspaceMembership.objects.filter(
+            workspace=workspace, instructor=instructor).exists():
+        raise ValidationError('This user is already a member of this workspace')
+
     invite = WorkspaceInvite.objects.create(
         dean=dean, instructor=instructor, exam=exam, workspace=workspace,
     )
@@ -270,20 +289,66 @@ def delete_exam_media(exam):
             shutil.rmtree(media_root / subdir / str(session.id), ignore_errors=True)
 
 
+def clear_session_evidence(session):
+    """Delete a session's on-disk evidence (clip + snapshot) directories.
+
+    Evidence files are named by alert UUID, so a re-analysis writes a fresh set
+    under new names and never overwrites the old ones — left alone, every re-run
+    accumulates orphaned snapshots/<session>/ and clips/<session>/ artifacts on
+    disk even though their Alert rows were deleted (C5). Called before the new
+    evidence is written, so wiping the whole per-session directory is safe.
+    Best-effort: any IO error is logged and skipped so a locked/missing file
+    never blocks the analysis.
+    """
+    media_root = Path(settings.MEDIA_ROOT)
+    for subdir in ('clips', 'snapshots'):
+        target = media_root / subdir / str(session.id)
+        try:
+            shutil.rmtree(target, ignore_errors=True)
+        except Exception:  # noqa: BLE001 — best-effort file cleanup
+            logger.exception('Failed to clear %s for session %s', subdir, session.id)
+
+
 def notify_users(users, notif_type, title, body, metadata=None):
-    """In-app notification + best-effort email for each user in *users*."""
+    """Create an in-app notification for each user, then email them off-thread.
+
+    The in-app notifications are written synchronously — they are fast, durable,
+    and expected to be visible immediately. The email fan-out (the slow, flaky
+    part) is handed to the django-rq ``default`` queue so a request resolving N
+    supervisors never blocks on N sequential SMTP round-trips (H9). When the
+    queue is eager (the dev/test default, no Redis/worker) the emails are sent
+    inline, so behaviour is unchanged without a worker.
+    """
+    recipients = []
     for user in users:
         create_notification(user, notif_type, title, body, metadata=metadata)
-        try:
-            send_mail(
-                subject=title,
-                message=body,
-                from_email=settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[user.email],
-                fail_silently=True,
-            )
-        except Exception:  # noqa: BLE001 — email is best-effort
-            logger.exception('Failed to email %s for %s', user.email, notif_type)
+        email = getattr(user, 'email', '')
+        if email:
+            recipients.append(email)
+
+    if recipients:
+        enqueue_email(recipients, title, body)
+
+
+def enqueue_email(recipients, subject, body):
+    """Fan *subject*/*body* out to *recipients*, off the HTTP thread when possible.
+
+    Hands the SMTP loop to the django-rq ``default`` queue; falls back to sending
+    inline when the queue is eager (no Redis/worker — the dev/test default).
+    Mirrors :func:`enqueue_analysis`'s async/eager handling. The local imports
+    keep django-rq out of the import graph until used and avoid a circular import
+    with :mod:`apis.tasks` (which imports this module).
+    """
+    import django_rq
+
+    from .tasks import send_notification_emails
+
+    payload = list(recipients)
+    queue = django_rq.get_queue('default')
+    if queue.is_async:
+        queue.enqueue(send_notification_emails, payload, subject, body)
+    else:
+        send_notification_emails(payload, subject, body)
 
 
 def respond_to_workspace_invite(invite, accepted):
@@ -328,26 +393,52 @@ def respond_to_workspace_invite(invite, accepted):
     return invite
 
 
+def _coerce_threshold(values, key):
+    """Read threshold *key* from *values* as a float, falling back to default.
+
+    ``SystemSettings.setting_value`` is a free-form CharField and
+    ``UserPreferences.metadata`` is arbitrary JSON, so a stored value can be
+    non-numeric (corruption, a hand-edited row, a bad migration). float() on
+    such a value used to raise ValueError and crash the entire thresholds read
+    path (M2). Here we fall back to the documented default and log the bad
+    value instead, so one corrupt setting degrades gracefully to the default
+    rather than taking down the whole endpoint.
+    """
+    default = THRESHOLD_DEFAULTS[key]
+    raw = values.get(key, default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning('Ignoring non-numeric stored threshold %s=%r; using default %s',
+                       key, raw, default)
+        return float(default)
+
+
 def threshold_payload(values, updated_at=None):
     """Normalise threshold values to the frontend API contract."""
     timestamp = (updated_at or timezone.now()).isoformat()
     return {
-        'gaze_threshold': float(values.get('gaze_threshold', THRESHOLD_DEFAULTS['gaze_threshold'])),
-        'noise_threshold': float(values.get('noise_threshold', THRESHOLD_DEFAULTS['noise_threshold'])),
-        'multiple_faces_threshold': float(values.get(
-            'multiple_faces_threshold',
-            THRESHOLD_DEFAULTS['multiple_faces_threshold'],
-        )),
+        'gaze_threshold': _coerce_threshold(values, 'gaze_threshold'),
+        'noise_threshold': _coerce_threshold(values, 'noise_threshold'),
+        'multiple_faces_threshold': _coerce_threshold(values, 'multiple_faces_threshold'),
         'updated_at': timestamp,
     }
 
 
 def validate_thresholds(payload):
-    """Accept only known threshold keys with numeric values between 0 and 1."""
+    """Accept only known threshold keys with numeric values between 0 and 1.
+
+    Unknown keys are rejected rather than silently dropped (M3): a typo'd key
+    (e.g. ``gaze_treshold``) used to be discarded, so the save "succeeded"
+    while the intended threshold never changed. Surfacing it as a validation
+    error lets the caller fix the key instead of trusting a phantom write.
+    """
     cleaned = {}
     for key, value in payload.items():
         if key not in THRESHOLD_DEFAULTS:
-            continue
+            raise ValidationError(
+                {key: f'Unknown threshold key. Allowed keys: '
+                      f'{", ".join(sorted(THRESHOLD_DEFAULTS))}.'})
         try:
             numeric = float(value)
         except (TypeError, ValueError):
@@ -399,6 +490,29 @@ def build_thresholds_response(user):
     }
 
 
+def effective_detection_confidence(user):
+    """Resolve the active detection-confidence floor (0-1) for *user*.
+
+    This is the bridge that makes the AIThresholds page real: it returns the
+    effective ``gaze_threshold`` (the global default, overridden by the user's
+    saved preference) so :func:`build_ai_report` can feed it to the AI pipeline
+    as the minimum-confidence floor for *both* the object and looking-away
+    detectors. Lower value → more sensitive.
+
+    The ``noise_threshold`` and ``multiple_faces_threshold`` knobs are
+    intentionally NOT consumed here: their features (audio analysis, multi-face
+    detection) do not exist yet, so feeding them to the pipeline would be
+    meaningless. They remain stored/returned as reserved settings.
+    """
+    effective = build_thresholds_response(user)['effective']
+    try:
+        value = float(effective.get('gaze_threshold', THRESHOLD_DEFAULTS['gaze_threshold']))
+    except (TypeError, ValueError):
+        value = THRESHOLD_DEFAULTS['gaze_threshold']
+    # Clamp into the detector's valid range; 0 would disable filtering entirely.
+    return min(1.0, max(0.0, value))
+
+
 def update_user_thresholds(user, payload):
     """Persist per-user threshold overrides."""
     cleaned = validate_thresholds(payload)
@@ -435,6 +549,14 @@ def update_global_thresholds(request, payload):
     return threshold_payload({**get_global_thresholds(), **cleaned}, latest_updated_at)
 
 
+# How many `student_identifier` variants to probe before giving up. Each probe is
+# a `get_or_create` round trip, so an unbounded loop lets one identifier with many
+# uploads (`john`, `john-2`, ... `john-10000`) fire thousands of DB queries and
+# exhaust the connection pool (N4). 100 free slots per identifier is far beyond any
+# legitimate use; past that we stop probing and surface a clean error.
+MAX_UPLOAD_SESSION_ATTEMPTS = 100
+
+
 def get_available_upload_session(instructor, upload, exam_name='', student_identifier=''):
     """Create or reuse a direct-upload session that does not already have a video."""
     resolved_exam_name = exam_name or 'Uploaded Videos'
@@ -446,17 +568,20 @@ def get_available_upload_session(instructor, upload, exam_name='', student_ident
     )
     base_identifier = resolved_student_identifier[:220]
     candidate = base_identifier
-    suffix = 1
 
-    while True:
+    for suffix in range(1, MAX_UPLOAD_SESSION_ATTEMPTS + 1):
         session, _created = ExamSession.objects.get_or_create(
             exam=exam,
             student_identifier=candidate,
         )
         if not hasattr(session, 'video'):
             return session
-        suffix += 1
-        candidate = f'{base_identifier}-{suffix}'
+        candidate = f'{base_identifier}-{suffix + 1}'
+
+    raise ValidationError(
+        f'Could not allocate an upload session for "{base_identifier}" after '
+        f'{MAX_UPLOAD_SESSION_ATTEMPTS} attempts; all are already in use. '
+        'Use a different student identifier.')
 
 
 def recording_session_for(exam):
@@ -524,12 +649,24 @@ def enqueue_analysis(request, video):
     from .tasks import run_analysis
 
     session = video.session
+    # Frame-sampling stride: honour a client-supplied value, else fall back to
+    # the model's (now truthful) default rather than a misleading 1 (H2/M9).
+    # ai_model_version is no longer a client input — it is provenance the
+    # pipeline stamps with the model it actually ran (H3), so it starts blank.
+    default_rate = AnalysisJob._meta.get_field('frame_sample_rate').default
+    try:
+        sample_rate = int(request.data.get('frame_sample_rate', default_rate))
+    except (TypeError, ValueError):
+        sample_rate = default_rate
+    if sample_rate < 1:
+        sample_rate = default_rate
+
     job, _created = AnalysisJob.objects.update_or_create(
         session=session,
         defaults={
             'status': AnalysisJob.Status.QUEUED,
-            'ai_model_version': request.data.get('ai_model_version', 'yolo11x'),
-            'frame_sample_rate': request.data.get('frame_sample_rate', 1),
+            'ai_model_version': '',
+            'frame_sample_rate': sample_rate,
             'started_at': None,
             'completed_at': None,
             'error_message': '',
@@ -598,9 +735,6 @@ def build_demo_report(session):
 _BEHAVIOR_RISK_WEIGHTS = {
     Alert.BehaviorType.PHONE_DETECTED: 1.0,
     Alert.BehaviorType.LAPTOPS: 0.9,
-    Alert.BehaviorType.MULTIPLE_FACES: 0.8,
-    Alert.BehaviorType.OTHER_PERSON: 0.8,
-    Alert.BehaviorType.OBJECT_DETECTED: 0.6,
     Alert.BehaviorType.LOOKING_AWAY: 0.4,
 }
 
@@ -614,43 +748,47 @@ def _severity_for(confidence):
     return Alert.Severity.LOW
 
 
-# Severity → risk weight for the overall report probability (a simple average
-# of these, capped at 1.0).
-_SEVERITY_WEIGHTS = {
-    Alert.Severity.HIGH: 1.0,
-    Alert.Severity.MEDIUM: 0.6,
-    Alert.Severity.LOW: 0.3,
-}
-
-
 def _report_probability(alerts):
-    """Overall cheating probability: mean severity weight, capped at 1.0."""
-    if not alerts:
-        return 0.0
-    weights = [_SEVERITY_WEIGHTS.get(alert.severity, 0.3) for alert in alerts]
-    return round(min(1.0, sum(weights) / len(weights)), 2)
+    """Overall cheating probability from independent weighted evidence.
 
+    Each alert is treated as one independent piece of evidence contributing its
+    behaviour-weighted confidence (``confidence_score · behaviour_weight``); the
+    report score is the probability that *at least one* is a genuine violation:
 
-def _cheating_probability(events):
-    """Combine event confidences into an overall 0–1 cheating probability.
+        ``1 - ∏(1 - confidence·weight)``
 
-    Treats each event as an independent piece of (weighted) evidence and
-    returns the probability that *at least one* is genuine:
-    ``1 - ∏(1 - confidence·weight)``. More/stronger detections push the score
-    up while a single soft cue keeps it modest. Capped at 0.99.
+    This fixes two defects in the old severity-mean formula:
+
+    * **Monotonic (C6):** adding or strengthening evidence can only push the
+      score up, never down. The old arithmetic mean diluted a serious alert as
+      soon as minor ones were added (1 phone = 1.00, but 1 phone + 5 glances =
+      0.42).
+    * **Behaviour-aware (N1):** a phone (weight 1.0) genuinely outweighs a turned
+      head (weight 0.4), and the raw ``confidence_score`` is used directly rather
+      than a 3-bucket severity label. The old formula keyed on severity only, so
+      a sustained head-turn that saturated to HIGH scored an identical 1.00 to a
+      phone — fabricating cheating against honest students.
+
+    Capped at 0.99 (independent evidence never proves certainty).
     """
     surviving_risk = 1.0
-    for event in events:
-        weight = _BEHAVIOR_RISK_WEIGHTS.get(event.behavior_type, 0.5)
-        surviving_risk *= 1.0 - min(1.0, max(0.0, event.confidence) * weight)
+    for alert in alerts:
+        weight = _BEHAVIOR_RISK_WEIGHTS.get(alert.behavior_type, 0.5)
+        confidence = min(1.0, max(0.0, alert.confidence_score or 0.0))
+        surviving_risk *= 1.0 - confidence * weight
     return round(min(0.99, 1.0 - surviving_risk), 2)
 
 
-def _attach_alert_evidence(video, session, alerts):
+def _attach_alert_evidence(video, session, alerts, person_index=None):
     """Attach per-alert visual evidence with a green-boxed flagged person.
 
-    Tracks faces across the recording once (see :mod:`apis.ai.face_tracker`),
-    then for each alert resolves the flagged person near its timestamp and saves
+    *person_index* is the per-person track index the analysis pass already built
+    from YOLO boxes (H6); it is reused as-is so the video is not scanned again.
+    Only when it is ``None`` (a direct evidence call outside the pipeline) does
+    this fall back to :func:`apis.ai.face_tracker.track_persons`, the standalone
+    Haar-cascade sweep.
+
+    For each alert it resolves the flagged person near its timestamp and saves
     three artifacts:
 
     * **crop** (``metadata['crop_url']``) — the flagged face only, no overlay;
@@ -664,88 +802,132 @@ def _attach_alert_evidence(video, session, alerts):
     Best-effort and fully isolated: any OpenCV/IO failure simply leaves that
     artifact empty and never aborts the analysis. URLs are stored as
     ``/media/...`` web paths; the report view turns them into absolute URLs.
+
+    Returns the number of alerts whose evidence was **incomplete** — i.e. an
+    extractor raised (a disk-full or OpenCV error, as opposed to legitimately
+    finding nothing to extract). Each such alert is also stamped with
+    ``metadata['evidence_incomplete'] = True`` (and the failing artifact names in
+    ``metadata['evidence_errors']``) so the partial state is visible rather than
+    silently swallowed (M1). Each alert is processed independently, so a failure
+    midway through never starves the remaining alerts of evidence.
     """
     if not alerts or not getattr(video, 'file', None):
-        return
+        return 0
 
     try:
         from .ai.face_tracker import (
             extract_annotated_frame, extract_clip, extract_face_crop, track_persons,
         )
     except Exception:  # noqa: BLE001 — OpenCV missing → skip evidence entirely
-        return
+        logger.warning('OpenCV/face_tracker unavailable; skipping evidence for session %s', session.id)
+        return len(alerts)
 
     video_path = video.file.path
     media_root = Path(settings.MEDIA_ROOT)
     media_url = '/' + settings.MEDIA_URL.strip('/')
 
-    try:
-        index = track_persons(video_path)
-    except Exception:  # noqa: BLE001
-        index = None
+    # Reuse the pipeline's YOLO-derived index when present; otherwise sweep the
+    # video once with the Haar fallback (H6).
+    index = person_index
+    if index is None:
+        try:
+            index = track_persons(video_path)
+        except Exception:  # noqa: BLE001
+            index = None
 
+    # Person boxes (YOLO) need a head crop for the avatar; face boxes (Haar) are
+    # used as-is.
+    head_fraction = 0.45 if getattr(index, 'box_kind', 'face') == 'person' else None
+
+    incomplete_alerts = 0
     for alert in alerts:
-        person_id, bbox, others = 'person_1', None, {}
-        if index is not None:
+        # Each alert is fully isolated: an unexpected error here (a disk-full
+        # OSError, a corrupt frame) marks just this alert incomplete and moves
+        # on, so a failure partway through can never starve later alerts of
+        # evidence the way an un-caught exception would (M1).
+        failed_artifacts: list[str] = []
+        try:
+            person_id, bbox, others = 'person_1', None, {}
+            if index is not None:
+                try:
+                    person_id, bbox = index.query(alert.timestamp_sec)
+                    others = index.persons_at(alert.timestamp_sec)
+                except Exception:  # noqa: BLE001
+                    person_id, bbox, others = 'person_1', None, {}
+
+            # Human-readable behaviour ("Phone Detected", "Looking Away", …).
+            behavior_label = alert.get_behavior_type_display()
+
+            # All people in the frame, with the flagged person's precise bbox.
+            boxes = dict(others)
+            if bbox is not None:
+                boxes[person_id] = bbox
+            boxes_list = list(boxes.items())
+
+            metadata = dict(alert.metadata or {})
+            metadata['person_id'] = person_id
+            if bbox is not None:
+                x1, y1, x2, y2 = bbox
+                metadata['bbox'] = [
+                    int(round(x1)), int(round(y1)),
+                    int(round(x2 - x1)), int(round(y2 - y1)),
+                ]
+
+            crop_rel = f'snapshots/{session.id}/{alert.id}_crop.jpg'
+            frame_rel = f'snapshots/{session.id}/{alert.id}_frame.jpg'
+            clip_rel = f'clips/{session.id}/{alert.id}.mp4'
+
+            # 1. Clean face crop → avatar (stored in metadata).
             try:
-                person_id, bbox = index.query(alert.timestamp_sec)
-                others = index.persons_at(alert.timestamp_sec)
+                if extract_face_crop(video_path, alert.timestamp_sec, bbox,
+                                      str(media_root / crop_rel), head_fraction=head_fraction):
+                    metadata['crop_url'] = f'{media_url}/{crop_rel}'
             except Exception:  # noqa: BLE001
-                person_id, bbox, others = 'person_1', None, {}
+                failed_artifacts.append('crop')
+                logger.exception('Evidence crop failed for alert %s', alert.id)
+            # 2. Full annotated frame → main evidence image (snapshot_url).
+            try:
+                if extract_annotated_frame(
+                    video_path, alert.timestamp_sec, boxes_list, person_id,
+                    behavior_label, str(media_root / frame_rel),
+                ):
+                    alert.snapshot_url = f'{media_url}/{frame_rel}'
+            except Exception:  # noqa: BLE001
+                failed_artifacts.append('snapshot')
+                logger.exception('Evidence snapshot failed for alert %s', alert.id)
+            # 3. 3-second clip with the overlay on every frame (clip_url).
+            try:
+                if extract_clip(
+                    video_path, alert.timestamp_sec, str(media_root / clip_rel),
+                    boxes=boxes_list, flagged_person_id=person_id, behavior_label=behavior_label,
+                ):
+                    alert.clip_url = f'{media_url}/{clip_rel}'
+            except Exception:  # noqa: BLE001
+                failed_artifacts.append('clip')
+                logger.exception('Evidence clip failed for alert %s', alert.id)
 
-        # Human-readable behaviour ("Phone Detected", "Looking Away", …).
-        behavior_label = alert.get_behavior_type_display()
+            if failed_artifacts:
+                metadata['evidence_incomplete'] = True
+                metadata['evidence_errors'] = failed_artifacts
+                incomplete_alerts += 1
 
-        # All people in the frame, with the flagged person's precise bbox.
-        boxes = dict(others)
-        if bbox is not None:
-            boxes[person_id] = bbox
-        boxes_list = list(boxes.items())
+            alert.metadata = metadata
+        except Exception:  # noqa: BLE001 — one alert must never abort the rest
+            logger.exception('Evidence generation aborted for alert %s', alert.id)
+            aborted_metadata = dict(alert.metadata or {})
+            aborted_metadata['evidence_incomplete'] = True
+            alert.metadata = aborted_metadata
+            incomplete_alerts += 1
 
-        metadata = dict(alert.metadata or {})
-        metadata['person_id'] = person_id
-        if bbox is not None:
-            x1, y1, x2, y2 = bbox
-            metadata['bbox'] = [
-                int(round(x1)), int(round(y1)),
-                int(round(x2 - x1)), int(round(y2 - y1)),
-            ]
+    try:
+        Alert.objects.bulk_update(alerts, ['snapshot_url', 'clip_url', 'metadata'])
+    except Exception:  # noqa: BLE001 — persistence itself failed: nothing saved
+        logger.exception('Failed to persist alert evidence for session %s', session.id)
+        return len(alerts)
 
-        crop_rel = f'snapshots/{session.id}/{alert.id}_crop.jpg'
-        frame_rel = f'snapshots/{session.id}/{alert.id}_frame.jpg'
-        clip_rel = f'clips/{session.id}/{alert.id}.mp4'
-
-        # 1. Clean face crop → avatar (stored in metadata).
-        try:
-            if extract_face_crop(video_path, alert.timestamp_sec, bbox, str(media_root / crop_rel)):
-                metadata['crop_url'] = f'{media_url}/{crop_rel}'
-        except Exception:  # noqa: BLE001
-            pass
-        # 2. Full annotated frame → main evidence image (snapshot_url).
-        try:
-            if extract_annotated_frame(
-                video_path, alert.timestamp_sec, boxes_list, person_id,
-                behavior_label, str(media_root / frame_rel),
-            ):
-                alert.snapshot_url = f'{media_url}/{frame_rel}'
-        except Exception:  # noqa: BLE001
-            pass
-        # 3. 3-second clip with the overlay on every frame (clip_url).
-        try:
-            if extract_clip(
-                video_path, alert.timestamp_sec, str(media_root / clip_rel),
-                boxes=boxes_list, flagged_person_id=person_id, behavior_label=behavior_label,
-            ):
-                alert.clip_url = f'{media_url}/{clip_rel}'
-        except Exception:  # noqa: BLE001
-            pass
-
-        alert.metadata = metadata
-
-    Alert.objects.bulk_update(alerts, ['snapshot_url', 'clip_url', 'metadata'])
+    return incomplete_alerts
 
 
-@transaction.atomic
 def build_ai_report(session, job=None):
     """Run the real YOLO/OpenCV pipeline for *session* and persist findings.
 
@@ -759,6 +941,12 @@ def build_ai_report(session, job=None):
     Re-running replaces any prior alerts for the session so the report always
     reflects the latest analysis. Heavy dependencies (OpenCV, ultralytics) are
     imported lazily here so the service module stays cheap to import.
+
+    Transaction boundaries (C4): the multi-minute ``analyze_video`` pass and the
+    per-alert evidence I/O (face tracking, JPEG/MP4 writes, ffmpeg) run OUTSIDE
+    any database transaction. Only the quick row writes are wrapped in short
+    ``atomic`` blocks, so a DB connection and row locks are never held while the
+    CPU/GPU/ffmpeg work runs.
     """
     from .ai import analyze_video
 
@@ -766,10 +954,25 @@ def build_ai_report(session, job=None):
     if video is None or not video.file:
         raise ValueError('Session has no video file to analyze.')
 
-    result = analyze_video(video.file.path)
+    # Bridge the AIThresholds sensitivity into the pipeline: the exam owner's
+    # effective gaze_threshold becomes the minimum-confidence floor for both
+    # detectors, so the slider actually controls detection (fixes C1).
+    instructor = getattr(session.exam, 'instructor', None)
+    confidence_floor = (
+        effective_detection_confidence(instructor)
+        if instructor is not None
+        else THRESHOLD_DEFAULTS['gaze_threshold']
+    )
+    # Wire the job's frame-sampling stride into the pipeline (H2). Without a job
+    # (e.g. a direct service call) analyze_video uses its own configured default.
+    analyze_kwargs = {
+        'object_confidence': confidence_floor,
+        'pose_confidence': confidence_floor,
+    }
+    if job is not None and job.frame_sample_rate:
+        analyze_kwargs['sample_every_n'] = job.frame_sample_rate
+    result = analyze_video(video.file.path, **analyze_kwargs)
 
-    # Replace prior detections so a re-analysis is not double-counted.
-    session.alerts.all().delete()
     alerts = [
         Alert(
             session=session,
@@ -787,10 +990,33 @@ def build_ai_report(session, job=None):
         )
         for event in result.events
     ]
-    Alert.objects.bulk_create(alerts)
+    # Persist the alert rows in a short transaction. Replacing prior detections
+    # (so a re-analysis is not double-counted) and creating the new ones is the
+    # only DB work here; the analyze_video pass above ran with no transaction
+    # open, and the evidence I/O below runs with none open either (C4).
+    with transaction.atomic():
+        session.alerts.all().delete()
+        Alert.objects.bulk_create(alerts)
 
-    # Enrich each alert with a face crop, a 3-second clip, and a person id.
-    _attach_alert_evidence(video, session, alerts)
+    # The deleted alerts' evidence files (named by old alert UUID) would survive
+    # the row delete above; wipe the per-session clip/snapshot dirs before the
+    # new evidence is written so re-runs don't accumulate orphans on disk (C5).
+    # File I/O, so it runs outside any transaction (C4).
+    clear_session_evidence(session)
+
+    # Enrich each alert with a face crop, a 3-second clip, and a person id. This
+    # is filesystem/ffmpeg I/O (minutes for long videos) and deliberately runs
+    # OUTSIDE a transaction; it commits its own per-alert bulk_update at the end.
+    # Reuse the person index the analysis pass already built from YOLO boxes (H6)
+    # so the video is not swept a third time.
+    incomplete_evidence = _attach_alert_evidence(
+        video, session, alerts, person_index=getattr(result, 'person_index', None),
+    )
+    if incomplete_evidence:
+        logger.warning(
+            'Evidence incomplete for %d of %d alert(s) in session %s',
+            incomplete_evidence, len(alerts), session.id,
+        )
 
     # Aggregate from the persisted alerts (now enriched with person ids), so the
     # report reflects exactly what was saved.
@@ -803,35 +1029,61 @@ def build_ai_report(session, job=None):
             person_ids.add(person_id)
 
     total_alerts = len(alerts)
-    person_count = len(person_ids) or (1 if total_alerts else 0)
+    # Number of *distinct* people the alerts were attributed to. This is only
+    # known when person tracking/evidence actually ran and stamped a person_id
+    # onto the alert metadata; if that failed entirely, person_ids is empty and
+    # the count is genuinely unknown — we must not fabricate "1 person" (M12),
+    # which previously happened via a ``len(...) or 1`` fallback and made the
+    # report claim someone was identified when no one was.
+    person_count = len(person_ids)
     probability = _report_probability(alerts)
     processing_time = result.metadata.get('processing_time_seconds')
 
-    if total_alerts:
+    if not total_alerts:
+        summary = 'No suspicious activity detected in this session.'
+    elif person_count:
         summary = f'{total_alerts} alert(s) detected across {person_count} person(s).'
     else:
-        summary = 'No suspicious activity detected in this session.'
+        summary = (
+            f'{total_alerts} alert(s) detected; the number of people involved '
+            'could not be determined.'
+        )
 
-    report, _created = Report.objects.update_or_create(
-        session=session,
-        defaults={
-            'overall_cheating_probability': probability,
-            'total_alerts': total_alerts,
-            'alerts_by_type': alerts_by_type,
-            'processing_time_seconds': processing_time,
-            'summary': summary,
-        },
-    )
+    # Persist the aggregate report (and the job's analysis metadata) in a short
+    # transaction — again, no I/O is held open here (C4).
+    with transaction.atomic():
+        report, _created = Report.objects.update_or_create(
+            session=session,
+            defaults={
+                'overall_cheating_probability': probability,
+                'total_alerts': total_alerts,
+                'alerts_by_type': alerts_by_type,
+                'processing_time_seconds': processing_time,
+                'summary': summary,
+            },
+        )
 
-    if job is not None:
-        job_metadata = dict(job.metadata or {})
-        job_metadata.update({
-            'analysis': result.metadata,
-            'annotated_video_path': result.annotated_video_path,
-            'annotated_video_url': _media_url_for(result.annotated_video_path),
-        })
-        job.metadata = job_metadata
-        job.save(update_fields=['metadata'])
+        if job is not None:
+            job_metadata = dict(job.metadata or {})
+            job_metadata.update({
+                'analysis': result.metadata,
+                'annotated_video_path': result.annotated_video_path,
+                'annotated_video_url': _media_url_for(result.annotated_video_path),
+                # Surface partial-evidence runs so the frontend can flag that some
+                # alerts are missing their snapshot/clip rather than implying the
+                # absence means "nothing happened" (M1).
+                'evidence_incomplete': bool(incomplete_evidence),
+                'evidence_incomplete_count': incomplete_evidence,
+            })
+            job.metadata = job_metadata
+            # Stamp the model that actually ran (H3): provenance, not a client
+            # input. The object-detection weights identify the run.
+            object_model = ((result.metadata or {}).get('model') or {}).get('object')
+            update_fields = ['metadata']
+            if object_model:
+                job.ai_model_version = str(object_model)[:100]
+                update_fields.append('ai_model_version')
+            job.save(update_fields=update_fields)
 
     return report
 
@@ -849,7 +1101,20 @@ def _media_url_for(filesystem_path):
         rel = Path(filesystem_path).resolve().relative_to(Path(settings.MEDIA_ROOT).resolve())
     except (ValueError, OSError):
         return None
-    return '/' + settings.MEDIA_URL.strip('/') + '/' + str(rel).replace('\\', '/')
+
+    rel_url = str(rel).replace('\\', '/')
+    media_url = settings.MEDIA_URL or '/media/'
+
+    # A CDN/absolute base (has a scheme) is used verbatim. A path-style
+    # MEDIA_URL is normalised to exactly one leading and trailing slash —
+    # falling back to 'media' when it is empty or just '/'. The old code did
+    # '/' + MEDIA_URL.strip('/') + '/...', which collapsed to '//snapshots/...'
+    # for an empty MEDIA_URL: a protocol-relative URL a browser reads as a host
+    # and blocks as mixed content on an HTTPS page (M5).
+    if '://' in media_url:
+        return media_url.rstrip('/') + '/' + rel_url
+    prefix = media_url.strip('/') or 'media'
+    return '/' + prefix + '/' + rel_url
 
 
 def dashboard_stats_for(user):
@@ -870,15 +1135,44 @@ def dashboard_stats_for(user):
 
 
 def activity_series_for(user):
-    """Return seven-day upload and analysis counts for charts."""
+    """Return seven-day upload and analysis counts for charts.
+
+    Two grouped queries — one per series — instead of the old 2·N per-day
+    ``COUNT`` queries (H7). Each truncates the timestamp to a local date, groups,
+    and counts in the database; the rows are then mapped onto the fixed day
+    window, with any day that has no rows reported as 0.
+    """
     videos = owned_videos(user)
     analyses = AnalysisJob.objects.filter(session__in=owned_sessions(user))
     days, labels = recent_day_window()
+    start = days[0]  # window is oldest -> newest, so days[0] is the lower bound
+
+    video_counts = _daily_counts(videos, 'uploaded_at', start)
+    analysis_counts = _daily_counts(analyses, 'created_at', start)
     return {
         'days': labels,
-        'videos': [videos.filter(uploaded_at__date=day).count() for day in days],
-        'analyses': [analyses.filter(created_at__date=day).count() for day in days],
+        'videos': [video_counts.get(day, 0) for day in days],
+        'analyses': [analysis_counts.get(day, 0) for day in days],
     }
+
+
+def _daily_counts(queryset, field_name, start_date):
+    """Return ``{date: row_count}`` for *field_name*, grouped by day in one query.
+
+    Only rows on/after *start_date* are scanned, and ``order_by()`` clears any
+    model default ordering so it cannot leak into (and break) the ``GROUP BY``.
+    The truncation uses the active timezone, matching ``recent_day_window``'s
+    use of :func:`~django.utils.timezone.localdate`.
+    """
+    rows = (
+        queryset
+        .filter(**{f'{field_name}__date__gte': start_date})
+        .annotate(_day=TruncDate(field_name))
+        .order_by()
+        .values('_day')
+        .annotate(_count=Count('pk'))
+    )
+    return {row['_day']: row['_count'] for row in rows}
 
 
 def system_metrics():

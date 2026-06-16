@@ -67,6 +67,11 @@ class AnalysisResult:
     events: list[AlertEvent]
     annotated_video_path: str | None
     metadata: dict = field(default_factory=dict)
+    # Per-person tracks built from the YOLO person boxes harvested during the
+    # analysis pass (H6). The service layer uses this to attribute and box people
+    # in evidence images without re-scanning the video. ``None`` only when the
+    # caller cannot build one; the evidence layer then falls back to its own scan.
+    person_index: object | None = None
 
 
 def _collect_frame_detections(
@@ -74,14 +79,21 @@ def _collect_frame_detections(
     object_detector: ObjectDetector,
     pose_analyzer: PoseAnalyzer,
     sample_every_n: int,
-) -> tuple[list[FrameDetection], int]:
+) -> tuple[list[FrameDetection], int, list[tuple]]:
     """Run both detectors over every sampled frame.
 
     The two detectors are independent per frame; they are invoked back to back
     here. (They could be fanned out to threads, but sharing a single CUDA model
     across threads is fragile, so the pipeline keeps them sequential.)
+
+    Alongside the behaviour detections this also harvests, per sampled frame, the
+    full set of person bounding boxes the pose model already produced — returned
+    as ``person_frames`` (``[(timestamp_sec, [bbox_xyxy, …]), …]``). The evidence
+    layer tracks people from these YOLO boxes rather than scanning the video a
+    third time with a Haar cascade (H6).
     """
     detections: list[FrameDetection] = []
+    person_frames: list[tuple] = []
     frames_analyzed = 0
     for sample in iter_sampled_frames(video_path, sample_every_n=sample_every_n):
         frames_analyzed += 1
@@ -95,7 +107,8 @@ def _collect_frame_detections(
                     timestamp_sec=sample.timestamp_sec,
                 )
             )
-        for pose in pose_analyzer.analyze(sample.frame):
+        pose_detections, person_boxes = pose_analyzer.analyze_frame(sample.frame)
+        for pose in pose_detections:
             detections.append(
                 FrameDetection(
                     behavior_type=pose.behavior_type,
@@ -105,7 +118,11 @@ def _collect_frame_detections(
                     timestamp_sec=sample.timestamp_sec,
                 )
             )
-    return detections, frames_analyzed
+        if person_boxes:
+            person_frames.append(
+                (sample.timestamp_sec, [bbox for bbox, _conf in person_boxes])
+            )
+    return detections, frames_analyzed, person_frames
 
 
 def _bbox_center(bbox) -> tuple[float, float, float] | None:
@@ -126,15 +143,19 @@ def _bbox_center(bbox) -> tuple[float, float, float] | None:
 
 
 def _same_track(center_a, center_b, factor: float = 0.75) -> bool:
-    """Whether two bbox centres are close enough to be the same person/object.
+    """Whether two *known* bbox centres are close enough to be the same person.
 
     The distance threshold scales with box size so it adapts to camera distance.
-    Either centre being ``None`` (no usable box) returns ``True`` — such
-    detections fall back to pure temporal merging rather than spawning spurious
-    extra events.
+    Both centres must be present: a ``None`` centre means the detection had no
+    usable box, and with no location we cannot prove two detections share a
+    person, so this returns ``False``. The missing-box case is handled by the
+    caller's temporal fallback (see :func:`consolidate_events`) — it is
+    deliberately NOT collapsed here, because returning ``True`` on ``None``
+    merged two different students who both fell back to ``(0,0,0,0)`` into a
+    single event and under-counted people (H11).
     """
     if center_a is None or center_b is None:
-        return True
+        return False
     ax, ay, a_size = center_a
     bx, by, b_size = center_b
     distance = ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
@@ -213,6 +234,20 @@ def consolidate_events(
             for track in tracks:
                 if (det.timestamp_sec - track['last_ts']) > merge_window_sec:
                     continue
+                if center is None or track['center'] is None:
+                    # At least one side has no usable box, so we cannot place
+                    # them spatially. Fall back to temporal continuity — but
+                    # only across *different* frames. Two detections of the
+                    # same behaviour in the SAME frame are necessarily
+                    # different people (the pose model emits at most one
+                    # looking-away per person per frame), so they must not
+                    # collapse into one event (H11). ``items`` is sorted by
+                    # timestamp, so ``last_ts >= det.timestamp_sec`` means the
+                    # track already has a detection from this very frame.
+                    if track['last_ts'] >= det.timestamp_sec:
+                        continue
+                    match = track
+                    break
                 if _same_track(center, track['center']):
                     match = track
                     break
@@ -286,6 +321,19 @@ def _default_output_path(video_path: str) -> str:
     return str(path.with_name(f'{path.stem}_annotated.mp4'))
 
 
+def _reencode_timeout_for(duration_sec: float) -> float:
+    """ffmpeg timeout budget for re-encoding a *duration_sec*-long video (M7).
+
+    The annotated re-encode runs over the WHOLE recording, so a fixed clip-sized
+    timeout would kill a long but healthy transcode. We allow several times
+    real-time and clamp to a sane range: a floor that covers ffmpeg start-up plus
+    very short clips, and a hard ceiling so a genuinely wedged process still can't
+    hold the worker indefinitely.
+    """
+    floor, ceiling, realtime_factor = 120.0, 1800.0, 6.0
+    return max(floor, min(ceiling, (duration_sec or 0.0) * realtime_factor))
+
+
 def _write_annotated_video(
     video_path: str,
     detections: list[FrameDetection],
@@ -325,37 +373,42 @@ def _write_annotated_video(
 
     by_frame = _surviving_detections_by_frame(detections, events)
 
+    # The whole intermediate lifecycle is wrapped so the ``.raw.mp4`` is never
+    # orphaned (M8): on success it is removed or moved onto the final path; on an
+    # unexpected crash between writing and re-encoding the finally still deletes
+    # it. ``_safe_remove`` no-ops when the file is already gone.
     try:
-        frame_number = 0
-        while True:
-            grabbed, frame = capture.read()
-            if not grabbed:
-                break
+        try:
+            frame_number = 0
+            while True:
+                grabbed, frame = capture.read()
+                if not grabbed:
+                    break
 
-            timestamp = frame_number / meta.fps if meta.fps else 0.0
-            active = [e for e in events if e.start_sec <= timestamp <= e.end_sec]
+                timestamp = frame_number / meta.fps if meta.fps else 0.0
+                active = [e for e in events if e.start_sec <= timestamp <= e.end_sec]
 
-            for det in by_frame.get(frame_number, ()):  # boxes on sampled frames
-                _draw_detection(cv2, frame, det)
-            if active:
-                _draw_event_banner(cv2, frame, active)
+                for det in by_frame.get(frame_number, ()):  # boxes on sampled frames
+                    _draw_detection(cv2, frame, det)
+                if active:
+                    _draw_event_banner(cv2, frame, active)
 
-            writer.write(frame)
-            frame_number += 1
+                writer.write(frame)
+                frame_number += 1
+        finally:
+            capture.release()
+            writer.release()
+
+        if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+            return None
+
+        if not _reencode_h264(raw_path, str(output_path),
+                              timeout=_reencode_timeout_for(meta.duration_sec)):
+            # No ffmpeg (or it failed/timed out): keep the OpenCV mp4v output.
+            os.replace(raw_path, str(output_path))
+        return str(output_path)
     finally:
-        capture.release()
-        writer.release()
-
-    if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
         _safe_remove(raw_path)
-        return None
-
-    if _reencode_h264(raw_path, str(output_path)):
-        _safe_remove(raw_path)
-    else:
-        # No ffmpeg (or it failed): keep the OpenCV mp4v output at the final path.
-        os.replace(raw_path, str(output_path))
-    return str(output_path)
 
 
 def _draw_detection(cv2, frame, det: FrameDetection) -> None:
@@ -383,6 +436,7 @@ def analyze_video(
     *,
     sample_every_n: int = config.SAMPLE_EVERY_N_FRAMES,
     object_confidence: float = config.OBJECT_CONFIDENCE,
+    pose_confidence: float = config.POSE_CONFIDENCE,
     annotate: bool = True,
     output_path: str | None = None,
     object_detector: ObjectDetector | None = None,
@@ -397,7 +451,11 @@ def analyze_video(
     sample_every_n:
         Frame-sampling stride (defaults to the configured rate).
     object_confidence:
-        Minimum confidence for object detections.
+        Minimum confidence for object (phone/laptop) detections.
+    pose_confidence:
+        Minimum keypoint confidence before a head-pose is trusted for the
+        looking-away heuristic. Together with *object_confidence* this is how the
+        caller's AIThresholds sensitivity reaches the detectors.
     annotate:
         When ``True`` (default) an annotated MP4 is written next to the source
         (or to *output_path*) and its path is returned in the result.
@@ -414,13 +472,19 @@ def analyze_video(
     started = time.perf_counter()
 
     object_detector = object_detector or ObjectDetector(confidence=object_confidence)
-    pose_analyzer = pose_analyzer or PoseAnalyzer()
+    pose_analyzer = pose_analyzer or PoseAnalyzer(keypoint_confidence=pose_confidence)
 
     meta = read_metadata(video_path)
-    detections, frames_analyzed = _collect_frame_detections(
+    detections, frames_analyzed, person_frames = _collect_frame_detections(
         video_path, object_detector, pose_analyzer, sample_every_n
     )
     events = consolidate_events(detections)
+
+    # Build the per-person index from the YOLO boxes already gathered above, so
+    # evidence attribution reuses this pass instead of a separate Haar sweep (H6).
+    from .face_tracker import index_from_person_boxes
+
+    person_index = index_from_person_boxes(person_frames, meta.width, meta.height)
 
     annotated_path = None
     if annotate and events:
@@ -444,7 +508,16 @@ def analyze_video(
         'frames_analyzed': frames_analyzed,
         'raw_detections': len(detections),
         'sample_every_n': sample_every_n,
+        'object_confidence': object_confidence,
+        'pose_confidence': pose_confidence,
         'processing_time_seconds': processing_time,
+        # Provenance: the model weights actually used this run, read from the
+        # (possibly injected) detector instances rather than assumed from config
+        # so the recorded version is always the one that ran (H3).
+        'model': {
+            'object': object_detector.model_path,
+            'pose': pose_analyzer.model_path,
+        },
         'video': {
             'fps': meta.fps,
             'total_frames': meta.total_frames,
@@ -458,4 +531,5 @@ def analyze_video(
         events=events,
         annotated_video_path=annotated_path,
         metadata=metadata,
+        person_index=person_index,
     )

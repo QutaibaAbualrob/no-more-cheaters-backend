@@ -9,6 +9,8 @@ actual detection work to the service layer (the YOLO/OpenCV pipeline behind
 regardless of how the analysis itself is implemented.
 """
 
+import logging
+
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.utils import timezone
@@ -18,6 +20,66 @@ from .services import build_ai_report, create_notification, record_audit_log
 
 
 User = get_user_model()
+
+logger = logging.getLogger(__name__)
+
+# Cap on the error text persisted to AnalysisJob.error_message. A raw analysis
+# exception can be a several-hundred-line CUDA/ffmpeg traceback (~10KB); storing
+# it verbatim on every failure bloats the unbounded TextField (M10). 2000 chars
+# keeps the exception type and the first frames — where the cause usually is —
+# while bounding the row size.
+_MAX_ERROR_MESSAGE_CHARS = 2000
+
+
+def _truncate_error(message):
+    """Bound a stored error string to ``_MAX_ERROR_MESSAGE_CHARS`` (M10).
+
+    Keeps the head of the message (the exception and its first stack frames) and
+    appends a marker so it is clear the text was clipped. The short, single-line
+    summary used for the audit log / instructor notification is derived
+    separately and is unaffected.
+    """
+    text = message or ''
+    if len(text) <= _MAX_ERROR_MESSAGE_CHARS:
+        return text
+    return text[:_MAX_ERROR_MESSAGE_CHARS] + '\n…[truncated]'
+
+
+def _existing_report_id(job):
+    """Return the str id of the session's report, or ``None`` if not generated yet."""
+    report = getattr(job.session, 'report', None)
+    return str(report.id) if report is not None else None
+
+
+def send_notification_emails(recipients, subject, body):
+    """Send *body* to each address in *recipients* (one email each), best-effort.
+
+    Enqueued by :func:`apis.services.notify_users` so the SMTP fan-out runs in a
+    worker instead of the HTTP request thread (H9): a request that resolves N
+    supervisors no longer blocks on N sequential SMTP round-trips. Each send is
+    isolated — a failure to one address is logged and never blocks the rest — and
+    the job never raises, so rq does not mark the whole batch failed or retry it.
+    Returns the number of addresses sent to.
+    """
+    from django.conf import settings
+    from django.core.mail import send_mail
+
+    sent = 0
+    for email in recipients:
+        if not email:
+            continue
+        try:
+            send_mail(
+                subject=subject,
+                message=body,
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[email],
+                fail_silently=True,
+            )
+            sent += 1
+        except Exception:  # noqa: BLE001 — email is best-effort; keep going
+            logger.exception('Failed to email %s: %s', email, subject)
+    return sent
 
 
 def run_analysis(job_id, actor_id=None):
@@ -38,30 +100,49 @@ def run_analysis(job_id, actor_id=None):
         Optional id of the user who triggered the analysis, attributed to the
         completion audit entries. ``None`` when the job has no human actor.
     """
-    job = (
-        AnalysisJob.objects
-        .select_related('session', 'session__video')
-        .get(id=job_id)
-    )
+    # Atomically claim the job before doing any work: lock the row, and bail out
+    # if it is already PROCESSING or COMPLETED. This stops a duplicate enqueue or
+    # a second worker from re-running a finished analysis — which would delete
+    # the first run's alerts, orphan its evidence files, and overwrite its report
+    # (C7). QUEUED and FAILED jobs are claimable (FAILED so a retry can proceed).
+    with transaction.atomic():
+        job = (
+            AnalysisJob.objects
+            .select_for_update()
+            .select_related('session', 'session__video', 'session__exam')
+            .get(id=job_id)
+        )
+        if job.status in (AnalysisJob.Status.PROCESSING, AnalysisJob.Status.COMPLETED):
+            logger.info(
+                'run_analysis skipped: job %s already %s', job_id, job.status,
+            )
+            return _existing_report_id(job)
+
+        job.status = AnalysisJob.Status.PROCESSING
+        job.started_at = timezone.now()
+        job.error_message = ''
+        job.save(update_fields=['status', 'started_at', 'error_message'])
+
     session = job.session
     actor = User.objects.filter(id=actor_id).first() if actor_id else None
 
-    job.status = AnalysisJob.Status.PROCESSING
-    job.started_at = timezone.now()
-    job.error_message = ''
-    job.save(update_fields=['status', 'started_at', 'error_message'])
-
+    # build_ai_report runs the heavy pipeline and manages its own short DB
+    # transactions internally; it is deliberately NOT wrapped in an outer
+    # transaction here, so no connection/locks are held during the minutes of
+    # CPU/GPU/ffmpeg work (C4).
     try:
-        with transaction.atomic():
-            report = build_ai_report(session, job=job)
-            job.status = AnalysisJob.Status.COMPLETED
-            job.completed_at = timezone.now()
-            job.save(update_fields=['status', 'completed_at'])
-            session.status = ExamSession.Status.COMPLETED
-            session.save(update_fields=['status', 'updated_at'])
+        report = build_ai_report(session, job=job)
     except Exception as exc:  # noqa: BLE001 — record failure then re-raise
-        _mark_failed(job, session, str(exc))
+        _mark_failed(job, session, str(exc), actor=actor)
         raise
+
+    # Flip job + session to COMPLETED in a short transaction.
+    with transaction.atomic():
+        job.status = AnalysisJob.Status.COMPLETED
+        job.completed_at = timezone.now()
+        job.save(update_fields=['status', 'completed_at'])
+        session.status = ExamSession.Status.COMPLETED
+        session.save(update_fields=['status', 'updated_at'])
 
     video_id = str(session.video.id) if hasattr(session, 'video') else str(session.id)
     record_audit_log(AuditLog.ActionType.ANALYSIS_COMPLETED, user=actor, target_resource=video_id)
@@ -80,15 +161,47 @@ def run_analysis(job_id, actor_id=None):
     return str(report.id)
 
 
-def _mark_failed(job, session, error_message):
-    """Flip a job and its session to FAILED, persisting the error message.
+def _mark_failed(job, session, error_message, actor=None):
+    """Flip a job and its session to FAILED, persist the error, and surface it.
 
     Runs outside the rolled-back analysis transaction so the failure state is
-    durably recorded even though the partial work was discarded.
+    durably recorded even though the partial work was discarded. Beyond the
+    status flip it now records an ANALYSIS_FAILED audit entry and notifies the
+    exam's instructor (H5/H12) — previously a failed analysis was completely
+    silent: the job sat in FAILED with no audit trail and no one was told.
+
+    The audit + notification are best-effort: any error raising from them is
+    swallowed (logged) so it can never mask the original analysis exception the
+    caller is about to re-raise, and so the FAILED state is always persisted.
     """
     job.status = AnalysisJob.Status.FAILED
-    job.error_message = error_message
+    job.error_message = _truncate_error(error_message)
     job.completed_at = timezone.now()
     job.save(update_fields=['status', 'error_message', 'completed_at'])
     session.status = ExamSession.Status.FAILED
     session.save(update_fields=['status', 'updated_at'])
+
+    try:
+        video_id = str(session.video.id) if hasattr(session, 'video') else str(session.id)
+        # A raw exception string can be a multi-line CUDA/ffmpeg traceback; keep
+        # the surfaced copy short (the full text stays on job.error_message).
+        short_error = (error_message or 'Unknown error').strip().splitlines()[0][:200]
+        record_audit_log(
+            AuditLog.ActionType.ANALYSIS_FAILED,
+            user=actor,
+            target_resource=video_id,
+            metadata={'session_id': str(session.id), 'error': short_error},
+        )
+
+        instructor = session.exam.instructor
+        if instructor is not None:
+            create_notification(
+                instructor,
+                Notification.NotifType.ANALYSIS_FAILED,
+                f'Analysis failed for {session.exam.name}',
+                'We could not finish analyzing this session. '
+                'Please try running the analysis again.',
+                metadata={'session_id': str(session.id), 'error': short_error},
+            )
+    except Exception:  # noqa: BLE001 — never let notification mask the real error
+        logger.exception('Failed to record/notify analysis failure for job %s', job.id)
