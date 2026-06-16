@@ -30,6 +30,37 @@ def _existing_report_id(job):
     return str(report.id) if report is not None else None
 
 
+def send_notification_emails(recipients, subject, body):
+    """Send *body* to each address in *recipients* (one email each), best-effort.
+
+    Enqueued by :func:`apis.services.notify_users` so the SMTP fan-out runs in a
+    worker instead of the HTTP request thread (H9): a request that resolves N
+    supervisors no longer blocks on N sequential SMTP round-trips. Each send is
+    isolated — a failure to one address is logged and never blocks the rest — and
+    the job never raises, so rq does not mark the whole batch failed or retry it.
+    Returns the number of addresses sent to.
+    """
+    from django.conf import settings
+    from django.core.mail import send_mail
+
+    sent = 0
+    for email in recipients:
+        if not email:
+            continue
+        try:
+            send_mail(
+                subject=subject,
+                message=body,
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[email],
+                fail_silently=True,
+            )
+            sent += 1
+        except Exception:  # noqa: BLE001 — email is best-effort; keep going
+            logger.exception('Failed to email %s: %s', email, subject)
+    return sent
+
+
 def run_analysis(job_id, actor_id=None):
     """Run analysis for a queued :class:`AnalysisJob`.
 

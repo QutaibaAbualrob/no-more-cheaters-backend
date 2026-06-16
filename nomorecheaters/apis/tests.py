@@ -35,7 +35,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from .models import (
-    Alert, AnalysisJob, AuditLog, Exam, ExamSession, Report,
+    Alert, AnalysisJob, AuditLog, Exam, ExamSession, Notification, Report,
     SystemSettings, UserPreferences, Video,
 )
 from .serializers import (
@@ -1638,6 +1638,72 @@ class ActivitySeriesQueryTests(APITestCase):
         # One grouped query per series (videos, analyses) — never 2·N.
         with self.assertNumQueries(2):
             activity_series_for(self.user)
+
+
+class NotifyUsersEmailOffloadTests(APITestCase):
+    """H9: notify_users writes in-app notices inline but offloads SMTP to the queue.
+
+    A request that resolves many supervisors must not block on N sequential
+    emails. The notifications stay synchronous; the email fan-out is enqueued
+    (async) or sent inline only when the queue is eager (dev/test default).
+    """
+
+    @staticmethod
+    def _make_users(n):
+        return [make_user(username=f'sup{i}', email=f'sup{i}@example.com') for i in range(n)]
+
+    def test_inapp_notifications_created_for_all_users(self):
+        from apis.services import notify_users
+
+        users = self._make_users(3)
+        notify_users(users, Notification.NotifType.EXAM_UPDATED, 'Title', 'Body')
+
+        for user in users:
+            self.assertEqual(Notification.objects.filter(recipient=user).count(), 1)
+
+    def test_eager_queue_sends_emails_inline(self):
+        from django.core import mail
+
+        from apis.services import notify_users
+
+        users = self._make_users(3)
+        notify_users(users, Notification.NotifType.EXAM_UPDATED, 'Subj', 'Body')
+
+        self.assertEqual(len(mail.outbox), 3)
+        self.assertEqual({m.to[0] for m in mail.outbox}, {u.email for u in users})
+
+    def test_async_queue_enqueues_email_job_and_skips_inline_send(self):
+        from django.core import mail
+
+        from apis.services import notify_users
+        from apis.tasks import send_notification_emails
+
+        users = self._make_users(2)
+        fake_queue = mock.Mock()
+        fake_queue.is_async = True
+
+        with mock.patch('django_rq.get_queue', return_value=fake_queue):
+            notify_users(users, Notification.NotifType.EXAM_CANCELLED, 'Subj', 'Body')
+
+        # In-app notices are still written inline.
+        self.assertEqual(Notification.objects.filter(recipient__in=users).count(), 2)
+        # The SMTP fan-out was handed to the queue, not run on this thread.
+        fake_queue.enqueue.assert_called_once()
+        args = fake_queue.enqueue.call_args.args
+        self.assertIs(args[0], send_notification_emails)
+        self.assertEqual(set(args[1]), {u.email for u in users})
+        self.assertEqual(args[2], 'Subj')
+        self.assertEqual(len(mail.outbox), 0)  # nothing emailed on the HTTP thread
+
+    def test_worker_sends_one_email_per_recipient_and_skips_blanks(self):
+        from django.core import mail
+
+        from apis.tasks import send_notification_emails
+
+        sent = send_notification_emails(['a@example.com', '', 'b@example.com'], 'S', 'B')
+
+        self.assertEqual(sent, 2)  # the blank address is skipped
+        self.assertEqual({m.to[0] for m in mail.outbox}, {'a@example.com', 'b@example.com'})
 
 
 class PreanalyzeDemosCommandTests(TestCase):

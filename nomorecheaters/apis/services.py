@@ -240,19 +240,45 @@ def clear_session_evidence(session):
 
 
 def notify_users(users, notif_type, title, body, metadata=None):
-    """In-app notification + best-effort email for each user in *users*."""
+    """Create an in-app notification for each user, then email them off-thread.
+
+    The in-app notifications are written synchronously — they are fast, durable,
+    and expected to be visible immediately. The email fan-out (the slow, flaky
+    part) is handed to the django-rq ``default`` queue so a request resolving N
+    supervisors never blocks on N sequential SMTP round-trips (H9). When the
+    queue is eager (the dev/test default, no Redis/worker) the emails are sent
+    inline, so behaviour is unchanged without a worker.
+    """
+    recipients = []
     for user in users:
         create_notification(user, notif_type, title, body, metadata=metadata)
-        try:
-            send_mail(
-                subject=title,
-                message=body,
-                from_email=settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[user.email],
-                fail_silently=True,
-            )
-        except Exception:  # noqa: BLE001 — email is best-effort
-            logger.exception('Failed to email %s for %s', user.email, notif_type)
+        email = getattr(user, 'email', '')
+        if email:
+            recipients.append(email)
+
+    if recipients:
+        enqueue_email(recipients, title, body)
+
+
+def enqueue_email(recipients, subject, body):
+    """Fan *subject*/*body* out to *recipients*, off the HTTP thread when possible.
+
+    Hands the SMTP loop to the django-rq ``default`` queue; falls back to sending
+    inline when the queue is eager (no Redis/worker — the dev/test default).
+    Mirrors :func:`enqueue_analysis`'s async/eager handling. The local imports
+    keep django-rq out of the import graph until used and avoid a circular import
+    with :mod:`apis.tasks` (which imports this module).
+    """
+    import django_rq
+
+    from .tasks import send_notification_emails
+
+    payload = list(recipients)
+    queue = django_rq.get_queue('default')
+    if queue.is_async:
+        queue.enqueue(send_notification_emails, payload, subject, body)
+    else:
+        send_notification_emails(payload, subject, body)
 
 
 def respond_to_workspace_invite(invite, accepted):
