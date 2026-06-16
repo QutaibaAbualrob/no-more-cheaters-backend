@@ -708,6 +708,8 @@ class VideoWorkflowAPITests(APITestCase):
         self.assertEqual(Video.objects.count(), 1)
         self.assertEqual(response.data['session_status'], ExamSession.Status.PENDING)
         self.assertEqual(AuditLog.objects.filter(action=AuditLog.ActionType.VIDEO_UPLOADED).count(), 1)
+        # 201 advertises the new resource via Location (no body-parse needed).
+        self.assertIn(str(Video.objects.get().id), response['Location'])
 
     def test_analyze_video_creates_job_alert_report_and_updates_history(self):
         session = make_session(exam=make_exam(instructor=self.user))
@@ -1407,6 +1409,9 @@ class AsyncQueueWiringTests(APITestCase):
         self.assertNotIn('analysis', response.data)
         fake_queue.enqueue.assert_called_once()
         self.assertIs(fake_queue.enqueue.call_args.args[0], run_analysis)
+        # 202 carries client-guidance headers: when to poll, and where.
+        self.assertEqual(response['Retry-After'], '5')
+        self.assertIn(str(video.id), response['Location'])
 
         # The job is persisted as QUEUED and no report exists until a worker runs.
         job = AnalysisJob.objects.get(session=video.session)

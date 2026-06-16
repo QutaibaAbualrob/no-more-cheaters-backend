@@ -1,6 +1,7 @@
 from django.contrib.auth import get_user_model
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
+from django.urls import reverse
 from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
@@ -257,7 +258,15 @@ class VideoUploadView(APIView):
             target_resource=str(video.id),
             metadata={'filename': video.original_filename, 'session': str(video.session_id)},
         )
-        return Response(VideoReadSerializer(video, context={'request': request}).data, status=status.HTTP_201_CREATED)
+        response = Response(
+            VideoReadSerializer(video, context={'request': request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+        # Location points at the newly created resource so the client can follow
+        # it without parsing the body for the id (RFC 7231 §7.1.2).
+        response['Location'] = request.build_absolute_uri(
+            reverse('videos_detail', kwargs={'pk': video.id}))
+        return response
 
 
 class AnalyzeVideoView(APIView):
@@ -270,6 +279,11 @@ class AnalyzeVideoView(APIView):
     ``202 Accepted`` and the client polls the video/report endpoints for
     completion.
     """
+
+    # Hint (seconds) for how soon a client should poll after a 202. The job is
+    # typically still QUEUED on return with a real worker; a few seconds avoids
+    # a tight poll loop without making the UI feel stalled.
+    RETRY_AFTER_SECONDS = 5
 
     def post(self, request, pk):
         video = get_object_or_404(owned_videos(request.user), pk=pk)
@@ -294,7 +308,14 @@ class AnalyzeVideoView(APIView):
                 'created_at',
             ))
             return Response(payload)
-        return Response(payload, status=status.HTTP_202_ACCEPTED)
+
+        response = Response(payload, status=status.HTTP_202_ACCEPTED)
+        # Tell the client when to poll and where: Retry-After is the suggested
+        # delay, Location is the resource whose status it should re-fetch.
+        response['Retry-After'] = str(self.RETRY_AFTER_SECONDS)
+        response['Location'] = request.build_absolute_uri(
+            reverse('videos_detail', kwargs={'pk': video.id}))
+        return response
 
 
 class VideoHistoryView(APIView):
