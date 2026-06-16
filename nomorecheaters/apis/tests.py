@@ -1226,6 +1226,215 @@ class MediaUrlForTests(TestCase):
         self.assertIsNone(_media_url_for(''))
 
 
+class _FakeDetection:
+    """Duck-types a yolo/pose detection: behavior_type, confidence, bbox."""
+
+    def __init__(self, behavior_type, confidence, bbox):
+        self.behavior_type = behavior_type
+        self.confidence = confidence
+        self.bbox = bbox
+
+
+class _FakeObjectDetector:
+    """Stands in for the YOLO object detector — the third-party model boundary.
+
+    Returns scripted detections keyed by the frame token (we set each sampled
+    frame's payload to its timestamp), so the REAL detector→consolidation
+    orchestration runs without OpenCV, torch, or model weights.
+    """
+
+    model_path = 'fake-object-model.pt'
+
+    def __init__(self, script):
+        self._script = script
+
+    def detect(self, frame):
+        return list(self._script.get(frame, []))
+
+
+class _FakePoseAnalyzer:
+    """Stands in for the pose analyzer; also emits the per-frame person boxes."""
+
+    model_path = 'fake-pose-model.pt'
+
+    def __init__(self, pose_script, person_script):
+        self._pose = pose_script
+        self._persons = person_script
+
+    def analyze_frame(self, frame):
+        return list(self._pose.get(frame, [])), list(self._persons.get(frame, []))
+
+
+def _scripted_pipeline_io():
+    """A deterministic 5-second clip script for the integration tests.
+
+    Three people, sampled twice a second:
+      * a phone visible in a SINGLE sampled frame (direct evidence — must survive
+        despite zero duration),
+      * two distinct people (left + right) looking away for a sustained 2s (must
+        stay two separate events, not merge — H11),
+      * one centre person looking away for a single frame (a blip that must be
+        dropped by the min-duration noise filter).
+    Person boxes are emitted only for the two sustained people, so the YOLO-box
+    person index (H6) resolves exactly two people.
+    """
+    from apis.ai import config
+
+    sample_ts = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5]
+    left = (30, 100, 130, 200)
+    right = (510, 100, 610, 200)
+    centre = (270, 100, 370, 200)
+
+    obj_script = {1.0: [_FakeDetection(config.PHONE_DETECTED, 0.92, (200, 150, 260, 210))]}
+    pose_script = {0.0: [_FakeDetection(config.LOOKING_AWAY, 0.70, centre)]}
+    person_script = {}
+    for ts in (2.0, 2.5, 3.0, 3.5, 4.0):
+        pose_script[ts] = [
+            _FakeDetection(config.LOOKING_AWAY, 0.80, left),
+            _FakeDetection(config.LOOKING_AWAY, 0.75, right),
+        ]
+        person_script[ts] = [(left, 0.9), (right, 0.9)]
+    return sample_ts, obj_script, pose_script, person_script
+
+
+def _fake_frame_samples(sample_ts):
+    from apis.ai.frame_extractor import FrameSample
+
+    # The frame payload is the timestamp, which the fake detectors key off.
+    return [FrameSample(frame=ts, frame_number=i, timestamp_sec=ts)
+            for i, ts in enumerate(sample_ts)]
+
+
+def _fake_video_metadata():
+    from apis.ai.frame_extractor import VideoMetadata
+
+    return VideoMetadata(fps=30.0, total_frames=150, duration_sec=5.0,
+                         width=640, height=480)
+
+
+class AIPipelineIntegrationTests(TestCase):
+    """H10: exercise the REAL pipeline end to end (frame sampling →
+    detection → temporal consolidation → person tracking → Alert/Report),
+    with only the YOLO model and the OpenCV frame I/O stubbed. The existing
+    suite mocks ``analyze_video`` wholesale; these tests do not."""
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
+
+    def test_analyze_video_orchestration(self):
+        from apis.ai import analyze_video
+
+        sample_ts, obj_script, pose_script, person_script = _scripted_pipeline_io()
+
+        with mock.patch('apis.ai.detector.read_metadata',
+                        return_value=_fake_video_metadata()), \
+                mock.patch('apis.ai.detector.iter_sampled_frames',
+                           side_effect=lambda *a, **k: iter(_fake_frame_samples(sample_ts))):
+            result = analyze_video(
+                '/does/not/exist.mp4',
+                annotate=False,
+                object_detector=_FakeObjectDetector(obj_script),
+                pose_analyzer=_FakePoseAnalyzer(pose_script, person_script),
+            )
+
+        # Three surviving events: 1 phone + 2 distinct people looking away.
+        self.assertEqual(result.metadata['events_by_type'],
+                         {'PHONE_DETECTED': 1, 'LOOKING_AWAY': 2})
+        self.assertEqual(len(result.events), 3)
+
+        # The phone survived as direct evidence despite a single-frame sighting.
+        phone = [e for e in result.events if e.behavior_type == 'PHONE_DETECTED']
+        self.assertEqual(len(phone), 1)
+        self.assertEqual(phone[0].frame_count, 1)
+
+        # Two distinct people looking away stayed two events, not one (H11); the
+        # centre person's single-frame blip was dropped by the duration filter.
+        looking = [e for e in result.events if e.behavior_type == 'LOOKING_AWAY']
+        self.assertEqual(len(looking), 2)
+        self.assertTrue(all(e.duration_sec >= 2.0 for e in looking))
+
+        # The person index built from the harvested YOLO boxes saw two people (H6).
+        self.assertEqual(len(result.person_index.tracks), 2)
+
+        # Metadata provenance reflects the (injected) models that actually ran (H3).
+        self.assertEqual(result.metadata['frames_analyzed'], 10)
+        self.assertEqual(result.metadata['raw_detections'], 12)  # 1 phone + 1 + 5*2 pose
+        self.assertEqual(result.metadata['model']['object'], 'fake-object-model.pt')
+        self.assertIsNone(result.annotated_video_path)  # annotate=False
+
+    def test_build_ai_report_end_to_end(self):
+        import logging
+
+        from apis.ai import detector as ai_detector
+        from apis.services import build_ai_report
+
+        instructor = make_user()
+        session = make_session(exam=make_exam(instructor=instructor))
+        Video.objects.create(
+            session=session,
+            file=SimpleUploadedFile('clip.mp4', fake_video_bytes(b'integration'),
+                                    content_type='video/mp4'),
+            original_filename='clip.mp4',
+            file_hash=hashlib.sha256(b'integration').hexdigest(),
+            size_bytes=128,
+        )
+
+        sample_ts, obj_script, pose_script, person_script = _scripted_pipeline_io()
+        real_analyze = ai_detector.analyze_video
+        captured = {}
+
+        def fake_analyze(path, **kwargs):
+            # Record the kwargs the service threaded in (C1: the instructor's
+            # confidence floor reaches the detectors), then run the REAL pipeline
+            # with injected detectors and no annotation (no OpenCV needed).
+            captured.update(kwargs)
+            return real_analyze(
+                path,
+                annotate=False,
+                object_detector=_FakeObjectDetector(obj_script),
+                pose_analyzer=_FakePoseAnalyzer(pose_script, person_script),
+            )
+
+        # Without OpenCV the per-alert evidence extractors fail and the M1
+        # isolation logic logs each one. That degraded path is not what this test
+        # asserts (it checks the Alert/Report mapping), so quiet the noise.
+        logging.disable(logging.CRITICAL)
+        try:
+            with mock.patch('apis.ai.analyze_video', side_effect=fake_analyze), \
+                    mock.patch('apis.ai.detector.read_metadata',
+                               return_value=_fake_video_metadata()), \
+                    mock.patch('apis.ai.detector.iter_sampled_frames',
+                               side_effect=lambda *a, **k: iter(_fake_frame_samples(sample_ts))):
+                report = build_ai_report(session)
+        finally:
+            logging.disable(logging.NOTSET)
+
+        # The consolidated events became Alert rows and one aggregate Report.
+        self.assertEqual(report.total_alerts, 3)
+        self.assertEqual(report.alerts_by_type,
+                         {'PHONE_DETECTED': 1, 'LOOKING_AWAY': 2})
+        self.assertGreater(report.overall_cheating_probability, 0.0)
+        self.assertLessEqual(report.overall_cheating_probability, 1.0)
+        self.assertIn('3 alert(s) detected', report.summary)
+
+        alerts = list(session.alerts.all())
+        self.assertEqual(len(alerts), 3)
+        self.assertEqual({a.behavior_type for a in alerts},
+                         {'PHONE_DETECTED', 'LOOKING_AWAY'})
+        self.assertTrue(all((a.metadata or {}).get('source') == 'ai-pipeline'
+                            for a in alerts))
+
+        # C1: the AIThresholds-derived confidence floor was wired into the pipeline.
+        self.assertIn('object_confidence', captured)
+        self.assertIn('pose_confidence', captured)
+
+
 class PasswordResetRedirectTests(TestCase):
     """M14 / FE-BUG-01: the reset-email redirect must hand the SPA both the uid
     and the token as path segments, matching the frontend's splat route."""
