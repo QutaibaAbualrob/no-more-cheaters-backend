@@ -569,9 +569,6 @@ def build_demo_report(session):
 _BEHAVIOR_RISK_WEIGHTS = {
     Alert.BehaviorType.PHONE_DETECTED: 1.0,
     Alert.BehaviorType.LAPTOPS: 0.9,
-    Alert.BehaviorType.MULTIPLE_FACES: 0.8,
-    Alert.BehaviorType.OTHER_PERSON: 0.8,
-    Alert.BehaviorType.OBJECT_DETECTED: 0.6,
     Alert.BehaviorType.LOOKING_AWAY: 0.4,
 }
 

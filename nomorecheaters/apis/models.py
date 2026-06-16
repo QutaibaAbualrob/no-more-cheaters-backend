@@ -295,11 +295,13 @@ class Alert(models.Model):
     """
 
     class BehaviorType(models.TextChoices):
+        # Only behaviours the AI pipeline can actually produce are listed.
+        # MULTIPLE_FACES, OTHER_PERSON, and OBJECT_DETECTED were removed (C2):
+        # there is no detector for them, so advertising them in the schema was
+        # misleading. Phone/laptop come from the object detector and looking-away
+        # from the pose heuristic (see apis/ai/config.py).
         PHONE_DETECTED = 'PHONE_DETECTED', 'Phone Detected'
-        MULTIPLE_FACES = 'MULTIPLE_FACES', 'Multiple Faces'
         LOOKING_AWAY = 'LOOKING_AWAY', 'Looking Away'
-        OTHER_PERSON = 'OTHER_PERSON', 'Other Person Detected'
-        OBJECT_DETECTED = 'OBJECT_DETECTED', 'Unauthorized Object Detected'
         LAPTOPS = 'LAPTOPS', 'Laptop Detected'
 
     class Severity(models.TextChoices):

@@ -204,7 +204,7 @@ class AlertModelTests(TestCase):
         alert = Alert.objects.create(
             session=make_session(),
             timestamp_sec=30,
-            behavior_type=Alert.BehaviorType.MULTIPLE_FACES,
+            behavior_type=Alert.BehaviorType.LOOKING_AWAY,
             confidence_score=0.75,
         )
 
@@ -378,7 +378,7 @@ class AlertSerializerTests(TestCase):
         alert = Alert.objects.create(
             session=make_session(),
             timestamp_sec=20,
-            behavior_type=Alert.BehaviorType.OTHER_PERSON,
+            behavior_type=Alert.BehaviorType.PHONE_DETECTED,
             confidence_score=0.8,
         )
         serializer = AlertReviewSerializer(
@@ -399,7 +399,7 @@ class AlertSerializerTests(TestCase):
         alert = Alert.objects.create(
             session=make_session(),
             timestamp_sec=20,
-            behavior_type=Alert.BehaviorType.OTHER_PERSON,
+            behavior_type=Alert.BehaviorType.PHONE_DETECTED,
             confidence_score=0.8,
         )
         alert.mark_reviewed(reviewer)
