@@ -557,37 +557,41 @@ def extract_clip(video_path: str, timestamp_sec: float, out_path: str,
     writer = _make_writer(cv2, raw_path, fps, (width, height))
     if writer is None:
         capture.release()
+        _safe_remove(raw_path)  # _make_writer may have left a 0-byte stub
         return False
 
-    written = 0
+    # Wrap the intermediate lifecycle so the ``.raw.mp4`` is never orphaned (M8):
+    # on success it is moved onto the final path; on a crash between writing and
+    # re-encoding the finally still removes it (``_safe_remove`` no-ops if gone).
     try:
-        capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        current = start_frame
-        while current <= end_frame:
-            grabbed, frame = capture.read()
-            if not grabbed:
-                break
-            if drawable:
-                _draw_person_boxes(cv2, frame, drawable, flagged_person_id, behavior_label)
-            elif fallback is not None:
-                _draw_box_with_label(cv2, frame, fallback[0], _FLAGGED_COLOR, fallback[1])
-            writer.write(frame)
-            written += 1
-            current += 1
+        written = 0
+        try:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            current = start_frame
+            while current <= end_frame:
+                grabbed, frame = capture.read()
+                if not grabbed:
+                    break
+                if drawable:
+                    _draw_person_boxes(cv2, frame, drawable, flagged_person_id, behavior_label)
+                elif fallback is not None:
+                    _draw_box_with_label(cv2, frame, fallback[0], _FLAGGED_COLOR, fallback[1])
+                writer.write(frame)
+                written += 1
+                current += 1
+        finally:
+            writer.release()
+            capture.release()
+
+        if written <= 0:
+            return False
+
+        if not _reencode_h264(raw_path, out_path):
+            # No ffmpeg (or it failed): keep the OpenCV clip at the final path.
+            os.replace(raw_path, out_path)
+        return os.path.exists(out_path) and os.path.getsize(out_path) > 0
     finally:
-        writer.release()
-        capture.release()
-
-    if written <= 0:
         _safe_remove(raw_path)
-        return False
-
-    if _reencode_h264(raw_path, out_path):
-        _safe_remove(raw_path)
-    else:
-        # No ffmpeg (or it failed): keep the OpenCV clip at the final path.
-        os.replace(raw_path, out_path)
-    return os.path.exists(out_path) and os.path.getsize(out_path) > 0
 
 
 def _safe_remove(path: str) -> None:

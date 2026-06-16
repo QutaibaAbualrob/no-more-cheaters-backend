@@ -326,38 +326,42 @@ def _write_annotated_video(
 
     by_frame = _surviving_detections_by_frame(detections, events)
 
+    # The whole intermediate lifecycle is wrapped so the ``.raw.mp4`` is never
+    # orphaned (M8): on success it is removed or moved onto the final path; on an
+    # unexpected crash between writing and re-encoding the finally still deletes
+    # it. ``_safe_remove`` no-ops when the file is already gone.
     try:
-        frame_number = 0
-        while True:
-            grabbed, frame = capture.read()
-            if not grabbed:
-                break
+        try:
+            frame_number = 0
+            while True:
+                grabbed, frame = capture.read()
+                if not grabbed:
+                    break
 
-            timestamp = frame_number / meta.fps if meta.fps else 0.0
-            active = [e for e in events if e.start_sec <= timestamp <= e.end_sec]
+                timestamp = frame_number / meta.fps if meta.fps else 0.0
+                active = [e for e in events if e.start_sec <= timestamp <= e.end_sec]
 
-            for det in by_frame.get(frame_number, ()):  # boxes on sampled frames
-                _draw_detection(cv2, frame, det)
-            if active:
-                _draw_event_banner(cv2, frame, active)
+                for det in by_frame.get(frame_number, ()):  # boxes on sampled frames
+                    _draw_detection(cv2, frame, det)
+                if active:
+                    _draw_event_banner(cv2, frame, active)
 
-            writer.write(frame)
-            frame_number += 1
+                writer.write(frame)
+                frame_number += 1
+        finally:
+            capture.release()
+            writer.release()
+
+        if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+            return None
+
+        if not _reencode_h264(raw_path, str(output_path),
+                              timeout=_reencode_timeout_for(meta.duration_sec)):
+            # No ffmpeg (or it failed/timed out): keep the OpenCV mp4v output.
+            os.replace(raw_path, str(output_path))
+        return str(output_path)
     finally:
-        capture.release()
-        writer.release()
-
-    if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
         _safe_remove(raw_path)
-        return None
-
-    if _reencode_h264(raw_path, str(output_path),
-                      timeout=_reencode_timeout_for(meta.duration_sec)):
-        _safe_remove(raw_path)
-    else:
-        # No ffmpeg (or it failed/timed out): keep the OpenCV mp4v output.
-        os.replace(raw_path, str(output_path))
-    return str(output_path)
 
 
 def _draw_detection(cv2, frame, det: FrameDetection) -> None:

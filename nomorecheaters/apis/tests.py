@@ -1604,6 +1604,127 @@ class FfmpegTimeoutTests(APITestCase):
         self.assertFalse(ok)  # caller keeps the mp4v file
 
 
+class RawIntermediateCleanupTests(APITestCase):
+    """M8: the ``.raw.mp4`` OpenCV intermediate is never orphaned on disk.
+
+    Both the annotated-video writer (``detector._write_annotated_video``) and the
+    clip writer (``face_tracker.extract_clip``) stage a mp4v ``.raw.mp4`` then
+    re-encode it to H.264. Previously the intermediate was only deleted on the
+    happy path; a crash (or M7 timeout treated as failure followed by an error)
+    between writing and re-encoding left it behind. The lifecycle is now wrapped
+    in try/finally so it is always removed or promoted onto the final path.
+    """
+
+    # The AI stack (cv2/numpy/ultralytics) is not installed in this environment,
+    # so these tests inject a fake ``cv2`` module that the functions' lazy
+    # ``import cv2`` picks up, plus a writer that lays down a real non-empty
+    # ``.raw.mp4`` so the on-disk cleanup is genuinely observable.
+    _PROP_FPS, _PROP_W, _PROP_H, _PROP_POS = 5, 3, 4, 1
+
+    def _fake_cv2(self, write_error=None):
+        import types
+
+        props = {self._PROP_FPS: 30.0, self._PROP_W: 4, self._PROP_H: 4}
+
+        class FakeCapture:
+            def __init__(self, path):
+                self._n = 0
+
+            def isOpened(self):
+                return True
+
+            def get(self, prop):
+                return props.get(prop, 0)
+
+            def set(self, *a, **k):
+                return True
+
+            def read(self):
+                # Grab a handful of frames then stop, so the clip writer always
+                # records at least one frame regardless of loop bounds.
+                self._n += 1
+                return (True, object()) if self._n <= 3 else (False, None)
+
+            def release(self):
+                pass
+
+        class FakeWriter:
+            def __init__(self, path, *a, **k):
+                with open(str(path), 'wb') as fh:  # non-empty raw intermediate
+                    fh.write(b'\x00' * 1024)
+
+            def isOpened(self):
+                return True
+
+            def write(self, frame):
+                if write_error is not None:
+                    raise write_error
+
+            def release(self):
+                pass
+
+        module = types.ModuleType('cv2')
+        module.CAP_PROP_FPS = self._PROP_FPS
+        module.CAP_PROP_FRAME_WIDTH = self._PROP_W
+        module.CAP_PROP_FRAME_HEIGHT = self._PROP_H
+        module.CAP_PROP_POS_FRAMES = self._PROP_POS
+        module.VideoWriter_fourcc = lambda *a: 0
+        module.VideoCapture = FakeCapture
+        module.VideoWriter = FakeWriter
+        return module, FakeWriter
+
+    def _media(self, name):
+        media_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, media_root, ignore_errors=True)
+        out = Path(media_root) / name
+        return out, Path(str(out) + '.raw.mp4')
+
+    def test_annotated_video_crash_removes_raw(self):
+        from apis.ai import detector
+
+        fake_cv2, _ = self._fake_cv2()
+        out, raw = self._media('annot.mp4')
+
+        with mock.patch.dict('sys.modules', {'cv2': fake_cv2}), \
+                mock.patch('apis.ai.detector.read_metadata',
+                           return_value=SimpleNamespace(fps=30.0, width=4, height=4, duration_sec=1.0)), \
+                mock.patch('apis.ai.face_tracker._reencode_h264', side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                detector._write_annotated_video('video.mp4', [], [], str(out))
+
+        self.assertFalse(raw.exists())  # M8: intermediate cleaned up on crash
+
+    def test_annotated_video_without_ffmpeg_promotes_raw(self):
+        from apis.ai import detector
+
+        fake_cv2, _ = self._fake_cv2()
+        out, raw = self._media('annot.mp4')
+
+        with mock.patch.dict('sys.modules', {'cv2': fake_cv2}), \
+                mock.patch('apis.ai.detector.read_metadata',
+                           return_value=SimpleNamespace(fps=30.0, width=4, height=4, duration_sec=1.0)), \
+                mock.patch('apis.ai.face_tracker._reencode_h264', return_value=False):
+            result = detector._write_annotated_video('video.mp4', [], [], str(out))
+
+        self.assertEqual(result, str(out))
+        self.assertTrue(out.exists())   # raw promoted onto the final path
+        self.assertFalse(raw.exists())  # no leftover intermediate
+
+    def test_clip_crash_removes_raw(self):
+        from apis.ai import face_tracker
+
+        # The writer raises mid-loop (after the .raw.mp4 stub is created), the
+        # exact crash window M8 protects — no dependency on the re-encode patch.
+        fake_cv2, _ = self._fake_cv2(write_error=RuntimeError('boom'))
+        out, raw = self._media('clip.mp4')
+
+        with mock.patch.dict('sys.modules', {'cv2': fake_cv2}):
+            with self.assertRaises(RuntimeError):
+                face_tracker.extract_clip('video.mp4', 5.0, str(out))
+
+        self.assertFalse(raw.exists())  # M8: clip intermediate cleaned up on crash
+
+
 class YoloPersonBoxReuseTests(APITestCase):
     """H6: evidence reuses the YOLO person boxes instead of a Haar sweep.
 
