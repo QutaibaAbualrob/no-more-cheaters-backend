@@ -300,6 +300,13 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
+# Hard cap on the size of an uploaded video, enforced in VideoUploadSerializer
+# (N2). Mirrors `client_max_body_size 1024m` in deploy/nginx.conf so the proxy
+# and the application reject the same threshold — Nginx rejects oversized
+# bodies before they reach Gunicorn, this catches anything that bypasses it
+# (e.g. the dev server, or a misconfigured proxy).
+MAX_UPLOAD_SIZE_BYTES = 1024 * 1024 * 1024  # 1 GiB
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 

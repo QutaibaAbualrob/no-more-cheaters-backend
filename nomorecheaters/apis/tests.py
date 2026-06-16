@@ -126,6 +126,17 @@ def request_for(user):
     return SimpleNamespace(user=user)
 
 
+def fake_video_bytes(unique=b''):
+    """Bytes that pass VideoUploadSerializer's container sniff (N2).
+
+    Begins with a minimal ISO-BMFF ``ftyp`` header so the content-sniff in
+    :meth:`VideoUploadSerializer._looks_like_video` accepts the fixture as a
+    real video. Append ``unique`` bytes to vary the SHA-256 hash between
+    uploads (dedup tests).
+    """
+    return b'\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00' + unique
+
+
 class UserModelTests(TestCase):
     """Verify the custom User model uses UUID primary keys."""
 
@@ -316,7 +327,7 @@ class VideoUploadSerializerTests(TestCase):
     def test_video_upload_serializer_populates_file_metadata(self):
         instructor = make_user()
         session = make_session(exam=make_exam(instructor=instructor))
-        content = b'fake video content'
+        content = fake_video_bytes(b'metadata content')
         upload = SimpleUploadedFile('exam.mp4', content, content_type='video/mp4')
         serializer = VideoUploadSerializer(
             data={'session': str(session.id), 'file': upload, 'duration_seconds': 42},
@@ -344,11 +355,78 @@ class VideoUploadSerializerTests(TestCase):
         self.assertFalse(serializer.is_valid())
         self.assertIn('file', serializer.errors)
 
+    def test_rejects_non_video_disguised_as_mp4(self):
+        """N2: a non-video renamed to .mp4 with no Content-Type must not pass.
+
+        The old check trusted the (absent) Content-Type and the extension, so
+        arbitrary bytes in a ``*.mp4`` would reach OpenCV/ffmpeg.
+        """
+        instructor = make_user()
+        session = make_session(exam=make_exam(instructor=instructor))
+        upload = SimpleUploadedFile(
+            'malware.mp4', b'MZ\x90\x00 not a real video at all', content_type=None,
+        )
+        serializer = VideoUploadSerializer(
+            data={'session': str(session.id), 'file': upload},
+            context={'request': request_for(instructor)},
+        )
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('file', serializer.errors)
+
+    def test_rejects_empty_file(self):
+        instructor = make_user()
+        session = make_session(exam=make_exam(instructor=instructor))
+        upload = SimpleUploadedFile('empty.mp4', b'', content_type='video/mp4')
+        serializer = VideoUploadSerializer(
+            data={'session': str(session.id), 'file': upload},
+            context={'request': request_for(instructor)},
+        )
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn('empty', str(serializer.errors['file']).lower())
+
+    def test_rejects_video_exceeding_max_upload_size(self):
+        instructor = make_user()
+        session = make_session(exam=make_exam(instructor=instructor))
+        upload = SimpleUploadedFile(
+            'big.mp4', fake_video_bytes(b'x' * 200), content_type='video/mp4',
+        )
+        with override_settings(MAX_UPLOAD_SIZE_BYTES=16):
+            serializer = VideoUploadSerializer(
+                data={'session': str(session.id), 'file': upload},
+                context={'request': request_for(instructor)},
+            )
+            self.assertFalse(serializer.is_valid())
+        self.assertIn('maximum upload size', str(serializer.errors['file']).lower())
+
+    def test_accepts_webm_and_avi_container_signatures(self):
+        instructor = make_user()
+        exam = make_exam(instructor=instructor)
+
+        webm = SimpleUploadedFile(
+            'clip.webm', b'\x1a\x45\xdf\xa3' + b'\x00' * 12, content_type='video/webm',
+        )
+        ser_webm = VideoUploadSerializer(
+            data={'session': str(make_session(exam=exam, student_identifier='w').id), 'file': webm},
+            context={'request': request_for(instructor)},
+        )
+        self.assertTrue(ser_webm.is_valid(), ser_webm.errors)
+
+        avi = SimpleUploadedFile(
+            'clip.avi', b'RIFF\x00\x00\x00\x00AVI \x00\x00\x00\x00', content_type='video/x-msvideo',
+        )
+        ser_avi = VideoUploadSerializer(
+            data={'session': str(make_session(exam=exam, student_identifier='a').id), 'file': avi},
+            context={'request': request_for(instructor)},
+        )
+        self.assertTrue(ser_avi.is_valid(), ser_avi.errors)
+
     def test_instructor_cannot_upload_video_for_another_instructors_session(self):
         owner = make_user(email='owner@example.com', username='owner')
         other = make_user(email='other@example.com', username='other')
         session = make_session(exam=make_exam(instructor=owner))
-        upload = SimpleUploadedFile('exam.mp4', b'fake video', content_type='video/mp4')
+        upload = SimpleUploadedFile('exam.mp4', fake_video_bytes(b'owner'), content_type='video/mp4')
         serializer = VideoUploadSerializer(
             data={'session': str(session.id), 'file': upload},
             context={'request': request_for(other)},
@@ -360,7 +438,7 @@ class VideoUploadSerializerTests(TestCase):
     def test_negative_duration_is_rejected(self):
         instructor = make_user()
         session = make_session(exam=make_exam(instructor=instructor))
-        upload = SimpleUploadedFile('exam.mp4', b'fake video', content_type='video/mp4')
+        upload = SimpleUploadedFile('exam.mp4', fake_video_bytes(b'negdur'), content_type='video/mp4')
         serializer = VideoUploadSerializer(
             data={'session': str(session.id), 'file': upload, 'duration_seconds': -1},
             context={'request': request_for(instructor)},
@@ -620,7 +698,7 @@ class VideoWorkflowAPITests(APITestCase):
         shutil.rmtree(self.media_root, ignore_errors=True)
 
     def test_upload_without_session_creates_default_domain_records(self):
-        upload = SimpleUploadedFile('student-one.mp4', b'video bytes', content_type='video/mp4')
+        upload = SimpleUploadedFile('student-one.mp4', fake_video_bytes(b'student-one'), content_type='video/mp4')
 
         response = self.client.post(reverse('videos_upload'), {'file': upload}, format='multipart')
 
@@ -633,7 +711,7 @@ class VideoWorkflowAPITests(APITestCase):
 
     def test_analyze_video_creates_job_alert_report_and_updates_history(self):
         session = make_session(exam=make_exam(instructor=self.user))
-        upload = SimpleUploadedFile('exam.mp4', b'unique workflow bytes', content_type='video/mp4')
+        upload = SimpleUploadedFile('exam.mp4', fake_video_bytes(b'workflow'), content_type='video/mp4')
         serializer = VideoUploadSerializer(
             data={'session': str(session.id), 'file': upload},
             context={'request': request_for(self.user)},
@@ -666,7 +744,7 @@ class VideoWorkflowAPITests(APITestCase):
         update_user_thresholds(self.user, {'gaze_threshold': 0.3})
 
         session = make_session(exam=make_exam(instructor=self.user))
-        upload = SimpleUploadedFile('exam-threshold.mp4', b'threshold wiring bytes', content_type='video/mp4')
+        upload = SimpleUploadedFile('exam-threshold.mp4', fake_video_bytes(b'threshold'), content_type='video/mp4')
         serializer = VideoUploadSerializer(
             data={'session': str(session.id), 'file': upload},
             context={'request': request_for(self.user)},
@@ -793,7 +871,7 @@ class DuplicateVideoHashTests(TestCase):
         exam = make_exam(instructor=instructor)
         session1 = make_session(exam=exam, student_identifier='s1')
         session2 = make_session(exam=exam, student_identifier='s2')
-        content = b'identical video bytes'
+        content = fake_video_bytes(b'identical')
 
         upload1 = SimpleUploadedFile('exam1.mp4', content, content_type='video/mp4')
         ser1 = VideoUploadSerializer(
@@ -1080,7 +1158,8 @@ class AsyncQueueWiringTests(APITestCase):
         self.settings_override.disable()
         shutil.rmtree(self.media_root, ignore_errors=True)
 
-    def _make_video(self, content=b'queue-wiring bytes'):
+    def _make_video(self, content=None):
+        content = content if content is not None else fake_video_bytes(b'queue-wiring')
         session = make_session(exam=make_exam(instructor=self.user))
         upload = SimpleUploadedFile('queue.mp4', content, content_type='video/mp4')
         serializer = VideoUploadSerializer(
