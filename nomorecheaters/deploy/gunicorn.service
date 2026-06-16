@@ -1,0 +1,39 @@
+# ── No More Cheaters — Gunicorn systemd unit (C3 / finalplan Task 3.5) ───────
+#
+# Serves the Django WSGI app on 127.0.0.1:8000, which the Nginx block in
+# nginx.conf proxies to. Auto-restarts on crash and on reboot.
+#
+# Install:
+#   sudo cp deploy/gunicorn.service /etc/systemd/system/nomorecheaters.service
+#   # edit the ALL-CAPS placeholders below first
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nomorecheaters
+#
+# NOTE: this runs the web app only. The django-rq worker that executes the AI
+# analysis pipeline is a SEPARATE process — run `manage.py rqworker default`
+# under its own unit (rqworker.service) with the same venv/env. Without it,
+# enqueued jobs sit in QUEUED forever (unless RQ_ASYNC is off).
+
+[Unit]
+Description=No More Cheaters Gunicorn daemon
+After=network.target
+
+[Service]
+User=YOUR_DEPLOY_USER
+Group=www-data
+WorkingDirectory=/PATH/TO/no-more-cheaters-backend/nomorecheaters
+
+# Load DJANGO_DEBUG=false, secret key, DB + Redis URLs, ALLOWED_HOSTS, etc.
+EnvironmentFile=/PATH/TO/no-more-cheaters-backend/nomorecheaters/.env
+
+ExecStart=/PATH/TO/venv/bin/gunicorn \
+    --workers 3 \
+    --bind 127.0.0.1:8000 \
+    --timeout 120 \
+    nomorecheaters.wsgi:application
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
