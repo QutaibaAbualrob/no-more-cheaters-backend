@@ -2160,6 +2160,108 @@ class NotifyUsersEmailOffloadTests(APITestCase):
         self.assertEqual({m.to[0] for m in mail.outbox}, {'a@example.com', 'b@example.com'})
 
 
+class DeleteExpiredVideosCommandTests(TestCase):
+    """M6: ``delete_expired_videos`` survives files it cannot delete.
+
+    A stored video file held open (a worker mid-analysis, or a lingering
+    handle on Windows) makes ``file.delete()`` raise ``OSError``. The command
+    must keep that Video row (so the file is retried, not orphaned) and must
+    not let one stuck file abort the sweep and strand every later expired
+    video.
+    """
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
+
+    def _expired_video(self, student_identifier, content):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        session = make_session(student_identifier=student_identifier)
+        return Video.objects.create(
+            session=session,
+            file=SimpleUploadedFile(
+                f'{student_identifier}.mp4', content, content_type='video/mp4'),
+            original_filename=f'{student_identifier}.mp4',
+            file_hash=hashlib.sha256(content).hexdigest(),
+            expires_at=timezone.now() - timedelta(days=1),
+        )
+
+    def test_deletes_expired_video_file_and_row(self):
+        video = self._expired_video('gone', b'expired video bytes')
+        stored_path = Path(self.media_root) / video.file.name
+        self.assertTrue(stored_path.exists())
+
+        call_command('delete_expired_videos', verbosity=0)
+
+        self.assertFalse(Video.objects.filter(id=video.id).exists())
+        self.assertFalse(stored_path.exists())
+        self.assertTrue(
+            AuditLog.objects.filter(
+                action=AuditLog.ActionType.VIDEO_DELETED,
+                target_resource=str(video.id),
+            ).exists())
+
+    def test_dry_run_deletes_nothing(self):
+        video = self._expired_video('keep', b'still here bytes')
+        stored_path = Path(self.media_root) / video.file.name
+
+        call_command('delete_expired_videos', '--dry-run', verbosity=0)
+
+        self.assertTrue(Video.objects.filter(id=video.id).exists())
+        self.assertTrue(stored_path.exists())
+        self.assertFalse(
+            AuditLog.objects.filter(action=AuditLog.ActionType.VIDEO_DELETED).exists())
+
+    def test_locked_file_keeps_row_and_skips_audit(self):
+        from django.core.files.storage import FileSystemStorage
+
+        video = self._expired_video('locked', b'locked video bytes')
+
+        with mock.patch.object(
+            FileSystemStorage, 'delete', autospec=True,
+            side_effect=OSError('file is in use'),
+        ):
+            call_command('delete_expired_videos', verbosity=0)
+
+        # Row kept so the file is retried next run, not orphaned.
+        self.assertTrue(Video.objects.filter(id=video.id).exists())
+        self.assertFalse(
+            AuditLog.objects.filter(action=AuditLog.ActionType.VIDEO_DELETED).exists())
+
+    def test_one_locked_file_does_not_strand_later_videos(self):
+        from django.core.files.storage import FileSystemStorage
+
+        self._expired_video('first', b'first video bytes')
+        self._expired_video('second', b'second video bytes')
+
+        original_delete = FileSystemStorage.delete
+        state = {'calls': 0}
+
+        def flaky_delete(self, name):
+            state['calls'] += 1
+            if state['calls'] == 1:
+                raise OSError('file is in use')
+            return original_delete(self, name)
+
+        with mock.patch.object(
+            FileSystemStorage, 'delete', autospec=True, side_effect=flaky_delete,
+        ):
+            call_command('delete_expired_videos', verbosity=0)
+
+        # One stuck file is kept; the other is still deleted in the same run.
+        self.assertEqual(Video.objects.count(), 1)
+        self.assertEqual(
+            AuditLog.objects.filter(action=AuditLog.ActionType.VIDEO_DELETED).count(), 1)
+
+
 class PreanalyzeDemosCommandTests(TestCase):
     """Task 1.5: the ``preanalyze_demos`` management command.
 
