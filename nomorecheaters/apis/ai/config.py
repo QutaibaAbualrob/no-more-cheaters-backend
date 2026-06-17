@@ -174,8 +174,15 @@ def resolve_device():
     return device
 
 # --- Frame sampling ----------------------------------------------------------
-# Analyse every Nth frame. At ~30fps the default samples roughly twice/second.
-SAMPLE_EVERY_N_FRAMES = max(1, _env_int('AI_SAMPLE_RATE', 15))
+# Analyse every Nth frame. This stride is the single biggest lever on overlay
+# SMOOTHNESS: the client draws a box per sampled frame and linearly interpolates
+# between them, so a smaller stride = more anchor points = tighter, less "jumpy"
+# box motion (and finer-grained alert timing). At ~30fps, 15 sampled ~2x/second
+# (a point every ~0.5s); 5 samples ~6x/second (~0.17s) for visibly smoother
+# tracking. The cost is ~3x more inference — which is exactly what the GPU path
+# (FP16 HALF + warmed/cached models, above) is here to absorb, so this branch
+# defaults to the denser 5. On CPU-only hardware raise AI_SAMPLE_RATE back to 15.
+SAMPLE_EVERY_N_FRAMES = max(1, _env_int('AI_SAMPLE_RATE', 5))
 
 # --- Confidence thresholds ---------------------------------------------------
 # OBJECT_CONFIDENCE is the coarse predict() floor (in the live pipeline it is
