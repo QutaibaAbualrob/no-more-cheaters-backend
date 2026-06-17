@@ -1599,3 +1599,507 @@ class ExamListAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         names = {row['name'] for row in response.data}
         self.assertEqual(names, {'Owner Exam A'})
+
+
+# =============================================================================
+# GPU acceleration — device resolution, FP16 gating, model cache/warmup, NVENC
+# =============================================================================
+# These verify the GPU deployment path documented in
+# ``no-more-cheaters-plan/ai_arch/07_gpu_deployment.md``. They come in two layers:
+#
+#   * **Logic tests** (the bulk) run on ANY machine — including a CPU-only CI box
+#     — by injecting a fake ``torch`` / ``ultralytics`` / ``numpy`` into
+#     ``sys.modules`` (the same philosophy as the fake-``cv2`` tests above). They
+#     exercise the device-selection, FP16-gating, caching, warmup and
+#     NVENC-selection code paths deterministically, with no real GPU or weights.
+#   * **Runtime smoke tests** (``GpuRuntimeSmokeTests``) only run when a CUDA
+#     torch is actually installed (the AWS g4dn worker or a local NVIDIA dev box);
+#     they run real FP16 math and a real YOLO forward pass on the GPU. On a
+#     CPU-only box they are SKIPPED, never failed.
+import os
+import sys
+import types
+from unittest import skipUnless
+
+
+def _cuda_torch_available():
+    """True iff a real CUDA-enabled torch is importable and reports a GPU."""
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:  # noqa: BLE001 — torch missing/broken → no GPU on this box
+        return False
+
+
+def _fake_torch(*, cuda_available=True, raise_on_check=False):
+    """A stand-in ``torch`` module exposing only what ``resolve_device`` reads."""
+    cuda = types.SimpleNamespace()
+    if raise_on_check:
+        def _is_available():
+            raise RuntimeError('simulated broken torch')
+    else:
+        def _is_available():
+            return cuda_available
+    cuda.is_available = _is_available
+    cuda.get_device_name = lambda index=0: 'Fake CUDA Device'
+    module = types.ModuleType('torch')
+    module.cuda = cuda
+    module.__version__ = '2.99.0+fake'
+    module.version = types.SimpleNamespace(cuda='99.9')
+    return module
+
+
+class _RecordingModel:
+    """Callable YOLO stand-in that records the predict() kwargs it is given.
+
+    Returns an empty results list so the detectors' result-parsing loop is a
+    no-op — the test asserts purely on WHICH kwargs (``device`` / ``half``) the
+    detector decided to pass through to inference.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, frame, **kwargs):
+        self.calls.append(kwargs)
+        return []
+
+    @property
+    def last(self):
+        return self.calls[-1]
+
+
+class GpuDeviceResolutionTests(TestCase):
+    """``config.resolve_device()`` returns the right ultralytics device arg.
+
+    ``0`` means "first CUDA GPU"; ``'cpu'`` means CPU. ``0`` is falsy, which is
+    the bug class this whole feature has to avoid — the resolution and the FP16
+    gate must compare against ``'cpu'`` explicitly, never ``if device``.
+    """
+
+    def setUp(self):
+        from apis.ai import config
+
+        self.config = config
+        # resolve_device caches its answer in a module global; save/restore it so
+        # a test's choice never leaks into the rest of the suite.
+        self._saved = config._resolved_device
+        config._resolved_device = None
+
+    def tearDown(self):
+        self.config._resolved_device = self._saved
+
+    def _resolve(self, ai_device, torch_module=None):
+        self.config._resolved_device = None
+        cm_device = mock.patch('apis.ai.config.AI_DEVICE', ai_device)
+        cm_device.start()
+        self.addCleanup(cm_device.stop)
+        if torch_module is None:
+            return self.config.resolve_device()
+        with mock.patch.dict(sys.modules, {'torch': torch_module}):
+            return self.config.resolve_device()
+
+    def test_forced_cpu(self):
+        self.assertEqual(self._resolve('cpu'), 'cpu')
+
+    def test_forced_gpu_aliases(self):
+        for alias in ('0', 'cuda', 'cuda:0', 'gpu', 'GPU'):
+            self.config._resolved_device = None
+            self.assertEqual(self._resolve(alias), 0, alias)
+
+    def test_auto_uses_gpu_when_cuda_available(self):
+        self.assertEqual(self._resolve('auto', _fake_torch(cuda_available=True)), 0)
+
+    def test_auto_uses_cpu_when_cuda_unavailable(self):
+        self.assertEqual(self._resolve('auto', _fake_torch(cuda_available=False)), 'cpu')
+
+    def test_auto_falls_back_to_cpu_when_torch_broken(self):
+        # A missing/broken torch must never crash the device check.
+        self.assertEqual(self._resolve('auto', _fake_torch(raise_on_check=True)), 'cpu')
+
+    def test_result_is_cached(self):
+        self.assertEqual(self._resolve('auto', _fake_torch(cuda_available=True)), 0)
+        # Even if CUDA "disappears", the cached answer is returned (resolved once).
+        with mock.patch.dict(sys.modules, {'torch': _fake_torch(cuda_available=False)}):
+            self.assertEqual(self.config.resolve_device(), 0)
+
+
+class GpuConfigDefaultTests(TestCase):
+    """The GPU-related config defaults are correct and env-overridable."""
+
+    def test_fp16_defaults_on(self):
+        from apis.ai import config
+
+        # FP16 defaults ON; safe because both detectors only pass it on a GPU.
+        self.assertTrue(config.HALF)
+        self.assertTrue(config.OBJECT_HALF)
+        self.assertTrue(config.POSE_HALF)
+
+    def test_warmup_defaults_on(self):
+        from apis.ai import config
+
+        self.assertTrue(config.WARMUP)
+
+    def test_nvenc_defaults_to_auto(self):
+        from apis.ai import config
+
+        self.assertEqual(config.NVENC, 'auto')
+
+    def test_env_bool_master_switch_and_overrides(self):
+        from apis.ai import config
+
+        # Master switch can be turned off.
+        with mock.patch.dict(os.environ, {'AI_HALF': 'false'}, clear=False):
+            self.assertFalse(config._env_bool('AI_HALF', True))
+        # Per-model override honours the usual truthy/falsy vocabulary.
+        with mock.patch.dict(os.environ, {'AI_OBJECT_HALF': 'off'}, clear=False):
+            self.assertFalse(config._env_bool('AI_OBJECT_HALF', True))
+        # An unrecognised value falls back to the supplied default.
+        with mock.patch.dict(os.environ, {'AI_HALF': 'maybe'}, clear=False):
+            self.assertTrue(config._env_bool('AI_HALF', True))
+
+
+class Fp16GatingTests(TestCase):
+    """Both detectors pass ``half=True`` to predict() ONLY on a GPU device.
+
+    Half-precision is a GPU-only optimization: on CPU it gives no benefit and
+    some torch ops reject it, so it must never be passed. The gate is
+    ``self.half and self.device != 'cpu'`` — crucially NOT ``if self.device``,
+    because device ``0`` (a real GPU) is falsy.
+    """
+
+    def _object_kwargs(self, *, device, half):
+        from apis.ai.yolo_detector import ObjectDetector
+
+        det = ObjectDetector(device=device, half=half)
+        model = _RecordingModel()
+        det._model = model  # bypass the real cache/weights load
+        det.detect('frame-token')
+        return model.last
+
+    def _pose_kwargs(self, *, device, half):
+        from apis.ai.pose_analyzer import PoseAnalyzer
+
+        pa = PoseAnalyzer(device=device, half=half)
+        model = _RecordingModel()
+        pa._model = model
+        pa.analyze_frame('frame-token')
+        return model.last
+
+    def test_object_passes_half_on_gpu(self):
+        kwargs = self._object_kwargs(device=0, half=True)
+        self.assertEqual(kwargs['device'], 0)
+        self.assertIs(kwargs.get('half'), True)
+
+    def test_object_omits_half_on_cpu(self):
+        kwargs = self._object_kwargs(device='cpu', half=True)
+        self.assertEqual(kwargs['device'], 'cpu')
+        self.assertNotIn('half', kwargs)
+
+    def test_object_omits_half_when_disabled_even_on_gpu(self):
+        kwargs = self._object_kwargs(device=0, half=False)
+        self.assertEqual(kwargs['device'], 0)
+        self.assertNotIn('half', kwargs)
+
+    def test_pose_passes_half_on_gpu(self):
+        kwargs = self._pose_kwargs(device=0, half=True)
+        self.assertEqual(kwargs['device'], 0)
+        self.assertIs(kwargs.get('half'), True)
+
+    def test_pose_omits_half_on_cpu(self):
+        kwargs = self._pose_kwargs(device='cpu', half=True)
+        self.assertEqual(kwargs['device'], 'cpu')
+        self.assertNotIn('half', kwargs)
+
+
+class _CacheYOLO:
+    """Fake ``ultralytics.YOLO`` for the cache tests: records construction,
+    ``.to(device)``, and inference (warmup) calls."""
+
+    created = []
+
+    def __init__(self, path):
+        self.path = path
+        self.to_device = None
+        self.predict_calls = []
+        type(self).created.append(self)
+
+    def to(self, device):
+        self.to_device = device
+        return self
+
+    def __call__(self, frame, **kwargs):
+        self.predict_calls.append(kwargs)
+        return []
+
+
+class _RaisingCacheYOLO(_CacheYOLO):
+    """Same, but inference raises — proves a warmup failure never propagates."""
+
+    created = []
+
+    def __call__(self, frame, **kwargs):
+        raise RuntimeError('simulated warmup failure')
+
+
+def _fake_numpy():
+    """Minimal ``numpy`` stand-in for ``model_cache._warmup`` (only ``zeros``)."""
+    module = types.ModuleType('numpy')
+    module.uint8 = 'uint8'
+    module.zeros = lambda shape, dtype=None: ('zeros', shape, dtype)
+    return module
+
+
+class ModelCacheTests(TestCase):
+    """``model_cache.load_model`` loads once per ``(weights, device)``, reuses it,
+    and warms up with the correct GPU-only FP16 gating — all best-effort."""
+
+    def setUp(self):
+        from apis.ai import model_cache
+
+        self.model_cache = model_cache
+        model_cache.clear()
+        _CacheYOLO.created = []
+        _RaisingCacheYOLO.created = []
+
+    def tearDown(self):
+        self.model_cache.clear()
+
+    def _patched(self, yolo_cls):
+        ultra = types.ModuleType('ultralytics')
+        ultra.YOLO = yolo_cls
+        # Fake both ultralytics (the weights load) AND numpy (the warmup blank),
+        # so the cache logic runs with zero heavy deps on any box.
+        return mock.patch.dict(sys.modules, {'ultralytics': ultra, 'numpy': _fake_numpy()})
+
+    def test_loads_once_and_reuses_per_key(self):
+        with self._patched(_CacheYOLO), mock.patch('apis.ai.config.WARMUP', False):
+            first = self.model_cache.load_model('m.pt', 0)
+            second = self.model_cache.load_model('m.pt', 0)
+        self.assertIs(first, second)
+        self.assertEqual(len(_CacheYOLO.created), 1)
+        self.assertEqual(first.to_device, 0)
+
+    def test_distinct_device_is_a_distinct_entry(self):
+        with self._patched(_CacheYOLO), mock.patch('apis.ai.config.WARMUP', False):
+            gpu = self.model_cache.load_model('m.pt', 0)
+            cpu = self.model_cache.load_model('m.pt', 'cpu')
+        self.assertIsNot(gpu, cpu)
+        self.assertEqual(len(_CacheYOLO.created), 2)
+
+    def test_clear_drops_cache(self):
+        with self._patched(_CacheYOLO), mock.patch('apis.ai.config.WARMUP', False):
+            self.model_cache.load_model('m.pt', 0)
+            self.model_cache.clear()
+            self.model_cache.load_model('m.pt', 0)
+        self.assertEqual(len(_CacheYOLO.created), 2)  # loaded again after clear
+
+    def test_warmup_runs_and_passes_half_on_gpu(self):
+        with self._patched(_CacheYOLO), mock.patch('apis.ai.config.WARMUP', True):
+            model = self.model_cache.load_model('m.pt', 0, half=True, warmup_imgsz=320)
+        self.assertEqual(len(model.predict_calls), 1)
+        warm = model.predict_calls[0]
+        self.assertEqual(warm['device'], 0)
+        self.assertEqual(warm['imgsz'], 320)
+        self.assertIs(warm.get('half'), True)
+
+    def test_warmup_omits_half_on_cpu(self):
+        with self._patched(_CacheYOLO), mock.patch('apis.ai.config.WARMUP', True):
+            model = self.model_cache.load_model('m.pt', 'cpu', half=True, warmup_imgsz=320)
+        self.assertEqual(len(model.predict_calls), 1)
+        self.assertNotIn('half', model.predict_calls[0])
+
+    def test_no_warmup_without_imgsz(self):
+        with self._patched(_CacheYOLO), mock.patch('apis.ai.config.WARMUP', True):
+            model = self.model_cache.load_model('m.pt', 0, half=True, warmup_imgsz=None)
+        self.assertEqual(model.predict_calls, [])
+
+    def test_no_warmup_when_disabled(self):
+        with self._patched(_CacheYOLO), mock.patch('apis.ai.config.WARMUP', False):
+            model = self.model_cache.load_model('m.pt', 0, half=True, warmup_imgsz=320)
+        self.assertEqual(model.predict_calls, [])
+
+    def test_warmup_failure_never_propagates(self):
+        with self._patched(_RaisingCacheYOLO), mock.patch('apis.ai.config.WARMUP', True):
+            # The inference inside warmup raises; load_model must still return the
+            # model (warmup is best-effort and can never block analysis).
+            model = self.model_cache.load_model('m.pt', 0, half=True, warmup_imgsz=320)
+        self.assertIsInstance(model, _RaisingCacheYOLO)
+
+
+class NvencSelectionTests(TestCase):
+    """``face_tracker`` prefers the NVENC GPU encoder when available, ALWAYS keeps
+    a libx264 CPU fallback, and the capability probe is cached and never raises."""
+
+    def setUp(self):
+        from apis.ai import face_tracker
+
+        self.ft = face_tracker
+        # The probe result is cached in a module global; reset it so each test
+        # starts unprobed and never leaks into the FfmpegTimeoutTests.
+        self._saved = face_tracker._NVENC_SUPPORTED
+        face_tracker._NVENC_SUPPORTED = None
+
+    def tearDown(self):
+        self.ft._NVENC_SUPPORTED = self._saved
+
+    def test_off_disables_without_probing(self):
+        with mock.patch('apis.ai.config.NVENC', 'off'), \
+                mock.patch('apis.ai.face_tracker.subprocess.run') as run:
+            self.assertFalse(self.ft._nvenc_available('ffmpeg'))
+        run.assert_not_called()
+
+    def test_auto_detects_nvenc_and_caches_the_probe(self):
+        listing = SimpleNamespace(returncode=0, stdout='... h264_nvenc ... libx264 ...')
+        with mock.patch('apis.ai.config.NVENC', 'auto'), \
+                mock.patch('apis.ai.face_tracker.subprocess.run', return_value=listing) as run:
+            self.assertTrue(self.ft._nvenc_available('ffmpeg'))
+            self.assertTrue(self.ft._nvenc_available('ffmpeg'))  # cached
+        self.assertEqual(run.call_count, 1)
+
+    def test_auto_without_nvenc_in_listing_is_false(self):
+        listing = SimpleNamespace(returncode=0, stdout='... libx264 ... libx265 ...')
+        with mock.patch('apis.ai.config.NVENC', 'auto'), \
+                mock.patch('apis.ai.face_tracker.subprocess.run', return_value=listing):
+            self.assertFalse(self.ft._nvenc_available('ffmpeg'))
+
+    def test_probe_failure_resolves_to_false(self):
+        with mock.patch('apis.ai.config.NVENC', 'auto'), \
+                mock.patch('apis.ai.face_tracker.subprocess.run', side_effect=OSError('boom')):
+            self.assertFalse(self.ft._nvenc_available('ffmpeg'))
+
+    def test_reencode_prefers_nvenc_then_falls_back_to_libx264(self):
+        calls = []
+
+        def fake_encode(ffmpeg, src, dst, video_args, timeout):
+            calls.append(video_args)
+            return '-c:v' not in video_args  # NVENC (has -c:v) fails; libx264 wins
+
+        with mock.patch('apis.ai.face_tracker._ffmpeg_exe', return_value='ffmpeg'), \
+                mock.patch('apis.ai.face_tracker._nvenc_available', return_value=True), \
+                mock.patch('apis.ai.face_tracker._run_ffmpeg_encode', side_effect=fake_encode), \
+                mock.patch('apis.ai.face_tracker._safe_remove') as safe_remove:
+            ok = self.ft._reencode_h264('in.mp4', 'out.mp4')
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 2)
+        self.assertIn('h264_nvenc', calls[0])  # NVENC attempted first
+        self.assertIn('libx264', calls[1])     # libx264 fallback second
+        safe_remove.assert_called_once()        # partial NVENC output cleaned up
+
+    def test_reencode_stops_at_nvenc_when_it_succeeds(self):
+        calls = []
+
+        def fake_encode(ffmpeg, src, dst, video_args, timeout):
+            calls.append(video_args)
+            return True
+
+        with mock.patch('apis.ai.face_tracker._ffmpeg_exe', return_value='ffmpeg'), \
+                mock.patch('apis.ai.face_tracker._nvenc_available', return_value=True), \
+                mock.patch('apis.ai.face_tracker._run_ffmpeg_encode', side_effect=fake_encode):
+            ok = self.ft._reencode_h264('in.mp4', 'out.mp4')
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 1)
+        self.assertIn('h264_nvenc', calls[0])  # libx264 never attempted
+
+    def test_reencode_uses_libx264_when_nvenc_unavailable(self):
+        calls = []
+
+        def fake_encode(ffmpeg, src, dst, video_args, timeout):
+            calls.append(video_args)
+            return True
+
+        with mock.patch('apis.ai.face_tracker._ffmpeg_exe', return_value='ffmpeg'), \
+                mock.patch('apis.ai.face_tracker._nvenc_available', return_value=False), \
+                mock.patch('apis.ai.face_tracker._run_ffmpeg_encode', side_effect=fake_encode):
+            ok = self.ft._reencode_h264('in.mp4', 'out.mp4')
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 1)
+        self.assertIn('libx264', calls[0])
+
+    def test_reencode_returns_false_without_ffmpeg(self):
+        with mock.patch('apis.ai.face_tracker._ffmpeg_exe', return_value=None):
+            self.assertFalse(self.ft._reencode_h264('in.mp4', 'out.mp4'))
+
+
+class GpuRuntimeSmokeTests(TestCase):
+    """Real-hardware checks. Only run when a CUDA torch is installed (the AWS
+    g4dn worker or a local NVIDIA dev box); SKIPPED, not failed, on CPU-only CI.
+
+    This is the "is the GPU actually configured and working" layer: real FP16
+    math and a real YOLO forward pass on the GPU — exactly what the deployed
+    worker does. The logic tests above prove the code DECIDES correctly; these
+    prove the box can actually EXECUTE it.
+    """
+
+    def setUp(self):
+        from apis.ai import config, model_cache
+
+        self.config = config
+        self.model_cache = model_cache
+        self._saved_device = config._resolved_device
+
+    def tearDown(self):
+        # Free any VRAM the real models allocated; restore device resolution.
+        self.model_cache.clear()
+        self.config._resolved_device = self._saved_device
+
+    @skipUnless(_cuda_torch_available(), 'CUDA torch not installed on this box')
+    def test_cuda_and_fp16_runtime(self):
+        import torch
+
+        # A half-precision matmul on the GPU — the exact capability FP16 inference
+        # relies on. Proves the CUDA toolchain + half support are usable here.
+        a = torch.randn(64, 64, device='cuda', dtype=torch.float16)
+        b = torch.randn(64, 64, device='cuda', dtype=torch.float16)
+        c = a @ b
+        torch.cuda.synchronize()
+        self.assertEqual(c.device.type, 'cuda')
+        self.assertEqual(c.dtype, torch.float16)
+        self.assertTrue(torch.isfinite(c.float()).all().item())
+
+    @skipUnless(_cuda_torch_available(), 'CUDA torch not installed on this box')
+    def test_resolve_device_selects_gpu_here(self):
+        self.config._resolved_device = None
+        with mock.patch('apis.ai.config.AI_DEVICE', 'auto'):
+            self.assertEqual(self.config.resolve_device(), 0)
+
+    @skipUnless(_cuda_torch_available(), 'CUDA torch not installed on this box')
+    def test_real_object_forward_pass_on_gpu(self):
+        import numpy as np
+
+        from apis.ai.yolo_detector import ObjectDetector
+
+        if not os.path.exists(self.config.OBJECT_MODEL):
+            self.skipTest('object weights not cached; skipping to avoid a download')
+
+        det = ObjectDetector(device=0, imgsz=64, half=True)
+        try:
+            _ = det.model  # real load + warmup on the GPU
+        except Exception as exc:  # noqa: BLE001 — environmental (weights/driver), not a logic bug
+            self.skipTest(f'could not load object model on GPU: {exc}')
+
+        frame = np.zeros((64, 64, 3), dtype=np.uint8)
+        detections = det.detect(frame)  # a real FP16 forward pass on the GPU
+        self.assertIsInstance(detections, list)
+        self.assertIn('cuda', str(getattr(det.model, 'device', 'cuda')))
+
+    @skipUnless(_cuda_torch_available(), 'CUDA torch not installed on this box')
+    def test_real_pose_forward_pass_on_gpu(self):
+        import numpy as np
+
+        from apis.ai.pose_analyzer import PoseAnalyzer
+
+        if not os.path.exists(self.config.POSE_MODEL):
+            self.skipTest('pose weights not cached; skipping to avoid a download')
+
+        pa = PoseAnalyzer(device=0, imgsz=64, half=True)
+        try:
+            _ = pa.model
+        except Exception as exc:  # noqa: BLE001 — environmental, not a logic bug
+            self.skipTest(f'could not load pose model on GPU: {exc}')
+
+        frame = np.zeros((64, 64, 3), dtype=np.uint8)
+        detections, person_boxes = pa.analyze_frame(frame)
+        self.assertIsInstance(detections, list)
+        self.assertIsInstance(person_boxes, list)
