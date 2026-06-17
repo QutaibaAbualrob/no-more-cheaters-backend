@@ -45,6 +45,7 @@ class Command(BaseCommand):
         )
 
         count = 0
+        skipped = 0
         for video in expired:
             session_id = str(video.session_id)
             filename = video.original_filename
@@ -55,14 +56,28 @@ class Command(BaseCommand):
                 continue
 
             # 1. Remove the generated evidence directories for this session.
+            #    ignore_errors leaves a locked clip/snapshot in place rather than
+            #    raising; the directory is retried whenever this video is.
             for subdir in ('clips', 'snapshots'):
                 target = media_root / subdir / session_id
                 if target.exists():
                     shutil.rmtree(target, ignore_errors=True)
 
-            # 2. Remove the stored video file from disk.
+            # 2. Remove the stored video file from disk. A file still held open
+            #    (a worker mid-analysis, or a lingering handle on Windows) raises
+            #    OSError here. When it does we keep the Video row and move on:
+            #    deleting the row now would orphan the on-disk file with no record
+            #    pointing at it, and one stuck file must not abort the whole sweep
+            #    and strand every later expired video (M6). The next run retries.
             if video.file:
-                video.file.delete(save=False)
+                try:
+                    video.file.delete(save=False)
+                except OSError as exc:
+                    skipped += 1
+                    self.stderr.write(self.style.WARNING(
+                        f'Skipped video {video.id}: could not delete file '
+                        f'({exc}); will retry on the next run.'))
+                    continue
 
             # 3. Audit, then drop the row.
             AuditLog.objects.create(
@@ -81,3 +96,7 @@ class Command(BaseCommand):
 
         verb = 'Would delete' if dry_run else 'Deleted'
         self.stdout.write(self.style.SUCCESS(f'{verb} {count} expired video(s).'))
+        if skipped:
+            self.stdout.write(self.style.WARNING(
+                f'Skipped {skipped} video(s) with files that could not be deleted; '
+                'they will be retried on the next run.'))

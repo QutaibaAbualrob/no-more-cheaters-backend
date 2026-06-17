@@ -23,11 +23,63 @@ User = get_user_model()
 
 logger = logging.getLogger(__name__)
 
+# Cap on the error text persisted to AnalysisJob.error_message. A raw analysis
+# exception can be a several-hundred-line CUDA/ffmpeg traceback (~10KB); storing
+# it verbatim on every failure bloats the unbounded TextField (M10). 2000 chars
+# keeps the exception type and the first frames — where the cause usually is —
+# while bounding the row size.
+_MAX_ERROR_MESSAGE_CHARS = 2000
+
+
+def _truncate_error(message):
+    """Bound a stored error string to ``_MAX_ERROR_MESSAGE_CHARS`` (M10).
+
+    Keeps the head of the message (the exception and its first stack frames) and
+    appends a marker so it is clear the text was clipped. The short, single-line
+    summary used for the audit log / instructor notification is derived
+    separately and is unaffected.
+    """
+    text = message or ''
+    if len(text) <= _MAX_ERROR_MESSAGE_CHARS:
+        return text
+    return text[:_MAX_ERROR_MESSAGE_CHARS] + '\n…[truncated]'
+
 
 def _existing_report_id(job):
     """Return the str id of the session's report, or ``None`` if not generated yet."""
     report = getattr(job.session, 'report', None)
     return str(report.id) if report is not None else None
+
+
+def send_notification_emails(recipients, subject, body):
+    """Send *body* to each address in *recipients* (one email each), best-effort.
+
+    Enqueued by :func:`apis.services.notify_users` so the SMTP fan-out runs in a
+    worker instead of the HTTP request thread (H9): a request that resolves N
+    supervisors no longer blocks on N sequential SMTP round-trips. Each send is
+    isolated — a failure to one address is logged and never blocks the rest — and
+    the job never raises, so rq does not mark the whole batch failed or retry it.
+    Returns the number of addresses sent to.
+    """
+    from django.conf import settings
+    from django.core.mail import send_mail
+
+    sent = 0
+    for email in recipients:
+        if not email:
+            continue
+        try:
+            send_mail(
+                subject=subject,
+                message=body,
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[email],
+                fail_silently=True,
+            )
+            sent += 1
+        except Exception:  # noqa: BLE001 — email is best-effort; keep going
+            logger.exception('Failed to email %s: %s', email, subject)
+    return sent
 
 
 def run_analysis(job_id, actor_id=None):
@@ -123,7 +175,7 @@ def _mark_failed(job, session, error_message, actor=None):
     caller is about to re-raise, and so the FAILED state is always persisted.
     """
     job.status = AnalysisJob.Status.FAILED
-    job.error_message = error_message
+    job.error_message = _truncate_error(error_message)
     job.completed_at = timezone.now()
     job.save(update_fields=['status', 'error_message', 'completed_at'])
     session.status = ExamSession.Status.FAILED

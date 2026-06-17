@@ -9,6 +9,7 @@ from django.contrib.auth import get_user_model
 from django.core.mail import send_mail
 from django.db import transaction
 from django.db.models import Count
+from django.db.models.functions import TruncDate
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
@@ -140,7 +141,25 @@ def send_workspace_invite(dean, instructor, exam=None, workspace=None):
     supervisor assignment); at least one should be supplied. Returns the created
     :class:`WorkspaceInvite`. A failing mail server is logged but does not abort
     the invite — the row and notification are still saved.
+
+    Inviting an instructor who already belongs to *workspace* is rejected here
+    (M13). The HTTP view pre-checks this, but the guard lives at the service
+    layer so callers that bypass the view — management commands, scripts, the
+    pre-analyze importer — cannot create a duplicate invite for an existing
+    member either.
+
+    A dean inviting *themselves* is rejected: accepting such an invite would make
+    the workspace owner a member of their own workspace, which pollutes
+    ``accepted_instructor_rows`` (the single source of truth for a dean's
+    assignable instructors) and lets the owner be picked as their own supervisor.
     """
+    if instructor.id == dean.id:
+        raise ValidationError('You cannot invite yourself')
+
+    if workspace is not None and WorkspaceMembership.objects.filter(
+            workspace=workspace, instructor=instructor).exists():
+        raise ValidationError('This user is already a member of this workspace')
+
     invite = WorkspaceInvite.objects.create(
         dean=dean, instructor=instructor, exam=exam, workspace=workspace,
     )
@@ -197,6 +216,66 @@ def exam_supervisor_users(exam, extra_user_ids=None):
     return list(User.objects.filter(id__in=ids))
 
 
+def _schedule_sentence(exam, schedule=None):
+    """Compose the 'on <date> at <time> in <hall>' tail for assignment notices."""
+    schedule = schedule or {}
+    date = schedule.get('date') or (exam.scheduled_date.isoformat() if exam.scheduled_date else 'the scheduled date')
+    start = schedule.get('start_time') or (exam.start_time.strftime('%H:%M') if exam.start_time else '')
+    end = schedule.get('end_time') or (exam.end_time.strftime('%H:%M') if exam.end_time else '')
+    time_range = f'{start}–{end}' if start and end else (start or 'the scheduled time')
+    hall = schedule.get('hall') or exam.hall or 'the assigned hall'
+    return f'on {date} at {time_range} in {hall}'
+
+
+def sync_exam_supervisors(dean, exam, instructor_ids, schedule=None):
+    """Make the ACCEPTED per-exam invites for *exam* match *instructor_ids*.
+
+    Assignment is immediate (the invite is created already ACCEPTED) so the exam
+    appears on each supervisor's calendar right away via ``calendar_exams`` —
+    there is no pending accept/decline step. Newly-assigned instructors get an
+    ``EXAM_ASSIGNED`` notification (bell badge); un-assigned instructors have
+    their exam invite removed so the exam drops off their calendar. Returns the
+    list of newly-assigned :class:`User` objects.
+    """
+    desired = {str(i) for i in (instructor_ids or []) if i}
+    existing = {
+        str(i) for i in WorkspaceInvite.objects
+        .filter(exam=exam, status=WorkspaceInvite.Status.ACCEPTED)
+        .values_list('instructor_id', flat=True)
+    }
+    to_add = desired - existing
+    to_remove = existing - desired
+
+    if to_remove:
+        WorkspaceInvite.objects.filter(exam=exam, instructor_id__in=to_remove).delete()
+
+    added_users = []
+    tail = _schedule_sentence(exam, schedule)
+    for instructor in User.objects.filter(id__in=to_add):
+        invite, _created = WorkspaceInvite.objects.get_or_create(
+            exam=exam, instructor=instructor,
+            defaults={'dean': dean, 'status': WorkspaceInvite.Status.ACCEPTED},
+        )
+        if invite.status != WorkspaceInvite.Status.ACCEPTED:
+            invite.status = WorkspaceInvite.Status.ACCEPTED
+            invite.responded_at = timezone.now()
+            invite.save(update_fields=['status', 'responded_at'])
+        create_notification(
+            instructor,
+            Notification.NotifType.EXAM_ASSIGNED,
+            f'New exam assigned: {exam.name}',
+            f'You have been assigned to supervise "{exam.name}" {tail}.',
+            metadata={
+                'exam_id': str(exam.id),
+                'exam_name': exam.name,
+                'date': (schedule or {}).get('date') or (exam.scheduled_date.isoformat() if exam.scheduled_date else ''),
+                'hall': (schedule or {}).get('hall') or exam.hall or '',
+            },
+        )
+        added_users.append(instructor)
+    return added_users
+
+
 def delete_exam_media(exam):
     """Delete all on-disk media for an exam's sessions before the DB cascade.
 
@@ -239,19 +318,45 @@ def clear_session_evidence(session):
 
 
 def notify_users(users, notif_type, title, body, metadata=None):
-    """In-app notification + best-effort email for each user in *users*."""
+    """Create an in-app notification for each user, then email them off-thread.
+
+    The in-app notifications are written synchronously — they are fast, durable,
+    and expected to be visible immediately. The email fan-out (the slow, flaky
+    part) is handed to the django-rq ``default`` queue so a request resolving N
+    supervisors never blocks on N sequential SMTP round-trips (H9). When the
+    queue is eager (the dev/test default, no Redis/worker) the emails are sent
+    inline, so behaviour is unchanged without a worker.
+    """
+    recipients = []
     for user in users:
         create_notification(user, notif_type, title, body, metadata=metadata)
-        try:
-            send_mail(
-                subject=title,
-                message=body,
-                from_email=settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[user.email],
-                fail_silently=True,
-            )
-        except Exception:  # noqa: BLE001 — email is best-effort
-            logger.exception('Failed to email %s for %s', user.email, notif_type)
+        email = getattr(user, 'email', '')
+        if email:
+            recipients.append(email)
+
+    if recipients:
+        enqueue_email(recipients, title, body)
+
+
+def enqueue_email(recipients, subject, body):
+    """Fan *subject*/*body* out to *recipients*, off the HTTP thread when possible.
+
+    Hands the SMTP loop to the django-rq ``default`` queue; falls back to sending
+    inline when the queue is eager (no Redis/worker — the dev/test default).
+    Mirrors :func:`enqueue_analysis`'s async/eager handling. The local imports
+    keep django-rq out of the import graph until used and avoid a circular import
+    with :mod:`apis.tasks` (which imports this module).
+    """
+    import django_rq
+
+    from .tasks import send_notification_emails
+
+    payload = list(recipients)
+    queue = django_rq.get_queue('default')
+    if queue.is_async:
+        queue.enqueue(send_notification_emails, payload, subject, body)
+    else:
+        send_notification_emails(payload, subject, body)
 
 
 def respond_to_workspace_invite(invite, accepted):
@@ -296,26 +401,52 @@ def respond_to_workspace_invite(invite, accepted):
     return invite
 
 
+def _coerce_threshold(values, key):
+    """Read threshold *key* from *values* as a float, falling back to default.
+
+    ``SystemSettings.setting_value`` is a free-form CharField and
+    ``UserPreferences.metadata`` is arbitrary JSON, so a stored value can be
+    non-numeric (corruption, a hand-edited row, a bad migration). float() on
+    such a value used to raise ValueError and crash the entire thresholds read
+    path (M2). Here we fall back to the documented default and log the bad
+    value instead, so one corrupt setting degrades gracefully to the default
+    rather than taking down the whole endpoint.
+    """
+    default = THRESHOLD_DEFAULTS[key]
+    raw = values.get(key, default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning('Ignoring non-numeric stored threshold %s=%r; using default %s',
+                       key, raw, default)
+        return float(default)
+
+
 def threshold_payload(values, updated_at=None):
     """Normalise threshold values to the frontend API contract."""
     timestamp = (updated_at or timezone.now()).isoformat()
     return {
-        'gaze_threshold': float(values.get('gaze_threshold', THRESHOLD_DEFAULTS['gaze_threshold'])),
-        'noise_threshold': float(values.get('noise_threshold', THRESHOLD_DEFAULTS['noise_threshold'])),
-        'multiple_faces_threshold': float(values.get(
-            'multiple_faces_threshold',
-            THRESHOLD_DEFAULTS['multiple_faces_threshold'],
-        )),
+        'gaze_threshold': _coerce_threshold(values, 'gaze_threshold'),
+        'noise_threshold': _coerce_threshold(values, 'noise_threshold'),
+        'multiple_faces_threshold': _coerce_threshold(values, 'multiple_faces_threshold'),
         'updated_at': timestamp,
     }
 
 
 def validate_thresholds(payload):
-    """Accept only known threshold keys with numeric values between 0 and 1."""
+    """Accept only known threshold keys with numeric values between 0 and 1.
+
+    Unknown keys are rejected rather than silently dropped (M3): a typo'd key
+    (e.g. ``gaze_treshold``) used to be discarded, so the save "succeeded"
+    while the intended threshold never changed. Surfacing it as a validation
+    error lets the caller fix the key instead of trusting a phantom write.
+    """
     cleaned = {}
     for key, value in payload.items():
         if key not in THRESHOLD_DEFAULTS:
-            continue
+            raise ValidationError(
+                {key: f'Unknown threshold key. Allowed keys: '
+                      f'{", ".join(sorted(THRESHOLD_DEFAULTS))}.'})
         try:
             numeric = float(value)
         except (TypeError, ValueError):
@@ -426,6 +557,14 @@ def update_global_thresholds(request, payload):
     return threshold_payload({**get_global_thresholds(), **cleaned}, latest_updated_at)
 
 
+# How many `student_identifier` variants to probe before giving up. Each probe is
+# a `get_or_create` round trip, so an unbounded loop lets one identifier with many
+# uploads (`john`, `john-2`, ... `john-10000`) fire thousands of DB queries and
+# exhaust the connection pool (N4). 100 free slots per identifier is far beyond any
+# legitimate use; past that we stop probing and surface a clean error.
+MAX_UPLOAD_SESSION_ATTEMPTS = 100
+
+
 def get_available_upload_session(instructor, upload, exam_name='', student_identifier=''):
     """Create or reuse a direct-upload session that does not already have a video."""
     resolved_exam_name = exam_name or 'Uploaded Videos'
@@ -437,17 +576,20 @@ def get_available_upload_session(instructor, upload, exam_name='', student_ident
     )
     base_identifier = resolved_student_identifier[:220]
     candidate = base_identifier
-    suffix = 1
 
-    while True:
+    for suffix in range(1, MAX_UPLOAD_SESSION_ATTEMPTS + 1):
         session, _created = ExamSession.objects.get_or_create(
             exam=exam,
             student_identifier=candidate,
         )
         if not hasattr(session, 'video'):
             return session
-        suffix += 1
-        candidate = f'{base_identifier}-{suffix}'
+        candidate = f'{base_identifier}-{suffix + 1}'
+
+    raise ValidationError(
+        f'Could not allocate an upload session for "{base_identifier}" after '
+        f'{MAX_UPLOAD_SESSION_ATTEMPTS} attempts; all are already in use. '
+        'Use a different student identifier.')
 
 
 def recording_session_for(exam):
@@ -645,11 +787,16 @@ def _report_probability(alerts):
     return round(min(0.99, 1.0 - surviving_risk), 2)
 
 
-def _attach_alert_evidence(video, session, alerts):
+def _attach_alert_evidence(video, session, alerts, person_index=None):
     """Attach per-alert visual evidence with a green-boxed flagged person.
 
-    Tracks faces across the recording once (see :mod:`apis.ai.face_tracker`),
-    then for each alert resolves the flagged person near its timestamp and saves
+    *person_index* is the per-person track index the analysis pass already built
+    from YOLO boxes (H6); it is reused as-is so the video is not scanned again.
+    Only when it is ``None`` (a direct evidence call outside the pipeline) does
+    this fall back to :func:`apis.ai.face_tracker.track_persons`, the standalone
+    Haar-cascade sweep.
+
+    For each alert it resolves the flagged person near its timestamp and saves
     three artifacts:
 
     * **crop** (``metadata['crop_url']``) — the flagged face only, no overlay;
@@ -663,85 +810,146 @@ def _attach_alert_evidence(video, session, alerts):
     Best-effort and fully isolated: any OpenCV/IO failure simply leaves that
     artifact empty and never aborts the analysis. URLs are stored as
     ``/media/...`` web paths; the report view turns them into absolute URLs.
+
+    Returns the number of alerts whose evidence was **incomplete** — i.e. an
+    extractor raised (a disk-full or OpenCV error, as opposed to legitimately
+    finding nothing to extract). Each such alert is also stamped with
+    ``metadata['evidence_incomplete'] = True`` (and the failing artifact names in
+    ``metadata['evidence_errors']``) so the partial state is visible rather than
+    silently swallowed (M1). Each alert is processed independently, so a failure
+    midway through never starves the remaining alerts of evidence.
     """
     if not alerts or not getattr(video, 'file', None):
-        return
+        return 0
 
     try:
         from .ai.face_tracker import (
             extract_annotated_frame, extract_clip, extract_face_crop, track_persons,
         )
     except Exception:  # noqa: BLE001 — OpenCV missing → skip evidence entirely
-        return
+        logger.warning('OpenCV/face_tracker unavailable; skipping evidence for session %s', session.id)
+        return len(alerts)
 
     video_path = video.file.path
     media_root = Path(settings.MEDIA_ROOT)
     media_url = '/' + settings.MEDIA_URL.strip('/')
 
-    try:
-        index = track_persons(video_path)
-    except Exception:  # noqa: BLE001
-        index = None
+    # Reuse the pipeline's YOLO-derived index when present; otherwise sweep the
+    # video once with the Haar fallback (H6).
+    index = person_index
+    if index is None:
+        try:
+            index = track_persons(video_path)
+        except Exception:  # noqa: BLE001
+            index = None
 
+    # Person boxes (YOLO) need a head crop for the avatar; face boxes (Haar) are
+    # used as-is.
+    head_fraction = 0.45 if getattr(index, 'box_kind', 'face') == 'person' else None
+
+    incomplete_alerts = 0
     for alert in alerts:
-        person_id, bbox, others = 'person_1', None, {}
-        if index is not None:
+        # Each alert is fully isolated: an unexpected error here (a disk-full
+        # OSError, a corrupt frame) marks just this alert incomplete and moves
+        # on, so a failure partway through can never starve later alerts of
+        # evidence the way an un-caught exception would (M1).
+        failed_artifacts: list[str] = []
+        try:
+            # Extract evidence at the precise event-start time the pipeline
+            # recorded (float), not the integer Alert.timestamp_sec: flooring to
+            # the whole second shifted every clip/snapshot up to ~1s earlier than
+            # the detected moment. Falls back to the integer when start_sec is
+            # absent (e.g. a demo/legacy alert).
+            start = float((alert.metadata or {}).get('start_sec', alert.timestamp_sec))
+
+            person_id, bbox, others = 'person_1', None, {}
+            object_bbox = (alert.metadata or {}).get('object_bbox')
+            if index is not None:
+                try:
+                    others = index.persons_at(start)
+                    # Object evidence (phone/laptop): attribute to the person
+                    # actually near the object box, not the largest person in
+                    # frame. Falls back to the time-based pick when there is no
+                    # object box or no person overlaps it.
+                    if object_bbox and hasattr(index, 'person_for_box'):
+                        person_id, bbox = index.person_for_box(start, object_bbox)
+                    if bbox is None:
+                        person_id, bbox = index.query(start)
+                except Exception:  # noqa: BLE001
+                    person_id, bbox, others = 'person_1', None, {}
+
+            # Human-readable behaviour ("Phone Detected", "Looking Away", …).
+            behavior_label = alert.get_behavior_type_display()
+
+            # All people in the frame, with the flagged person's precise bbox.
+            boxes = dict(others)
+            if bbox is not None:
+                boxes[person_id] = bbox
+            boxes_list = list(boxes.items())
+
+            metadata = dict(alert.metadata or {})
+            metadata['person_id'] = person_id
+            if bbox is not None:
+                x1, y1, x2, y2 = bbox
+                metadata['bbox'] = [
+                    int(round(x1)), int(round(y1)),
+                    int(round(x2 - x1)), int(round(y2 - y1)),
+                ]
+
+            crop_rel = f'snapshots/{session.id}/{alert.id}_crop.jpg'
+            frame_rel = f'snapshots/{session.id}/{alert.id}_frame.jpg'
+            clip_rel = f'clips/{session.id}/{alert.id}.mp4'
+
+            # 1. Clean face crop → avatar (stored in metadata).
             try:
-                person_id, bbox = index.query(alert.timestamp_sec)
-                others = index.persons_at(alert.timestamp_sec)
+                if extract_face_crop(video_path, start, bbox,
+                                      str(media_root / crop_rel), head_fraction=head_fraction):
+                    metadata['crop_url'] = f'{media_url}/{crop_rel}'
             except Exception:  # noqa: BLE001
-                person_id, bbox, others = 'person_1', None, {}
+                failed_artifacts.append('crop')
+                logger.exception('Evidence crop failed for alert %s', alert.id)
+            # 2. Full annotated frame → main evidence image (snapshot_url).
+            try:
+                if extract_annotated_frame(
+                    video_path, start, boxes_list, person_id,
+                    behavior_label, str(media_root / frame_rel),
+                ):
+                    alert.snapshot_url = f'{media_url}/{frame_rel}'
+            except Exception:  # noqa: BLE001
+                failed_artifacts.append('snapshot')
+                logger.exception('Evidence snapshot failed for alert %s', alert.id)
+            # 3. 3-second clip with the overlay on every frame (clip_url).
+            try:
+                if extract_clip(
+                    video_path, start, str(media_root / clip_rel),
+                    boxes=boxes_list, flagged_person_id=person_id, behavior_label=behavior_label,
+                    person_index=index,
+                ):
+                    alert.clip_url = f'{media_url}/{clip_rel}'
+            except Exception:  # noqa: BLE001
+                failed_artifacts.append('clip')
+                logger.exception('Evidence clip failed for alert %s', alert.id)
 
-        # Human-readable behaviour ("Phone Detected", "Looking Away", …).
-        behavior_label = alert.get_behavior_type_display()
+            if failed_artifacts:
+                metadata['evidence_incomplete'] = True
+                metadata['evidence_errors'] = failed_artifacts
+                incomplete_alerts += 1
 
-        # All people in the frame, with the flagged person's precise bbox.
-        boxes = dict(others)
-        if bbox is not None:
-            boxes[person_id] = bbox
-        boxes_list = list(boxes.items())
+            alert.metadata = metadata
+        except Exception:  # noqa: BLE001 — one alert must never abort the rest
+            logger.exception('Evidence generation aborted for alert %s', alert.id)
+            aborted_metadata = dict(alert.metadata or {})
+            aborted_metadata['evidence_incomplete'] = True
+            alert.metadata = aborted_metadata
+            incomplete_alerts += 1
 
-        metadata = dict(alert.metadata or {})
-        metadata['person_id'] = person_id
-        if bbox is not None:
-            x1, y1, x2, y2 = bbox
-            metadata['bbox'] = [
-                int(round(x1)), int(round(y1)),
-                int(round(x2 - x1)), int(round(y2 - y1)),
-            ]
+    try:
+        Alert.objects.bulk_update(alerts, ['snapshot_url', 'clip_url', 'metadata'])
+    except Exception:  # noqa: BLE001 — persistence itself failed: nothing saved
+        logger.exception('Failed to persist alert evidence for session %s', session.id)
+        return len(alerts)
 
-        crop_rel = f'snapshots/{session.id}/{alert.id}_crop.jpg'
-        frame_rel = f'snapshots/{session.id}/{alert.id}_frame.jpg'
-        clip_rel = f'clips/{session.id}/{alert.id}.mp4'
-
-        # 1. Clean face crop → avatar (stored in metadata).
-        try:
-            if extract_face_crop(video_path, alert.timestamp_sec, bbox, str(media_root / crop_rel)):
-                metadata['crop_url'] = f'{media_url}/{crop_rel}'
-        except Exception:  # noqa: BLE001
-            pass
-        # 2. Full annotated frame → main evidence image (snapshot_url).
-        try:
-            if extract_annotated_frame(
-                video_path, alert.timestamp_sec, boxes_list, person_id,
-                behavior_label, str(media_root / frame_rel),
-            ):
-                alert.snapshot_url = f'{media_url}/{frame_rel}'
-        except Exception:  # noqa: BLE001
-            pass
-        # 3. 3-second clip with the overlay on every frame (clip_url).
-        try:
-            if extract_clip(
-                video_path, alert.timestamp_sec, str(media_root / clip_rel),
-                boxes=boxes_list, flagged_person_id=person_id, behavior_label=behavior_label,
-            ):
-                alert.clip_url = f'{media_url}/{clip_rel}'
-        except Exception:  # noqa: BLE001
-            pass
-
-        alert.metadata = metadata
-
-    Alert.objects.bulk_update(alerts, ['snapshot_url', 'clip_url', 'metadata'])
+    return incomplete_alerts
 
 
 def build_ai_report(session, job=None):
@@ -802,6 +1010,9 @@ def build_ai_report(session, job=None):
                 'end_sec': round(event.end_sec, 3),
                 'duration_sec': round(event.duration_sec, 3),
                 'frame_count': event.frame_count,
+                # The object's box at start_sec, so evidence attribution can pick
+                # the person actually near the phone/laptop (see person_for_box).
+                'object_bbox': [int(round(v)) for v in event.bbox] if event.bbox else None,
             },
         )
         for event in result.events
@@ -823,7 +1034,16 @@ def build_ai_report(session, job=None):
     # Enrich each alert with a face crop, a 3-second clip, and a person id. This
     # is filesystem/ffmpeg I/O (minutes for long videos) and deliberately runs
     # OUTSIDE a transaction; it commits its own per-alert bulk_update at the end.
-    _attach_alert_evidence(video, session, alerts)
+    # Reuse the person index the analysis pass already built from YOLO boxes (H6)
+    # so the video is not swept a third time.
+    incomplete_evidence = _attach_alert_evidence(
+        video, session, alerts, person_index=getattr(result, 'person_index', None),
+    )
+    if incomplete_evidence:
+        logger.warning(
+            'Evidence incomplete for %d of %d alert(s) in session %s',
+            incomplete_evidence, len(alerts), session.id,
+        )
 
     # Aggregate from the persisted alerts (now enriched with person ids), so the
     # report reflects exactly what was saved.
@@ -836,14 +1056,25 @@ def build_ai_report(session, job=None):
             person_ids.add(person_id)
 
     total_alerts = len(alerts)
-    person_count = len(person_ids) or (1 if total_alerts else 0)
+    # Number of *distinct* people the alerts were attributed to. This is only
+    # known when person tracking/evidence actually ran and stamped a person_id
+    # onto the alert metadata; if that failed entirely, person_ids is empty and
+    # the count is genuinely unknown — we must not fabricate "1 person" (M12),
+    # which previously happened via a ``len(...) or 1`` fallback and made the
+    # report claim someone was identified when no one was.
+    person_count = len(person_ids)
     probability = _report_probability(alerts)
     processing_time = result.metadata.get('processing_time_seconds')
 
-    if total_alerts:
+    if not total_alerts:
+        summary = 'No suspicious activity detected in this session.'
+    elif person_count:
         summary = f'{total_alerts} alert(s) detected across {person_count} person(s).'
     else:
-        summary = 'No suspicious activity detected in this session.'
+        summary = (
+            f'{total_alerts} alert(s) detected; the number of people involved '
+            'could not be determined.'
+        )
 
     # Persist the aggregate report (and the job's analysis metadata) in a short
     # transaction — again, no I/O is held open here (C4).
@@ -865,6 +1096,18 @@ def build_ai_report(session, job=None):
                 'analysis': result.metadata,
                 'annotated_video_path': result.annotated_video_path,
                 'annotated_video_url': _media_url_for(result.annotated_video_path),
+                # Per-person box tracks for the frontend's live overlay: the
+                # client draws these on top of the original video synced to
+                # playback, so boxes no longer have to be baked into a re-encoded
+                # copy. None when no index was built (the player then falls back to
+                # the annotated video). Best-effort — serialization never aborts a
+                # report.
+                'overlay': _overlay_payload(getattr(result, 'person_index', None)),
+                # Surface partial-evidence runs so the frontend can flag that some
+                # alerts are missing their snapshot/clip rather than implying the
+                # absence means "nothing happened" (M1).
+                'evidence_incomplete': bool(incomplete_evidence),
+                'evidence_incomplete_count': incomplete_evidence,
             })
             job.metadata = job_metadata
             # Stamp the model that actually ran (H3): provenance, not a client
@@ -877,6 +1120,22 @@ def build_ai_report(session, job=None):
             job.save(update_fields=update_fields)
 
     return report
+
+
+def _overlay_payload(person_index):
+    """Serialize a :class:`PersonIndex` for the frontend overlay, or ``None``.
+
+    Best-effort: a missing index, one without ``to_overlay_dict`` (e.g. a test
+    double), or any serialization error yields ``None`` so the report still
+    builds — the player simply falls back to the annotated video.
+    """
+    if person_index is None or not hasattr(person_index, 'to_overlay_dict'):
+        return None
+    try:
+        return person_index.to_overlay_dict()
+    except Exception:  # noqa: BLE001 — overlay is a nicety, never fatal
+        logger.exception('Failed to serialize person tracks for overlay')
+        return None
 
 
 def _media_url_for(filesystem_path):
@@ -892,7 +1151,20 @@ def _media_url_for(filesystem_path):
         rel = Path(filesystem_path).resolve().relative_to(Path(settings.MEDIA_ROOT).resolve())
     except (ValueError, OSError):
         return None
-    return '/' + settings.MEDIA_URL.strip('/') + '/' + str(rel).replace('\\', '/')
+
+    rel_url = str(rel).replace('\\', '/')
+    media_url = settings.MEDIA_URL or '/media/'
+
+    # A CDN/absolute base (has a scheme) is used verbatim. A path-style
+    # MEDIA_URL is normalised to exactly one leading and trailing slash —
+    # falling back to 'media' when it is empty or just '/'. The old code did
+    # '/' + MEDIA_URL.strip('/') + '/...', which collapsed to '//snapshots/...'
+    # for an empty MEDIA_URL: a protocol-relative URL a browser reads as a host
+    # and blocks as mixed content on an HTTPS page (M5).
+    if '://' in media_url:
+        return media_url.rstrip('/') + '/' + rel_url
+    prefix = media_url.strip('/') or 'media'
+    return '/' + prefix + '/' + rel_url
 
 
 def dashboard_stats_for(user):
@@ -913,15 +1185,44 @@ def dashboard_stats_for(user):
 
 
 def activity_series_for(user):
-    """Return seven-day upload and analysis counts for charts."""
+    """Return seven-day upload and analysis counts for charts.
+
+    Two grouped queries — one per series — instead of the old 2·N per-day
+    ``COUNT`` queries (H7). Each truncates the timestamp to a local date, groups,
+    and counts in the database; the rows are then mapped onto the fixed day
+    window, with any day that has no rows reported as 0.
+    """
     videos = owned_videos(user)
     analyses = AnalysisJob.objects.filter(session__in=owned_sessions(user))
     days, labels = recent_day_window()
+    start = days[0]  # window is oldest -> newest, so days[0] is the lower bound
+
+    video_counts = _daily_counts(videos, 'uploaded_at', start)
+    analysis_counts = _daily_counts(analyses, 'created_at', start)
     return {
         'days': labels,
-        'videos': [videos.filter(uploaded_at__date=day).count() for day in days],
-        'analyses': [analyses.filter(created_at__date=day).count() for day in days],
+        'videos': [video_counts.get(day, 0) for day in days],
+        'analyses': [analysis_counts.get(day, 0) for day in days],
     }
+
+
+def _daily_counts(queryset, field_name, start_date):
+    """Return ``{date: row_count}`` for *field_name*, grouped by day in one query.
+
+    Only rows on/after *start_date* are scanned, and ``order_by()`` clears any
+    model default ordering so it cannot leak into (and break) the ``GROUP BY``.
+    The truncation uses the active timezone, matching ``recent_day_window``'s
+    use of :func:`~django.utils.timezone.localdate`.
+    """
+    rows = (
+        queryset
+        .filter(**{f'{field_name}__date__gte': start_date})
+        .annotate(_day=TruncDate(field_name))
+        .order_by()
+        .values('_day')
+        .annotate(_count=Count('pk'))
+    )
+    return {row['_day']: row['_count'] for row in rows}
 
 
 def system_metrics():

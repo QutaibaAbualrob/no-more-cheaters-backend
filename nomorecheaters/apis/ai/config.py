@@ -63,11 +63,65 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == '':
+        return default
+    value = raw.strip().lower()
+    if value in ('1', 'true', 'yes', 'on'):
+        return True
+    if value in ('0', 'false', 'no', 'off'):
+        return False
+    return default
+
+
 # --- Model weights -----------------------------------------------------------
 # ultralytics resolves these names and downloads the weights on first use
 # (~220MB total), caching them on disk for subsequent runs.
 OBJECT_MODEL = os.getenv('AI_OBJECT_MODEL', 'yolo11x.pt')
 POSE_MODEL = os.getenv('AI_POSE_MODEL', 'yolo11x-pose.pt')
+
+# --- Inference resolution ----------------------------------------------------
+# Source recordings are typically 1280x720. The ultralytics default (imgsz=640)
+# downscales the frame ~2x linearly, which destroys the few pixels a small,
+# distant phone occupies — so phones are essentially never detected at 640.
+# 960 keeps far more of that detail at ~2-2.5x the compute of 640; bump to 1280
+# for the best small-object recall (~3.5-4x). Box coordinates are unaffected:
+# ultralytics rescales every box back to ORIGINAL source-frame pixels regardless
+# of imgsz.
+OBJECT_IMGSZ = max(32, _env_int('AI_OBJECT_IMGSZ', 960))
+POSE_IMGSZ = max(32, _env_int('AI_POSE_IMGSZ', 960))
+# FP16 (half-precision) inference. Applied to predict() ONLY when the resolved
+# device is a GPU — FP16 gives no benefit on CPU and some torch ops reject it
+# (Ultralytics guards it, but there is no reason to pass it), so both detectors
+# gate it on `device != 'cpu'`. Because of that gate it can safely default ON: on
+# a GPU it roughly halves inference cost and VRAM at negligible accuracy loss, and
+# on CPU it is simply never passed. AI_HALF is the master switch; AI_OBJECT_HALF /
+# AI_POSE_HALF override it per model (AI_OBJECT_HALF is kept for back-compat with
+# older deploys that set it explicitly).
+HALF = _env_bool('AI_HALF', True)
+OBJECT_HALF = _env_bool('AI_OBJECT_HALF', HALF)
+POSE_HALF = _env_bool('AI_POSE_HALF', HALF)
+# Class-agnostic NMS. Near-inert because the detector is restricted to classes
+# {phone, laptop}; opt-in only, default off.
+OBJECT_AGNOSTIC_NMS = _env_bool('AI_AGNOSTIC_NMS', False)
+
+# Warm each model with a one-shot dummy inference when it is first loaded, so the
+# first real frame of the first job doesn't pay the CUDA-context / cuDNN-autotune
+# / weight-upload latency. Best-effort — a failed warmup never blocks analysis.
+WARMUP = _env_bool('AI_WARMUP', True)
+
+# --- Video re-encode (annotated video + evidence clips) ----------------------
+# The annotated full-length video and each evidence clip are re-encoded to a
+# browser-playable H.264 file. NVENC (h264_nvenc) offloads that to the NVIDIA
+# GPU's dedicated hardware encoder — far faster than CPU libx264 on long videos —
+# but it needs an ffmpeg built WITH h264_nvenc (the bundled imageio-ffmpeg is not)
+# and an NVIDIA GPU. So it is best-effort with a guaranteed libx264 fallback:
+#   "auto" (default) → use NVENC when the ffmpeg binary advertises it, else
+#                      libx264; a failed NVENC run also falls back. NVENC can never
+#                      *break* a re-encode, only speed it up.
+#   "off"            → always libx264 (CPU). Forces CPU encoding.
+NVENC = os.getenv('AI_NVENC', 'auto').strip().lower()
 
 # --- Inference device --------------------------------------------------------
 # AI_DEVICE controls where YOLO runs:
@@ -105,20 +159,99 @@ def resolve_device():
             device = 'cpu'
 
     _resolved_device = device
-    logger.info('Running YOLO on device: %s', device)
+    if device == 0:
+        try:
+            import torch
+
+            logger.info(
+                'YOLO inference device: GPU 0 - %s (torch %s, CUDA %s)',
+                torch.cuda.get_device_name(0), torch.__version__, torch.version.cuda,
+            )
+        except Exception:  # noqa: BLE001 — device-name lookup is best-effort logging
+            logger.info('YOLO inference device: GPU 0')
+    else:
+        logger.info('YOLO inference device: CPU (no CUDA available or AI_DEVICE=cpu)')
     return device
 
 # --- Frame sampling ----------------------------------------------------------
-# Analyse every Nth frame. At ~30fps the default samples roughly twice/second.
-SAMPLE_EVERY_N_FRAMES = max(1, _env_int('AI_SAMPLE_RATE', 15))
+# Analyse every Nth frame. This stride is the single biggest lever on overlay
+# SMOOTHNESS: the client draws a box per sampled frame and linearly interpolates
+# between them, so a smaller stride = more anchor points = tighter, less "jumpy"
+# box motion (and finer-grained alert timing). At ~30fps, 15 sampled ~2x/second
+# (a point every ~0.5s); 5 samples ~6x/second (~0.17s) for visibly smoother
+# tracking. The cost is ~3x more inference — which is exactly what the GPU path
+# (FP16 HALF + warmed/cached models, above) is here to absorb, so this branch
+# defaults to the denser 5. On CPU-only hardware raise AI_SAMPLE_RATE back to 15.
+SAMPLE_EVERY_N_FRAMES = max(1, _env_int('AI_SAMPLE_RATE', 5))
 
 # --- Confidence thresholds ---------------------------------------------------
+# OBJECT_CONFIDENCE is the coarse predict() floor (in the live pipeline it is
+# overridden by the instructor's AIThresholds sensitivity — see
+# services.build_ai_report). On TOP of that floor each class has its own keep
+# threshold (CLASS_CONFIDENCE), applied post-inference in the detector as
+# max(floor, class_keep):
+#   * LAPTOP is kept HIGH (0.85) because YOLO reads bright rectangular exam
+#     paper/books as "laptop" with confidence reaching ~0.79; 0.85 rejects them
+#     regardless of the slider. This is the paper-false-positive fix.
+#   * PHONE keeps the floor (>=0.30 minimum) — phones are the real target and
+#     are hard to see, so recall is governed by the slider + imgsz, not a high
+#     per-class bar.
 OBJECT_CONFIDENCE = _env_float('AI_OBJECT_CONFIDENCE', 0.40)
+CLASS_CONFIDENCE = {
+    PHONE_DETECTED: _env_float('AI_PHONE_CONFIDENCE', 0.30),
+    LAPTOPS: _env_float('AI_LAPTOP_CONFIDENCE', 0.85),
+}
 # Minimum person/keypoint confidence required before head-pose is trusted.
 POSE_CONFIDENCE = _env_float('AI_POSE_CONFIDENCE', 0.50)
-# Nose offset from the eye midpoint, as a fraction of inter-eye distance,
-# beyond which the head is considered "turned away".
+# Nose offset from the eye midpoint, as a fraction of inter-eye distance.
+# Retained as a low-level input to the head-yaw estimate below.
 LOOKING_AWAY_RATIO = _env_float('AI_LOOKING_AWAY_RATIO', 0.35)
+
+# --- Head-pose (looking-away) gating -----------------------------------------
+# A person is only flagged LOOKING_AWAY when their head is turned SIDEWAYS by
+# more than this many degrees. Looking *down* (a vertical pitch — normal exam
+# behaviour) is never flagged because the estimate below is horizontal-only.
+LOOKING_AWAY_ANGLE_DEG = _env_float('AI_HEAD_TURN_ANGLE_DEG', 45.0)
+# Approximate nose-protrusion-to-inter-ocular-distance ratio used to convert the
+# 2D horizontal nose offset into a yaw angle: yaw ≈ atan(offset_ratio / this).
+# ~0.55 is a typical adult-face value; it is an approximation from 2D keypoints,
+# not a true 3D pose solve. Lower → the same offset reads as a larger angle.
+NOSE_DEPTH_RATIO = _env_float('AI_NOSE_DEPTH_RATIO', 0.55)
+
+# --- Head-pose (looking-away) v2 heuristic -----------------------------------
+# Replaces the brittle nose-vs-eye-midpoint yaw (above, kept for back-compat).
+# Up to three votes; LOOKING_AWAY is flagged only when at least
+# LOOKING_AWAY_MIN_VOTES fire AND the mandatory horizontal-offset vote (V2) is
+# among them — so a purely vertical pitch (looking down to write) never flags.
+#   V1  ear asymmetry — only one ear confidently visible (a profile); the
+#       visible-ear side also gives turn direction.
+#   V2  horizontal offset (MANDATORY) — nose displaced sideways from the
+#       shoulder midpoint, normalised by shoulder width (scale-invariant), so it
+#       reads pure yaw and ignores pitch.
+#   V3  corroborating — a horizontal offset large enough to be self-evident.
+EAR_VISIBLE_CONF = _env_float('AI_EAR_VISIBLE_CONF', 0.60)
+EAR_HIDDEN_CONF = _env_float('AI_EAR_HIDDEN_CONF', 0.35)
+EAR_CONF_RATIO = _env_float('AI_EAR_CONF_RATIO', 2.5)
+NOSE_SHOULDER_SIDEWAYS = _env_float('AI_NOSE_SHOULDER_SIDEWAYS', 0.35)
+NOSE_SHOULDER_TURNED = _env_float('AI_NOSE_SHOULDER_TURNED', 0.55)
+LOOKING_AWAY_MIN_VOTES = max(1, _env_int('AI_LOOKING_AWAY_VOTES', 2))
+
+# Master switch for looking-away detection. DEFAULT ON.
+#
+# WARNING: the 2-D head-yaw heuristic is sound for a FRONTAL (student-facing)
+# camera, but NOT for an oblique/ceiling/wide camera: perspective alone displaces
+# the nose horizontally and hides one ear for *forward-facing* students, so the
+# whole class trips it (one test clip flagged 7 of 12 forward/down-facing
+# students). On an oblique camera, disable it with AI_ENABLE_LOOKING_AWAY=false
+# (a real OS env var — this project's runtime does not load a .env file); the
+# proper path there is a dedicated 3D head-pose model (6DRepNet / L2CS-Net). The
+# pose pass still runs when this is off (it harvests the YOLO person boxes used
+# for evidence, H6) — only the looking-away *alerts* are suppressed.
+ENABLE_LOOKING_AWAY = _env_bool('AI_ENABLE_LOOKING_AWAY', True)
+
+# A looking-away event must contain at least this many *consecutive* sampled
+# frames before it becomes an alert — a single momentary glance never counts.
+LOOKING_AWAY_MIN_CONSECUTIVE = max(1, _env_int('AI_CONSECUTIVE_DETECTIONS', 3))
 
 # --- Temporal rules layer ----------------------------------------------------
 # Detections of the same class within this sliding window merge into one event.

@@ -1,6 +1,7 @@
 from django.contrib.auth import get_user_model
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
+from django.urls import reverse
 from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
@@ -14,8 +15,8 @@ from .models import (
     UserPreferences, Video, Workspace, WorkspaceInvite, WorkspaceMembership,
 )
 from .selectors import (
-    actionable_exams, assigned_supervisor_ids, can_supervise_exam, can_view_report,
-    is_admin, is_dean, owned_sessions, owned_students, owned_videos,
+    actionable_exams, assigned_supervisor_ids, calendar_exams, can_supervise_exam,
+    can_view_report, is_admin, is_dean, owned_sessions, owned_students, owned_videos,
     recent_day_window, users_visible_to, visible_sessions, visible_videos,
 )
 from .serializers import (
@@ -50,6 +51,7 @@ from .services import (
     resolve_calendar_exam,
     respond_to_workspace_invite,
     send_workspace_invite,
+    sync_exam_supervisors,
     system_metrics,
     update_global_thresholds,
     update_user_thresholds,
@@ -257,7 +259,15 @@ class VideoUploadView(APIView):
             target_resource=str(video.id),
             metadata={'filename': video.original_filename, 'session': str(video.session_id)},
         )
-        return Response(VideoReadSerializer(video, context={'request': request}).data, status=status.HTTP_201_CREATED)
+        response = Response(
+            VideoReadSerializer(video, context={'request': request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+        # Location points at the newly created resource so the client can follow
+        # it without parsing the body for the id (RFC 7231 §7.1.2).
+        response['Location'] = request.build_absolute_uri(
+            reverse('videos_detail', kwargs={'pk': video.id}))
+        return response
 
 
 class AnalyzeVideoView(APIView):
@@ -270,6 +280,11 @@ class AnalyzeVideoView(APIView):
     ``202 Accepted`` and the client polls the video/report endpoints for
     completion.
     """
+
+    # Hint (seconds) for how soon a client should poll after a 202. The job is
+    # typically still QUEUED on return with a real worker; a few seconds avoids
+    # a tight poll loop without making the UI feel stalled.
+    RETRY_AFTER_SECONDS = 5
 
     def post(self, request, pk):
         video = get_object_or_404(owned_videos(request.user), pk=pk)
@@ -294,7 +309,14 @@ class AnalyzeVideoView(APIView):
                 'created_at',
             ))
             return Response(payload)
-        return Response(payload, status=status.HTTP_202_ACCEPTED)
+
+        response = Response(payload, status=status.HTTP_202_ACCEPTED)
+        # Tell the client when to poll and where: Retry-After is the suggested
+        # delay, Location is the resource whose status it should re-fetch.
+        response['Retry-After'] = str(self.RETRY_AFTER_SECONDS)
+        response['Location'] = request.build_absolute_uri(
+            reverse('videos_detail', kwargs={'pk': video.id}))
+        return response
 
 
 class VideoHistoryView(APIView):
@@ -425,6 +447,11 @@ class SessionReportView(APIView):
             # The annotated full-length video (boxes/labels drawn on flagged
             # frames), produced by the analysis pipeline. None until analysis runs.
             'annotated_video_url': absolute((job.metadata or {}).get('annotated_video_url')) if job else None,
+            # Per-person box tracks (source-frame pixel coords) for the live
+            # client-side overlay drawn over the original video. None for jobs
+            # analysed before this existed; the player then uses the annotated
+            # video instead. Coords are not URLs, so they pass through verbatim.
+            'overlay': (job.metadata or {}).get('overlay') if job else None,
         }
 
         if report is None:
@@ -928,6 +955,8 @@ class WorkspaceInviteView(APIView):
         invitee = User.objects.filter(email__iexact=invitee_email).first()
         if invitee is None:
             raise NotFound('No user found with this email')
+        if invitee.id == request.user.id:
+            raise ValidationError('You cannot invite yourself')
         if invitee.is_superuser or invitee.role == User.Role.ADMIN:
             raise ValidationError('Cannot invite admin users')
         if invitee.role not in (User.Role.INSTRUCTOR, User.Role.DEAN):
@@ -966,7 +995,13 @@ class InviteRespondView(APIView):
     permission_classes = [AllowAny]
     accepted = True  # overridden per-URL via .as_view(accepted=...)
 
-    def get(self, request, token):
+    def post(self, request, token):
+        # POST, not GET: responding to an invite mutates state (joins a
+        # workspace / sets the invite status), so it must not happen on a GET.
+        # Email security scanners and link-preview bots issue GET requests when
+        # they pre-fetch the link in the invite email; with a GET handler that
+        # silently accepted/declined the invite before the human ever clicked
+        # (RFC 7231 §4.2.1 — GET must be safe). The frontend page now POSTs.
         invite = get_object_or_404(
             WorkspaceInvite.objects.select_related('instructor', 'dean', 'exam', 'workspace'),
             token=token,
@@ -1138,6 +1173,87 @@ class ExamListView(APIView):
         return Response(ExamReadSerializer(exams, many=True).data)
 
 
+def _apply_exam_schedule(exam, data):
+    """Set calendar schedule/presentation fields on *exam* from request *data*.
+
+    Only keys present in *data* are touched. Date/time arrive as ISO strings
+    ('YYYY-MM-DD' / 'HH:MM'); a blank value clears the field. Returns the list of
+    changed field names (so the caller can ``save(update_fields=...)``).
+    """
+    from django.utils.dateparse import parse_date, parse_time
+
+    changed = []
+    if 'course' in data:
+        exam.course = (data.get('course') or '')[:255]
+        changed.append('course')
+    if 'hall' in data:
+        exam.hall = (data.get('hall') or '')[:255]
+        changed.append('hall')
+    if data.get('color'):
+        exam.color = str(data['color'])[:20]
+        changed.append('color')
+    if data.get('recording_mode') in dict(Exam.RecordingMode.choices):
+        exam.recording_mode = data['recording_mode']
+        changed.append('recording_mode')
+    if 'date' in data or 'scheduled_date' in data:
+        raw = data.get('date') or data.get('scheduled_date')
+        exam.scheduled_date = parse_date(raw) if raw else None
+        changed.append('scheduled_date')
+    if 'start_time' in data:
+        raw = data.get('start_time')
+        exam.start_time = parse_time(raw) if raw else None
+        changed.append('start_time')
+    if 'end_time' in data:
+        raw = data.get('end_time')
+        exam.end_time = parse_time(raw) if raw else None
+        changed.append('end_time')
+    return changed
+
+
+class CalendarExamsView(APIView):
+    """The shared exam calendar: list visible exams, or schedule a new one.
+
+    * **GET** — every authenticated user gets the exams on their calendar
+      (:func:`calendar_exams`): a dean sees their workspace's exams; an instructor
+      sees their own plus every exam a dean has assigned them to supervise.
+    * **POST** — dean/admin only. Creates a scheduled exam owned by the dean and
+      assigns the given ``supervisor_ids`` immediately (each gets an
+      EXAM_ASSIGNED notification and the exam appears on their calendar at once).
+
+    This replaces the old client-cookie ("mock") calendar so exams are real,
+    shared backend records — visible across users and devices.
+    """
+
+    def get(self, request):
+        exams = calendar_exams(request.user).order_by('scheduled_date', 'start_time', '-created_at')
+        return Response(ExamReadSerializer(exams, many=True).data)
+
+    def post(self, request):
+        if not (is_admin(request.user) or is_dean(request.user)):
+            raise PermissionDenied('Only deans or administrators can schedule exams.')
+
+        name = (request.data.get('name') or '').strip()
+        if not name:
+            raise ValidationError({'name': 'Exam name is required.'})
+
+        exam = Exam(
+            instructor=request.user,
+            name=name,
+            description=request.data.get('description') or '',
+        )
+        _apply_exam_schedule(exam, request.data)
+        exam.save()
+
+        schedule = {
+            'date': request.data.get('date') or request.data.get('scheduled_date'),
+            'start_time': request.data.get('start_time'),
+            'end_time': request.data.get('end_time'),
+            'hall': request.data.get('hall'),
+        }
+        sync_exam_supervisors(request.user, exam, request.data.get('supervisor_ids'), schedule=schedule)
+        return Response(ExamReadSerializer(exam).data, status=status.HTTP_201_CREATED)
+
+
 class ExamDetailView(APIView):
     """Edit/delete an exam, notifying every assigned supervisor.
 
@@ -1163,14 +1279,35 @@ class ExamDetailView(APIView):
         if not can_edit:
             raise PermissionDenied('You do not have permission to edit this exam.')
 
+        changed = ['updated_at']
         name = request.data.get('name')
         if name is not None and str(name).strip():
             exam.name = str(name).strip()
+            changed.append('name')
         if 'description' in request.data:
             exam.description = request.data.get('description') or ''
-        exam.save(update_fields=['name', 'description', 'updated_at'])
+            changed.append('description')
+        # Persist any calendar schedule/presentation fields that were sent.
+        changed.extend(_apply_exam_schedule(exam, request.data))
+        exam.save(update_fields=list(dict.fromkeys(changed)))
 
-        supervisors = exam_supervisor_users(exam, request.data.get('supervisor_ids'))
+        # Re-assign supervisors (dean/admin only): newly-added supervisors get an
+        # EXAM_ASSIGNED notification from sync; everyone else gets EXAM_UPDATED.
+        added = []
+        if 'supervisor_ids' in request.data and (is_admin(request.user) or is_dean(request.user)):
+            schedule = {
+                'date': request.data.get('date') or request.data.get('scheduled_date'),
+                'start_time': request.data.get('start_time'),
+                'end_time': request.data.get('end_time'),
+                'hall': request.data.get('hall'),
+            }
+            added = sync_exam_supervisors(request.user, exam, request.data.get('supervisor_ids'), schedule=schedule)
+
+        added_ids = {u.id for u in added}
+        supervisors = [
+            u for u in exam_supervisor_users(exam, request.data.get('supervisor_ids'))
+            if u.id not in added_ids
+        ]
         new_date = request.data.get('date') or 'the same date'
         start_time = request.data.get('start_time') or request.data.get('time') or 'the same time'
         end_time = request.data.get('end_time') or ''
@@ -1191,22 +1328,20 @@ class ExamDetailView(APIView):
         if not (is_admin(request.user) or is_dean(request.user)):
             raise PermissionDenied('Only deans or administrators can delete exams.')
 
-        # Resolve recipients and compose the message *before* deleting the exam.
+        # Resolve recipients and capture the message fields *before* deleting —
+        # the supervisor links and the exam's own attributes are gone once the
+        # cascade runs. We only *send* after the delete succeeds (see below).
         supervisors = exam_supervisor_users(exam, request.data.get('supervisor_ids'))
         name = exam.name
         exam_id = str(exam.id)
         date = request.data.get('date') or 'its scheduled date'
         time = request.data.get('time') or 'its scheduled time'
-        notify_users(
-            supervisors,
-            Notification.NotifType.EXAM_CANCELLED,
-            f'Exam cancelled: {name}',
-            f'The exam "{name}" scheduled for {date} at {time} has been deleted. '
-            f'All sessions and uploaded videos were removed. This cannot be undone.',
-            metadata={'exam_name': name},
-        )
-        # Remove on-disk media (videos, clips, snapshots) before the DB cascade
-        # drops the rows that point at them.
+
+        # Delete first, notify last (M11). Media goes before the DB cascade so the
+        # rows pointing at the files still exist while the files are removed; the
+        # "exam cancelled" emails are sent only once the exam is actually gone, so
+        # a disk error mid-delete never tells recipients an exam was removed while
+        # it still exists.
         delete_exam_media(exam)
         write_audit_log(
             request,
@@ -1215,4 +1350,13 @@ class ExamDetailView(APIView):
             metadata={'name': name},
         )
         exam.delete()
+
+        notify_users(
+            supervisors,
+            Notification.NotifType.EXAM_CANCELLED,
+            f'Exam cancelled: {name}',
+            f'The exam "{name}" scheduled for {date} at {time} has been deleted. '
+            f'All sessions and uploaded videos were removed. This cannot be undone.',
+            metadata={'exam_name': name},
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)

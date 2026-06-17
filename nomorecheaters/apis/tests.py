@@ -35,7 +35,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from .models import (
-    Alert, AnalysisJob, AuditLog, Exam, ExamSession, Report,
+    Alert, AnalysisJob, AuditLog, Exam, ExamSession, Notification, Report,
     SystemSettings, UserPreferences, Video,
 )
 from .serializers import (
@@ -708,6 +708,8 @@ class VideoWorkflowAPITests(APITestCase):
         self.assertEqual(Video.objects.count(), 1)
         self.assertEqual(response.data['session_status'], ExamSession.Status.PENDING)
         self.assertEqual(AuditLog.objects.filter(action=AuditLog.ActionType.VIDEO_UPLOADED).count(), 1)
+        # 201 advertises the new resource via Location (no body-parse needed).
+        self.assertIn(str(Video.objects.get().id), response['Location'])
 
     def test_analyze_video_creates_job_alert_report_and_updates_history(self):
         session = make_session(exam=make_exam(instructor=self.user))
@@ -852,6 +854,689 @@ class ThresholdsAndSystemAPITests(APITestCase):
         self.assertIn('counts', metrics_response.data)
         self.assertEqual(logs_response.status_code, status.HTTP_200_OK)
         self.assertEqual(logs_response.data['count'], 1)
+
+
+class ValidateThresholdsTests(APITestCase):
+    """M3: validate_thresholds rejects unknown keys instead of dropping them."""
+
+    def test_unknown_key_is_rejected(self):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        from apis.services import validate_thresholds
+
+        with self.assertRaises(DRFValidationError) as ctx:
+            validate_thresholds({'gaze_treshold': 0.5})  # typo'd key
+        self.assertIn('gaze_treshold', ctx.exception.detail)
+
+    def test_unknown_key_rejected_even_alongside_valid_keys(self):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        from apis.services import validate_thresholds
+
+        with self.assertRaises(DRFValidationError):
+            validate_thresholds({'gaze_threshold': 0.5, 'bogus': 0.5})
+
+    def test_known_keys_pass_through_as_floats(self):
+        from apis.services import validate_thresholds
+
+        cleaned = validate_thresholds({'gaze_threshold': '0.5', 'noise_threshold': 0.7})
+        self.assertEqual(cleaned, {'gaze_threshold': 0.5, 'noise_threshold': 0.7})
+
+    def test_out_of_range_and_non_numeric_still_rejected(self):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        from apis.services import validate_thresholds
+
+        with self.assertRaises(DRFValidationError):
+            validate_thresholds({'gaze_threshold': 2.0})
+        with self.assertRaises(DRFValidationError):
+            validate_thresholds({'gaze_threshold': 'abc'})
+
+    def test_unknown_key_returns_400_from_api(self):
+        instructor = make_user(username='m3user', email='m3@example.com')
+        self.client.force_authenticate(instructor)
+        response = self.client.patch(
+            reverse('my_thresholds'), {'gaze_treshold': 0.5}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class ThresholdPayloadCoercionTests(TestCase):
+    """M2: threshold_payload tolerates non-numeric stored values."""
+
+    def test_non_numeric_stored_value_falls_back_to_default(self):
+        from apis.services import THRESHOLD_DEFAULTS, threshold_payload
+
+        payload = threshold_payload({'gaze_threshold': 'corrupt'})
+        self.assertEqual(payload['gaze_threshold'],
+                         float(THRESHOLD_DEFAULTS['gaze_threshold']))
+
+    def test_none_stored_value_falls_back_to_default(self):
+        from apis.services import THRESHOLD_DEFAULTS, threshold_payload
+
+        payload = threshold_payload({'noise_threshold': None})
+        self.assertEqual(payload['noise_threshold'],
+                         float(THRESHOLD_DEFAULTS['noise_threshold']))
+
+    def test_numeric_string_is_preserved(self):
+        from apis.services import threshold_payload
+
+        payload = threshold_payload({'gaze_threshold': '0.42'})
+        self.assertEqual(payload['gaze_threshold'], 0.42)
+
+    def test_get_global_thresholds_survives_corrupt_setting(self):
+        from apis.services import get_global_thresholds
+
+        SystemSettings.objects.update_or_create(
+            setting_key='gaze_threshold',
+            defaults={'setting_value': 'not-a-number'},
+        )
+        # Must not raise; the corrupt value degrades to the default.
+        payload = get_global_thresholds()
+        self.assertIsInstance(payload['gaze_threshold'], float)
+
+
+class SendWorkspaceInviteMembershipTests(TestCase):
+    """M13: send_workspace_invite refuses to re-invite an existing member."""
+
+    def _setup(self):
+        from apis.models import Workspace
+
+        dean = make_user(username='dean13', email='dean13@example.com',
+                         role=User.Role.DEAN)
+        instructor = make_user(username='inst13', email='inst13@example.com')
+        workspace = Workspace.objects.create(name='Physics Dept', owner=dean)
+        return dean, instructor, workspace
+
+    def test_invite_rejected_for_existing_member(self):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        from apis.models import WorkspaceInvite, WorkspaceMembership
+        from apis.services import send_workspace_invite
+
+        dean, instructor, workspace = self._setup()
+        WorkspaceMembership.objects.create(workspace=workspace, instructor=instructor)
+
+        with self.assertRaises(DRFValidationError):
+            send_workspace_invite(dean, instructor, workspace=workspace)
+        # No duplicate invite row created for the existing member.
+        self.assertFalse(WorkspaceInvite.objects.filter(
+            workspace=workspace, instructor=instructor).exists())
+
+    def test_invite_allowed_for_non_member(self):
+        from apis.models import WorkspaceInvite
+        from apis.services import send_workspace_invite
+
+        dean, instructor, workspace = self._setup()
+        invite = send_workspace_invite(dean, instructor, workspace=workspace)
+
+        self.assertEqual(invite.workspace_id, workspace.id)
+        self.assertTrue(WorkspaceInvite.objects.filter(id=invite.id).exists())
+
+    def test_exam_only_invite_not_blocked_by_membership(self):
+        from apis.services import send_workspace_invite
+
+        dean, instructor, _workspace = self._setup()
+        exam = make_exam(instructor=dean)
+        # No workspace target → membership guard does not apply.
+        invite = send_workspace_invite(dean, instructor, exam=exam)
+        self.assertEqual(invite.exam_id, exam.id)
+
+    def test_self_invite_rejected(self):
+        """A dean cannot invite themselves into their own workspace.
+
+        Accepting such an invite would make the owner a member of their own
+        workspace and corrupt accepted_instructor_rows.
+        """
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        from apis.models import WorkspaceInvite
+        from apis.services import send_workspace_invite
+
+        dean, _instructor, workspace = self._setup()
+        with self.assertRaises(DRFValidationError):
+            send_workspace_invite(dean, dean, workspace=workspace)
+        self.assertFalse(WorkspaceInvite.objects.filter(
+            workspace=workspace, instructor=dean).exists())
+
+
+class InviteRespondMethodTests(APITestCase):
+    """Invite accept/decline must be POST, not a GET with side effects."""
+
+    def _invite(self):
+        from apis.models import Workspace, WorkspaceInvite
+
+        dean = make_user(username='deanIR', email='deanir@example.com',
+                         role=User.Role.DEAN)
+        instructor = make_user(username='instIR', email='instir@example.com')
+        workspace = Workspace.objects.create(name='Stats Dept', owner=dean)
+        invite = WorkspaceInvite.objects.create(
+            dean=dean, instructor=instructor, workspace=workspace)
+        return invite
+
+    def test_get_is_rejected_with_no_side_effect(self):
+        from apis.models import WorkspaceInvite
+
+        invite = self._invite()
+        response = self.client.get(
+            reverse('invite_accept', kwargs={'token': invite.token}))
+
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+        invite.refresh_from_db()
+        # The bot's GET prefetch must not have accepted the invite.
+        self.assertEqual(invite.status, WorkspaceInvite.Status.PENDING)
+
+    def test_post_accept_joins_workspace(self):
+        from apis.models import WorkspaceInvite, WorkspaceMembership
+
+        invite = self._invite()
+        response = self.client.post(
+            reverse('invite_accept', kwargs={'token': invite.token}))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        invite.refresh_from_db()
+        self.assertEqual(invite.status, WorkspaceInvite.Status.ACCEPTED)
+        self.assertTrue(WorkspaceMembership.objects.filter(
+            workspace=invite.workspace, instructor=invite.instructor).exists())
+
+    def test_post_decline_sets_declined(self):
+        from apis.models import WorkspaceInvite
+
+        invite = self._invite()
+        response = self.client.post(
+            reverse('invite_decline', kwargs={'token': invite.token}))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        invite.refresh_from_db()
+        self.assertEqual(invite.status, WorkspaceInvite.Status.DECLINED)
+
+
+class UploadSessionBoundTests(TestCase):
+    """N4: get_available_upload_session must not probe identifiers forever.
+
+    Each probe is a `get_or_create` round trip, so an unbounded loop lets one
+    identifier with many occupied sessions fire thousands of queries. The loop
+    is capped at MAX_UPLOAD_SESSION_ATTEMPTS, after which it raises rather than
+    spinning.
+    """
+
+    def _upload(self):
+        return SimpleNamespace(name='john.mp4')
+
+    def _occupy(self, instructor, upload, ident, n):
+        """Allocate *n* sessions for *ident* and attach a video to each."""
+        from apis.services import get_available_upload_session
+
+        sessions = []
+        for i in range(n):
+            session = get_available_upload_session(
+                instructor, upload, student_identifier=ident)
+            Video.objects.create(
+                session=session,
+                original_filename='x.mp4',
+                file='x.mp4',
+                file_hash=f'hash-{i}-{uuid.uuid4().hex}',
+            )
+            sessions.append(session)
+        return sessions
+
+    def test_reuses_next_free_identifier_variant(self):
+        from apis.services import get_available_upload_session
+
+        instructor = make_user()
+        upload = self._upload()
+        first, = self._occupy(instructor, upload, 'john', 1)
+
+        # 'john' is taken, so the next allocation must fall through to 'john-2'.
+        nxt = get_available_upload_session(
+            instructor, upload, student_identifier='john')
+
+        self.assertNotEqual(nxt.id, first.id)
+        self.assertEqual(nxt.student_identifier, 'john-2')
+        self.assertFalse(hasattr(nxt, 'video'))
+
+    def test_raises_after_max_attempts_exhausted(self):
+        from apis import services
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        instructor = make_user()
+        upload = self._upload()
+
+        # Cap the loop low so the test stays fast; occupy every slot it will probe.
+        with mock.patch.object(services, 'MAX_UPLOAD_SESSION_ATTEMPTS', 3):
+            self._occupy(instructor, upload, 'john', 3)
+
+            with self.assertRaises(DRFValidationError) as ctx:
+                services.get_available_upload_session(
+                    instructor, upload, student_identifier='john')
+
+        self.assertIn('john', str(ctx.exception.detail))
+        # No runaway session creation past the cap: john, john-2, john-3 only.
+        self.assertEqual(
+            ExamSession.objects.filter(
+                student_identifier__startswith='john').count(),
+            3,
+        )
+
+
+class UploadRewindHardeningTests(TestCase):
+    """N5: the post-hash rewind must be verified so a stuck descriptor can't
+    silently store a truncated video."""
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
+
+    def test_full_content_is_stored_after_rewind(self):
+        """The happy path: hashing consumes the stream, yet the saved file holds
+        every byte — proof the rewind put the descriptor back to the start."""
+        instructor = make_user()
+        session = make_session(exam=make_exam(instructor=instructor))
+        content = fake_video_bytes(b'the complete payload must survive hashing')
+        upload = SimpleUploadedFile('exam.mp4', content, content_type='video/mp4')
+        serializer = VideoUploadSerializer(
+            data={'session': str(session.id), 'file': upload},
+            context={'request': request_for(instructor)},
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        video = serializer.save()
+
+        video.file.open('rb')
+        try:
+            stored = video.file.read()
+        finally:
+            video.file.close()
+        self.assertEqual(stored, content)
+
+    def test_unverified_rewind_is_rejected_without_writing_a_row(self):
+        """A descriptor left at EOF (a seek that didn't take) must raise rather
+        than persist a truncated file."""
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        instructor = make_user()
+        session = make_session(exam=make_exam(instructor=instructor))
+        content = fake_video_bytes(b'stuck stream')
+
+        class _StuckFile:
+            """File-like whose seek(0) silently fails to rewind."""
+            name = 'exam.mp4'
+            content_type = 'video/mp4'
+            size = len(content)
+
+            def chunks(self):
+                yield content
+
+            def seek(self, _pos):
+                pass  # no-op: the rewind does not take effect
+
+            def tell(self):
+                return len(content)  # still at EOF
+
+        serializer = VideoUploadSerializer(
+            context={'request': request_for(instructor)})
+        with self.assertRaises(DRFValidationError):
+            serializer.create({'file': _StuckFile(), 'session': session})
+
+        self.assertFalse(Video.objects.filter(session=session).exists())
+
+
+class MediaUrlForTests(TestCase):
+    """M5: _media_url_for must never emit a protocol-relative '//...' URL."""
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
+
+    def _path(self):
+        return str(Path(self.media_root) / 'clips' / 'sess' / 'x.mp4')
+
+    def test_standard_media_url(self):
+        from apis.services import _media_url_for
+
+        with override_settings(MEDIA_URL='/media/'):
+            self.assertEqual(_media_url_for(self._path()), '/media/clips/sess/x.mp4')
+
+    def test_empty_media_url_is_not_protocol_relative(self):
+        from apis.services import _media_url_for
+
+        with override_settings(MEDIA_URL=''):
+            url = _media_url_for(self._path())
+
+        self.assertFalse(url.startswith('//'))
+        self.assertEqual(url, '/media/clips/sess/x.mp4')
+
+    def test_bare_slash_media_url_is_not_protocol_relative(self):
+        from apis.services import _media_url_for
+
+        with override_settings(MEDIA_URL='/'):
+            url = _media_url_for(self._path())
+
+        self.assertFalse(url.startswith('//'))
+        self.assertEqual(url, '/media/clips/sess/x.mp4')
+
+    def test_absolute_cdn_media_url_is_used_verbatim(self):
+        from apis.services import _media_url_for
+
+        with override_settings(MEDIA_URL='https://cdn.example.com/media/'):
+            self.assertEqual(
+                _media_url_for(self._path()),
+                'https://cdn.example.com/media/clips/sess/x.mp4')
+
+    def test_path_outside_media_root_returns_none(self):
+        from apis.services import _media_url_for
+
+        outside = str(Path(self.media_root).parent / 'outside.mp4')
+        self.assertIsNone(_media_url_for(outside))
+
+    def test_empty_path_returns_none(self):
+        from apis.services import _media_url_for
+
+        self.assertIsNone(_media_url_for(''))
+
+
+class _FakeDetection:
+    """Duck-types a yolo/pose detection: behavior_type, confidence, bbox."""
+
+    def __init__(self, behavior_type, confidence, bbox):
+        self.behavior_type = behavior_type
+        self.confidence = confidence
+        self.bbox = bbox
+
+
+class _FakeObjectDetector:
+    """Stands in for the YOLO object detector — the third-party model boundary.
+
+    Returns scripted detections keyed by the frame token (we set each sampled
+    frame's payload to its timestamp), so the REAL detector→consolidation
+    orchestration runs without OpenCV, torch, or model weights.
+    """
+
+    model_path = 'fake-object-model.pt'
+
+    def __init__(self, script):
+        self._script = script
+
+    def detect(self, frame):
+        return list(self._script.get(frame, []))
+
+
+class _FakePoseAnalyzer:
+    """Stands in for the pose analyzer; also emits the per-frame person boxes."""
+
+    model_path = 'fake-pose-model.pt'
+
+    def __init__(self, pose_script, person_script):
+        self._pose = pose_script
+        self._persons = person_script
+
+    def analyze_frame(self, frame):
+        return list(self._pose.get(frame, [])), list(self._persons.get(frame, []))
+
+
+def _scripted_pipeline_io():
+    """A deterministic 5-second clip script for the integration tests.
+
+    Three people, sampled twice a second:
+      * a phone visible in a SINGLE sampled frame (direct evidence — must survive
+        despite zero duration),
+      * two distinct people (left + right) looking away for a sustained 2s (must
+        stay two separate events, not merge — H11),
+      * one centre person looking away for a single frame (a blip that must be
+        dropped by the min-duration noise filter).
+    Person boxes are emitted only for the two sustained people, so the YOLO-box
+    person index (H6) resolves exactly two people.
+    """
+    from apis.ai import config
+
+    sample_ts = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5]
+    left = (30, 100, 130, 200)
+    right = (510, 100, 610, 200)
+    centre = (270, 100, 370, 200)
+
+    obj_script = {1.0: [_FakeDetection(config.PHONE_DETECTED, 0.92, (200, 150, 260, 210))]}
+    pose_script = {0.0: [_FakeDetection(config.LOOKING_AWAY, 0.70, centre)]}
+    person_script = {}
+    for ts in (2.0, 2.5, 3.0, 3.5, 4.0):
+        pose_script[ts] = [
+            _FakeDetection(config.LOOKING_AWAY, 0.80, left),
+            _FakeDetection(config.LOOKING_AWAY, 0.75, right),
+        ]
+        person_script[ts] = [(left, 0.9), (right, 0.9)]
+    return sample_ts, obj_script, pose_script, person_script
+
+
+def _fake_frame_samples(sample_ts):
+    from apis.ai.frame_extractor import FrameSample
+
+    # The frame payload is the timestamp, which the fake detectors key off.
+    return [FrameSample(frame=ts, frame_number=i, timestamp_sec=ts)
+            for i, ts in enumerate(sample_ts)]
+
+
+def _fake_video_metadata():
+    from apis.ai.frame_extractor import VideoMetadata
+
+    return VideoMetadata(fps=30.0, total_frames=150, duration_sec=5.0,
+                         width=640, height=480)
+
+
+class AIPipelineIntegrationTests(TestCase):
+    """H10: exercise the REAL pipeline end to end (frame sampling →
+    detection → temporal consolidation → person tracking → Alert/Report),
+    with only the YOLO model and the OpenCV frame I/O stubbed. The existing
+    suite mocks ``analyze_video`` wholesale; these tests do not."""
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
+
+    def test_analyze_video_orchestration(self):
+        from apis.ai import analyze_video
+
+        sample_ts, obj_script, pose_script, person_script = _scripted_pipeline_io()
+
+        with mock.patch('apis.ai.config.ENABLE_LOOKING_AWAY', True), \
+                mock.patch('apis.ai.detector.read_metadata',
+                           return_value=_fake_video_metadata()), \
+                mock.patch('apis.ai.detector.iter_sampled_frames',
+                           side_effect=lambda *a, **k: iter(_fake_frame_samples(sample_ts))):
+            result = analyze_video(
+                '/does/not/exist.mp4',
+                annotate=False,
+                object_detector=_FakeObjectDetector(obj_script),
+                pose_analyzer=_FakePoseAnalyzer(pose_script, person_script),
+            )
+
+        # Three surviving events: 1 phone + 2 distinct people looking away.
+        self.assertEqual(result.metadata['events_by_type'],
+                         {'PHONE_DETECTED': 1, 'LOOKING_AWAY': 2})
+        self.assertEqual(len(result.events), 3)
+
+        # The phone survived as direct evidence despite a single-frame sighting.
+        phone = [e for e in result.events if e.behavior_type == 'PHONE_DETECTED']
+        self.assertEqual(len(phone), 1)
+        self.assertEqual(phone[0].frame_count, 1)
+
+        # Two distinct people looking away stayed two events, not one (H11); the
+        # centre person's single-frame blip was dropped by the duration filter.
+        looking = [e for e in result.events if e.behavior_type == 'LOOKING_AWAY']
+        self.assertEqual(len(looking), 2)
+        self.assertTrue(all(e.duration_sec >= 2.0 for e in looking))
+
+        # The person index built from the harvested YOLO boxes saw two people (H6).
+        self.assertEqual(len(result.person_index.tracks), 2)
+
+        # Metadata provenance reflects the (injected) models that actually ran (H3).
+        self.assertEqual(result.metadata['frames_analyzed'], 10)
+        self.assertEqual(result.metadata['raw_detections'], 12)  # 1 phone + 1 + 5*2 pose
+        self.assertEqual(result.metadata['model']['object'], 'fake-object-model.pt')
+        self.assertIsNone(result.annotated_video_path)  # annotate=False
+
+    def test_looking_away_suppressed_when_disabled_by_default(self):
+        """With ENABLE_LOOKING_AWAY off (the default), looking-away alerts are
+        suppressed while object evidence still flags — and the YOLO person index
+        is still built (H6 person tracking is independent of the gate)."""
+        from apis.ai import analyze_video
+
+        sample_ts, obj_script, pose_script, person_script = _scripted_pipeline_io()
+
+        with mock.patch('apis.ai.detector.read_metadata',
+                        return_value=_fake_video_metadata()), \
+                mock.patch('apis.ai.detector.iter_sampled_frames',
+                           side_effect=lambda *a, **k: iter(_fake_frame_samples(sample_ts))):
+            result = analyze_video(
+                '/does/not/exist.mp4',
+                annotate=False,
+                object_detector=_FakeObjectDetector(obj_script),
+                pose_analyzer=_FakePoseAnalyzer(pose_script, person_script),
+            )
+
+        # The phone (direct evidence) survives; every looking-away event is gone.
+        self.assertEqual(result.metadata['events_by_type'], {'PHONE_DETECTED': 1})
+        self.assertTrue(all(e.behavior_type != 'LOOKING_AWAY' for e in result.events))
+        # H6 person tracking is unaffected by the looking-away gate.
+        self.assertEqual(len(result.person_index.tracks), 2)
+
+    def test_build_ai_report_end_to_end(self):
+        import logging
+
+        from apis.ai import detector as ai_detector
+        from apis.services import build_ai_report
+
+        instructor = make_user()
+        session = make_session(exam=make_exam(instructor=instructor))
+        Video.objects.create(
+            session=session,
+            file=SimpleUploadedFile('clip.mp4', fake_video_bytes(b'integration'),
+                                    content_type='video/mp4'),
+            original_filename='clip.mp4',
+            file_hash=hashlib.sha256(b'integration').hexdigest(),
+            size_bytes=128,
+        )
+
+        sample_ts, obj_script, pose_script, person_script = _scripted_pipeline_io()
+        real_analyze = ai_detector.analyze_video
+        captured = {}
+
+        def fake_analyze(path, **kwargs):
+            # Record the kwargs the service threaded in (C1: the instructor's
+            # confidence floor reaches the detectors), then run the REAL pipeline
+            # with injected detectors and no annotation (no OpenCV needed).
+            captured.update(kwargs)
+            return real_analyze(
+                path,
+                annotate=False,
+                object_detector=_FakeObjectDetector(obj_script),
+                pose_analyzer=_FakePoseAnalyzer(pose_script, person_script),
+            )
+
+        # Without OpenCV the per-alert evidence extractors fail and the M1
+        # isolation logic logs each one. That degraded path is not what this test
+        # asserts (it checks the Alert/Report mapping), so quiet the noise.
+        logging.disable(logging.CRITICAL)
+        try:
+            with mock.patch('apis.ai.config.ENABLE_LOOKING_AWAY', True), \
+                    mock.patch('apis.ai.analyze_video', side_effect=fake_analyze), \
+                    mock.patch('apis.ai.detector.read_metadata',
+                               return_value=_fake_video_metadata()), \
+                    mock.patch('apis.ai.detector.iter_sampled_frames',
+                               side_effect=lambda *a, **k: iter(_fake_frame_samples(sample_ts))):
+                report = build_ai_report(session)
+        finally:
+            logging.disable(logging.NOTSET)
+
+        # The consolidated events became Alert rows and one aggregate Report.
+        self.assertEqual(report.total_alerts, 3)
+        self.assertEqual(report.alerts_by_type,
+                         {'PHONE_DETECTED': 1, 'LOOKING_AWAY': 2})
+        self.assertGreater(report.overall_cheating_probability, 0.0)
+        self.assertLessEqual(report.overall_cheating_probability, 1.0)
+        self.assertIn('3 alert(s) detected', report.summary)
+
+        alerts = list(session.alerts.all())
+        self.assertEqual(len(alerts), 3)
+        self.assertEqual({a.behavior_type for a in alerts},
+                         {'PHONE_DETECTED', 'LOOKING_AWAY'})
+        self.assertTrue(all((a.metadata or {}).get('source') == 'ai-pipeline'
+                            for a in alerts))
+
+        # C1: the AIThresholds-derived confidence floor was wired into the pipeline.
+        self.assertIn('object_confidence', captured)
+        self.assertIn('pose_confidence', captured)
+
+
+class PasswordResetRedirectTests(TestCase):
+    """M14 / FE-BUG-01: the reset-email redirect must hand the SPA both the uid
+    and the token as path segments, matching the frontend's splat route."""
+
+    def test_confirm_redirect_carries_uid_and_token_segments(self):
+        from django.conf import settings
+
+        uid, token = 'MQ', 'set-abc123def'
+        response = self.client.get(
+            reverse('password_reset_confirm', kwargs={'uid': uid, 'token': token}))
+
+        self.assertEqual(response.status_code, 302)
+        expected = (settings.FRONTEND_URL.rstrip('/')
+                    + f'/account/password/reset/key/{uid}/{token}/')
+        self.assertEqual(response['Location'], expected)
+        # The frontend splat reads the last two '/'-segments as uid/token, so the
+        # tail must be exactly two segments — not one combined ':key'.
+        tail = response['Location'].split('/account/password/reset/key/', 1)[1]
+        self.assertEqual([p for p in tail.split('/') if p], [uid, token])
+
+
+class ExamDeleteOrderingTests(APITestCase):
+    """M11: exam deletion must finish before the 'cancelled' emails go out."""
+
+    def _setup(self):
+        dean = make_user(username='deanDEL', email='deandel@example.com',
+                         role=User.Role.DEAN)
+        exam = make_exam(instructor=dean)
+        self.client.force_authenticate(dean)
+        return dean, exam
+
+    def test_notifications_not_sent_when_media_delete_fails(self):
+        dean, exam = self._setup()
+
+        # Media cleanup blows up (disk error) mid-delete. The exam must remain,
+        # and recipients must NOT have been told it was cancelled.
+        with mock.patch('apis.views.notify_users') as notify, \
+                mock.patch('apis.views.delete_exam_media',
+                           side_effect=OSError('disk gone')):
+            with self.assertRaises(OSError):
+                self.client.delete(
+                    reverse('exam_detail', kwargs={'pk': exam.id}))
+
+        notify.assert_not_called()
+        self.assertTrue(Exam.objects.filter(pk=exam.id).exists())
+
+    def test_delete_then_notify_on_success(self):
+        dean, exam = self._setup()
+
+        with mock.patch('apis.views.notify_users') as notify, \
+                mock.patch('apis.views.delete_exam_media') as media:
+            response = self.client.delete(
+                reverse('exam_detail', kwargs={'pk': exam.id}))
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Exam.objects.filter(pk=exam.id).exists())
+        media.assert_called_once()
+        notify.assert_called_once()
 
 
 class DuplicateVideoHashTests(TestCase):
@@ -1230,6 +1915,9 @@ class AsyncQueueWiringTests(APITestCase):
         self.assertNotIn('analysis', response.data)
         fake_queue.enqueue.assert_called_once()
         self.assertIs(fake_queue.enqueue.call_args.args[0], run_analysis)
+        # 202 carries client-guidance headers: when to poll, and where.
+        self.assertEqual(response['Retry-After'], '5')
+        self.assertIn(str(video.id), response['Location'])
 
         # The job is persisted as QUEUED and no report exists until a worker runs.
         job = AnalysisJob.objects.get(session=video.session)
@@ -1254,6 +1942,40 @@ class AsyncQueueWiringTests(APITestCase):
         self.assertEqual(
             ExamSession.objects.get(id=video.session.id).status,
             ExamSession.Status.FAILED,
+        )
+
+    def test_truncate_error_caps_long_tracebacks(self):
+        """M10: the helper bounds the stored text and marks the clip."""
+        from apis.tasks import _MAX_ERROR_MESSAGE_CHARS, _truncate_error
+
+        short = 'ValueError: boom'
+        self.assertEqual(_truncate_error(short), short)  # short text untouched
+        self.assertEqual(_truncate_error(''), '')
+        self.assertEqual(_truncate_error(None), '')
+
+        huge = 'x' * (_MAX_ERROR_MESSAGE_CHARS + 5000)
+        capped = _truncate_error(huge)
+        self.assertTrue(capped.startswith('x' * _MAX_ERROR_MESSAGE_CHARS))
+        self.assertTrue(capped.endswith('[truncated]'))
+        self.assertLess(len(capped), len(huge))
+
+    def test_worker_stores_truncated_error_message(self):
+        """M10: a multi-KB traceback is not persisted verbatim onto the job."""
+        from apis.tasks import _MAX_ERROR_MESSAGE_CHARS
+
+        video = self._make_video()
+        job = AnalysisJob.objects.create(session=video.session, status=AnalysisJob.Status.QUEUED)
+
+        giant = 'CUDA out of memory\n' + ('frame ' * 4000)
+        with mock.patch('apis.tasks.build_ai_report', side_effect=RuntimeError(giant)):
+            with self.assertRaises(RuntimeError):
+                run_analysis(str(job.id), actor_id=str(self.user.id))
+
+        job.refresh_from_db()
+        # Head preserved (the actual cause), total length bounded.
+        self.assertTrue(job.error_message.startswith('CUDA out of memory'))
+        self.assertLessEqual(
+            len(job.error_message), _MAX_ERROR_MESSAGE_CHARS + len('\n…[truncated]'),
         )
 
     def test_failure_is_audited_and_notified(self):
@@ -1427,6 +2149,811 @@ class DeadJobFieldsWiringTests(APITestCase):
 
         job = AnalysisJob.objects.get(session=video.session)
         self.assertEqual(job.ai_model_version, 'yolo11x.pt')
+
+
+class _Arr(list):
+    """List that quacks like an ultralytics tensor row (``.tolist()``)."""
+
+    def tolist(self):
+        return list(self)
+
+
+class _FakeBox:
+    """Minimal stand-in for one ultralytics detection box."""
+
+    def __init__(self, xyxy, conf):
+        self.xyxy = [_Arr(xyxy)]
+        self.conf = [conf]
+
+
+class ConsolidateEventsTrackingTests(APITestCase):
+    """H11: distinct people are not merged when their boxes are degenerate.
+
+    ``PoseAnalyzer`` falls back to ``bbox=(0,0,0,0)`` when it cannot match a
+    person box to the keypoints. ``_bbox_center`` maps that to ``None``. The old
+    ``_same_track`` returned ``True`` whenever either centre was ``None``, so two
+    different students who both fell back to ``(0,0,0,0)`` collapsed into a single
+    event — the report then showed fewer people and fewer events than reality.
+    The fix keeps the missing-box temporal fallback (so one person's behaviour
+    still sustains across frames) but refuses to merge two same-frame detections,
+    which are necessarily different people.
+    """
+
+    @staticmethod
+    def _det(ts, bbox, behavior=None, confidence=0.9):
+        from apis.ai import config
+        from apis.ai.detector import FrameDetection
+
+        return FrameDetection(
+            behavior_type=behavior or config.LOOKING_AWAY,
+            confidence=confidence,
+            bbox=bbox,
+            frame_number=int(ts * 10),
+            timestamp_sec=float(ts),
+        )
+
+    def test_same_track_requires_two_known_centres(self):
+        from apis.ai.detector import _same_track
+
+        a = (100.0, 100.0, 60.0)
+        # Two unlocalisable detections must NOT be assumed to be one person.
+        self.assertFalse(_same_track(None, None))
+        self.assertFalse(_same_track(a, None))
+        self.assertFalse(_same_track(None, a))
+        # Known, close centres still match; known, far centres do not.
+        self.assertTrue(_same_track(a, (105.0, 102.0, 60.0)))
+        self.assertFalse(_same_track(a, (400.0, 100.0, 60.0)))
+
+    def test_two_degenerate_people_same_frames_stay_two_events(self):
+        """Two students with (0,0,0,0) boxes across three frames → two events."""
+        from apis.ai.detector import consolidate_events
+
+        zero = (0.0, 0.0, 0.0, 0.0)
+        # Person A and person B both flagged at t=0, 2 and 4 (within the 5s merge
+        # window). Three consecutive sampled frames clear BOTH noise gates — the
+        # 2s min-duration and the LOOKING_AWAY_MIN_CONSECUTIVE=3 consecutive-frame
+        # gate — so the events survive and the H11 separation is what's under test.
+        detections = [
+            self._det(0.0, zero), self._det(0.0, zero),
+            self._det(2.0, zero), self._det(2.0, zero),
+            self._det(4.0, zero), self._det(4.0, zero),
+        ]
+        events = consolidate_events(detections)
+        self.assertEqual(len(events), 2)
+        for event in events:
+            self.assertEqual(event.frame_count, 3)
+            self.assertAlmostEqual(event.duration_sec, 4.0)
+
+    def test_single_degenerate_person_still_merges_across_frames(self):
+        """One person's degenerate-box behaviour sustains into a single event."""
+        from apis.ai.detector import consolidate_events
+
+        zero = (0.0, 0.0, 0.0, 0.0)
+        detections = [self._det(t, zero) for t in (0.0, 2.0, 4.0)]
+        events = consolidate_events(detections)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].frame_count, 3)
+
+    def test_distinct_real_boxes_are_two_events(self):
+        """Control: two well-separated boxes were (and remain) two events."""
+        from apis.ai.detector import consolidate_events
+
+        left = (100, 50, 160, 200)
+        right = (400, 60, 470, 210)
+        # Three consecutive sampled frames (t=0,2,4) clear the looking-away
+        # consecutive-frame gate; the well-separated boxes keep them two events.
+        detections = [
+            self._det(0.0, left), self._det(0.0, right),
+            self._det(2.0, left), self._det(2.0, right),
+            self._det(4.0, left), self._det(4.0, right),
+        ]
+        events = consolidate_events(detections)
+        self.assertEqual(len(events), 2)
+
+
+class FfmpegTimeoutTests(APITestCase):
+    """M7: the ffmpeg re-encode is bounded so a wedged process can't hang a worker.
+
+    The single ``subprocess.run`` (in ``_reencode_h264``) carries a timeout; the
+    short evidence clips use the default, while the full annotated-video re-encode
+    passes a larger, duration-scaled budget so a long-but-healthy transcode is not
+    killed prematurely. A timeout is treated like any ffmpeg failure (returns
+    ``False``), so the caller falls back to the mp4v output.
+    """
+
+    def test_reencode_timeout_scales_and_clamps(self):
+        from apis.ai.detector import _reencode_timeout_for
+
+        # Short/zero durations get the floor; long ones scale; huge ones clamp.
+        self.assertEqual(_reencode_timeout_for(0), 120.0)
+        self.assertEqual(_reencode_timeout_for(5), 120.0)       # 5*6=30 < floor
+        self.assertEqual(_reencode_timeout_for(60), 360.0)      # 60*6, within range
+        self.assertEqual(_reencode_timeout_for(100000), 1800.0)  # clamped to ceiling
+
+    def test_reencode_forwards_timeout_to_subprocess(self):
+        from apis.ai import face_tracker
+
+        with mock.patch('apis.ai.face_tracker._ffmpeg_exe', return_value='ffmpeg'), \
+                mock.patch('apis.ai.face_tracker.subprocess.run') as run, \
+                mock.patch('apis.ai.face_tracker.os.path.exists', return_value=True), \
+                mock.patch('apis.ai.face_tracker.os.path.getsize', return_value=10):
+            run.return_value = SimpleNamespace(returncode=0)
+            ok = face_tracker._reencode_h264('in.mp4', 'out.mp4', timeout=777)
+
+        self.assertTrue(ok)
+        self.assertEqual(run.call_args.kwargs.get('timeout'), 777)
+
+    def test_reencode_timeout_is_treated_as_failure(self):
+        import subprocess
+
+        from apis.ai import face_tracker
+
+        with mock.patch('apis.ai.face_tracker._ffmpeg_exe', return_value='ffmpeg'), \
+                mock.patch(
+                    'apis.ai.face_tracker.subprocess.run',
+                    side_effect=subprocess.TimeoutExpired(cmd='ffmpeg', timeout=1),
+                ):
+            ok = face_tracker._reencode_h264('in.mp4', 'out.mp4', timeout=1)
+
+        self.assertFalse(ok)  # caller keeps the mp4v file
+
+
+class RawIntermediateCleanupTests(APITestCase):
+    """M8: the ``.raw.mp4`` OpenCV intermediate is never orphaned on disk.
+
+    Both the annotated-video writer (``detector._write_annotated_video``) and the
+    clip writer (``face_tracker.extract_clip``) stage a mp4v ``.raw.mp4`` then
+    re-encode it to H.264. Previously the intermediate was only deleted on the
+    happy path; a crash (or M7 timeout treated as failure followed by an error)
+    between writing and re-encoding left it behind. The lifecycle is now wrapped
+    in try/finally so it is always removed or promoted onto the final path.
+    """
+
+    # The AI stack (cv2/numpy/ultralytics) is not installed in this environment,
+    # so these tests inject a fake ``cv2`` module that the functions' lazy
+    # ``import cv2`` picks up, plus a writer that lays down a real non-empty
+    # ``.raw.mp4`` so the on-disk cleanup is genuinely observable.
+    _PROP_FPS, _PROP_W, _PROP_H, _PROP_POS = 5, 3, 4, 1
+
+    def _fake_cv2(self, write_error=None):
+        import types
+
+        props = {self._PROP_FPS: 30.0, self._PROP_W: 4, self._PROP_H: 4}
+
+        class FakeCapture:
+            def __init__(self, path):
+                self._n = 0
+
+            def isOpened(self):
+                return True
+
+            def get(self, prop):
+                return props.get(prop, 0)
+
+            def set(self, *a, **k):
+                return True
+
+            def read(self):
+                # Grab a handful of frames then stop, so the clip writer always
+                # records at least one frame regardless of loop bounds.
+                self._n += 1
+                return (True, object()) if self._n <= 3 else (False, None)
+
+            def release(self):
+                pass
+
+        class FakeWriter:
+            def __init__(self, path, *a, **k):
+                with open(str(path), 'wb') as fh:  # non-empty raw intermediate
+                    fh.write(b'\x00' * 1024)
+
+            def isOpened(self):
+                return True
+
+            def write(self, frame):
+                if write_error is not None:
+                    raise write_error
+
+            def release(self):
+                pass
+
+        module = types.ModuleType('cv2')
+        module.CAP_PROP_FPS = self._PROP_FPS
+        module.CAP_PROP_FRAME_WIDTH = self._PROP_W
+        module.CAP_PROP_FRAME_HEIGHT = self._PROP_H
+        module.CAP_PROP_POS_FRAMES = self._PROP_POS
+        module.VideoWriter_fourcc = lambda *a: 0
+        module.VideoCapture = FakeCapture
+        module.VideoWriter = FakeWriter
+        return module, FakeWriter
+
+    def _media(self, name):
+        media_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, media_root, ignore_errors=True)
+        out = Path(media_root) / name
+        return out, Path(str(out) + '.raw.mp4')
+
+    def test_annotated_video_crash_removes_raw(self):
+        from apis.ai import detector
+
+        fake_cv2, _ = self._fake_cv2()
+        out, raw = self._media('annot.mp4')
+
+        with mock.patch.dict('sys.modules', {'cv2': fake_cv2}), \
+                mock.patch('apis.ai.detector.read_metadata',
+                           return_value=SimpleNamespace(fps=30.0, width=4, height=4, duration_sec=1.0)), \
+                mock.patch('apis.ai.face_tracker._reencode_h264', side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                detector._write_annotated_video('video.mp4', [], [], str(out))
+
+        self.assertFalse(raw.exists())  # M8: intermediate cleaned up on crash
+
+    def test_annotated_video_without_ffmpeg_promotes_raw(self):
+        from apis.ai import detector
+
+        fake_cv2, _ = self._fake_cv2()
+        out, raw = self._media('annot.mp4')
+
+        with mock.patch.dict('sys.modules', {'cv2': fake_cv2}), \
+                mock.patch('apis.ai.detector.read_metadata',
+                           return_value=SimpleNamespace(fps=30.0, width=4, height=4, duration_sec=1.0)), \
+                mock.patch('apis.ai.face_tracker._reencode_h264', return_value=False):
+            result = detector._write_annotated_video('video.mp4', [], [], str(out))
+
+        self.assertEqual(result, str(out))
+        self.assertTrue(out.exists())   # raw promoted onto the final path
+        self.assertFalse(raw.exists())  # no leftover intermediate
+
+    def test_clip_crash_removes_raw(self):
+        from apis.ai import face_tracker
+
+        # The writer raises mid-loop (after the .raw.mp4 stub is created), the
+        # exact crash window M8 protects — no dependency on the re-encode patch.
+        fake_cv2, _ = self._fake_cv2(write_error=RuntimeError('boom'))
+        out, raw = self._media('clip.mp4')
+
+        with mock.patch.dict('sys.modules', {'cv2': fake_cv2}):
+            with self.assertRaises(RuntimeError):
+                face_tracker.extract_clip('video.mp4', 5.0, str(out))
+
+        self.assertFalse(raw.exists())  # M8: clip intermediate cleaned up on crash
+
+
+class YoloPersonBoxReuseTests(APITestCase):
+    """H6: evidence reuses the YOLO person boxes instead of a Haar sweep.
+
+    The pose pass already detects every person per frame; those boxes are
+    harvested into a :class:`PersonIndex` and reused, so the video is not scanned
+    a third time with the Haar cascade.
+    """
+
+    def test_pose_analyzer_surfaces_person_boxes_without_looking_away(self):
+        """``analyze_frame`` returns person boxes even when nobody is flagged."""
+        from apis.ai.pose_analyzer import PoseAnalyzer
+
+        analyzer = PoseAnalyzer()
+        # keypoints=None → no looking-away detection, but boxes still present.
+        result = SimpleNamespace(
+            boxes=[_FakeBox([10, 20, 60, 200], 0.91), _FakeBox([300, 30, 360, 210], 0.82)],
+            keypoints=None,
+        )
+        analyzer._model = lambda frame, **kwargs: [result]
+
+        detections, person_boxes = analyzer.analyze_frame(object())
+
+        self.assertEqual(detections, [])  # nobody looking away
+        self.assertEqual(len(person_boxes), 2)  # both persons still tracked
+        self.assertEqual(person_boxes[0][0], (10.0, 20.0, 60.0, 200.0))
+        # The backward-compatible wrapper still returns just the detections.
+        self.assertEqual(analyzer.analyze(object()), [])
+
+    def test_index_from_person_boxes_tracks_and_labels_left_to_right(self):
+        """YOLO boxes build a queryable, left-to-right-labelled PersonIndex."""
+        from apis.ai.face_tracker import index_from_person_boxes
+
+        # Two people, each sighted in two consecutive sampled frames.
+        frames = [
+            (0.0, [(100, 50, 160, 200), (400, 60, 470, 210)]),
+            (1.0, [(104, 52, 164, 202), (398, 58, 468, 208)]),
+        ]
+        index = index_from_person_boxes(frames, 640, 480)
+
+        self.assertEqual(index.box_kind, 'person')
+        self.assertEqual(index.person_count, 2)
+        # person_1 is the leftmost track; person_2 the rightmost.
+        self.assertEqual(set(index.persons_at(0.0)), {'person_1', 'person_2'})
+        left_bbox = index.persons_at(0.0)['person_1']
+        right_bbox = index.persons_at(0.0)['person_2']
+        self.assertLess(left_bbox[0], right_bbox[0])
+
+    def test_evidence_consumes_pipeline_index_and_skips_haar_sweep(self):
+        """``_attach_alert_evidence`` uses the supplied index; never calls track_persons."""
+        from apis import services
+
+        media_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, media_root, ignore_errors=True)
+
+        with override_settings(MEDIA_ROOT=media_root):
+            user = make_user(username='h6', email='h6@example.com')
+            session = make_session(exam=make_exam(instructor=user))
+            video_path = Path(media_root) / 'h6.mp4'
+            video_path.write_bytes(fake_video_bytes(b'h6'))
+            video = SimpleNamespace(file=SimpleNamespace(path=str(video_path)))
+
+            alert = Alert.objects.create(
+                session=session,
+                timestamp_sec=5,
+                behavior_type=Alert.BehaviorType.LOOKING_AWAY,
+                severity=Alert.Severity.MEDIUM,
+                confidence_score=0.6,
+                metadata={'source': 'ai-pipeline'},
+            )
+
+            # A YOLO-derived index: person boxes, queryable like the real one.
+            person_index = SimpleNamespace(
+                box_kind='person',
+                query=lambda ts: ('person_2', (300.0, 30.0, 360.0, 210.0)),
+                persons_at=lambda ts: {'person_2': (300.0, 30.0, 360.0, 210.0)},
+            )
+
+            with mock.patch('apis.ai.face_tracker.track_persons') as haar:
+                services._attach_alert_evidence(
+                    video, session, [alert], person_index=person_index,
+                )
+
+            haar.assert_not_called()  # H6: no redundant Haar sweep
+
+        alert.refresh_from_db()
+        self.assertEqual(alert.metadata.get('person_id'), 'person_2')
+        # The flagged person's bbox (x, y, w, h) is recorded from the YOLO box.
+        self.assertEqual(alert.metadata.get('bbox'), [300, 30, 60, 180])
+
+    def test_build_ai_report_passes_person_index_into_evidence(self):
+        """The pipeline result's ``person_index`` reaches the evidence layer (H6)."""
+        from apis import services
+
+        media_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, media_root, ignore_errors=True)
+
+        with override_settings(MEDIA_ROOT=media_root):
+            user = make_user(username='h6b', email='h6b@example.com')
+            session = make_session(exam=make_exam(instructor=user))
+            upload = SimpleUploadedFile('h6b.mp4', fake_video_bytes(b'h6b'), content_type='video/mp4')
+            serializer = VideoUploadSerializer(
+                data={'session': str(session.id), 'file': upload},
+                context={'request': request_for(user)},
+            )
+            self.assertTrue(serializer.is_valid(), serializer.errors)
+            serializer.save()
+
+            sentinel_index = SimpleNamespace(box_kind='person', tracks={})
+            result = fake_analysis_result()
+            result.person_index = sentinel_index
+
+            with mock.patch('apis.ai.analyze_video', return_value=result), \
+                    mock.patch('apis.services._attach_alert_evidence') as attach:
+                services.build_ai_report(session)
+
+            self.assertIs(attach.call_args.kwargs.get('person_index'), sentinel_index)
+
+
+class PersonCountFallbackTests(APITestCase):
+    """M12: the report never fabricates "1 person" when attribution failed.
+
+    ``person_count`` for the summary is derived from the ``person_id`` stamped
+    onto each alert by ``_attach_alert_evidence``. If tracking/evidence fails
+    entirely, no alert carries a ``person_id`` and the count is genuinely
+    unknown — the old ``len(...) or 1`` fallback wrongly claimed one person was
+    identified. The summary must instead say the count could not be determined.
+    """
+
+    def _build_report(self, attach_side_effect):
+        from apis import services
+
+        media_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, media_root, ignore_errors=True)
+
+        with override_settings(MEDIA_ROOT=media_root):
+            user = make_user(username='m12', email='m12@example.com')
+            session = make_session(exam=make_exam(instructor=user))
+            upload = SimpleUploadedFile(
+                'm12.mp4', fake_video_bytes(b'm12'), content_type='video/mp4',
+            )
+            serializer = VideoUploadSerializer(
+                data={'session': str(session.id), 'file': upload},
+                context={'request': request_for(user)},
+            )
+            self.assertTrue(serializer.is_valid(), serializer.errors)
+            serializer.save()
+
+            with mock.patch('apis.ai.analyze_video', return_value=fake_analysis_result()), \
+                    mock.patch(
+                        'apis.services._attach_alert_evidence',
+                        side_effect=attach_side_effect,
+                    ):
+                return services.build_ai_report(session)
+
+    def test_summary_is_unknown_when_no_person_attributed(self):
+        # Evidence ran but stamped no person_id at all (tracking failed).
+        report = self._build_report(lambda *a, **k: None)
+
+        self.assertEqual(report.total_alerts, 1)
+        self.assertIn('could not be determined', report.summary)
+        self.assertNotIn('person(s).', report.summary)  # no fabricated count
+
+    def test_summary_counts_distinct_attributed_people(self):
+        def stamp_people(video, session, alerts, **kwargs):
+            # Simulate evidence attributing each alert to its own person.
+            for idx, alert in enumerate(alerts, start=1):
+                alert.metadata = {**(alert.metadata or {}), 'person_id': f'person_{idx}'}
+
+        report = self._build_report(stamp_people)
+
+        self.assertEqual(report.total_alerts, 1)
+        self.assertIn('across 1 person(s)', report.summary)
+
+
+class IncompleteEvidenceSignalTests(APITestCase):
+    """M1: partial evidence failures are recorded, not silently swallowed.
+
+    ``_attach_alert_evidence`` processes alerts in a loop writing three artifacts
+    each. If an extractor raises midway (e.g. disk fills), the old code left the
+    artifact empty with no trace and — worse — an error outside the per-artifact
+    guards could abort the loop, starving every later alert. Now each alert is
+    isolated, failing artifacts are stamped onto ``metadata['evidence_incomplete']``
+    /``evidence_errors``, and the count of affected alerts is returned and stamped
+    onto the job so the partial state is visible.
+    """
+
+    def _make(self):
+        media_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, media_root, ignore_errors=True)
+        user = make_user(username='m1', email='m1@example.com')
+        session = make_session(exam=make_exam(instructor=user))
+        video_path = Path(media_root) / 'm1.mp4'
+        video_path.write_bytes(fake_video_bytes(b'm1'))
+        video = SimpleNamespace(file=SimpleNamespace(path=str(video_path)))
+        index = SimpleNamespace(
+            box_kind='person',
+            query=lambda ts: ('person_1', None),
+            persons_at=lambda ts: {},
+        )
+        return media_root, session, video, index
+
+    def _alert(self, session, ts):
+        return Alert.objects.create(
+            session=session,
+            timestamp_sec=ts,
+            behavior_type=Alert.BehaviorType.LOOKING_AWAY,
+            severity=Alert.Severity.MEDIUM,
+            confidence_score=0.6,
+            metadata={'source': 'ai-pipeline'},
+        )
+
+    def test_failed_artifact_is_recorded_and_counted(self):
+        from apis import services
+
+        media_root, session, video, index = self._make()
+        alert = self._alert(session, 5)
+
+        with override_settings(MEDIA_ROOT=media_root), \
+                mock.patch('apis.ai.face_tracker.extract_face_crop', side_effect=OSError('disk full')), \
+                mock.patch('apis.ai.face_tracker.extract_annotated_frame', return_value=False), \
+                mock.patch('apis.ai.face_tracker.extract_clip', return_value=False):
+            incomplete = services._attach_alert_evidence(
+                video, session, [alert], person_index=index,
+            )
+
+        self.assertEqual(incomplete, 1)
+        alert.refresh_from_db()
+        self.assertTrue(alert.metadata.get('evidence_incomplete'))
+        self.assertIn('crop', alert.metadata.get('evidence_errors', []))
+
+    def test_one_alert_failure_does_not_starve_the_others(self):
+        """A raising extractor on alert #1 must not block alert #2's evidence."""
+        from apis import services
+
+        media_root, session, video, index = self._make()
+        first = self._alert(session, 1)
+        second = self._alert(session, 2)
+
+        # extract_clip raises only for the first alert (matched by timestamp);
+        # the snapshot extractor succeeds for both.
+        def clip_side_effect(video_path, ts, out, **kwargs):
+            if ts == 1:
+                raise OSError('disk full')
+            return True
+
+        with override_settings(MEDIA_ROOT=media_root), \
+                mock.patch('apis.ai.face_tracker.extract_face_crop', return_value=False), \
+                mock.patch('apis.ai.face_tracker.extract_annotated_frame', return_value=True), \
+                mock.patch('apis.ai.face_tracker.extract_clip', side_effect=clip_side_effect):
+            incomplete = services._attach_alert_evidence(
+                video, session, [first, second], person_index=index,
+            )
+
+        self.assertEqual(incomplete, 1)  # only the first alert
+        first.refresh_from_db()
+        second.refresh_from_db()
+        # The first alert is flagged incomplete; the second still got its evidence.
+        self.assertTrue(first.metadata.get('evidence_incomplete'))
+        self.assertFalse(second.metadata.get('evidence_incomplete', False))
+        self.assertTrue(second.clip_url)
+        self.assertTrue(second.snapshot_url)
+
+    def test_job_metadata_flags_incomplete_evidence(self):
+        from apis import services
+
+        media_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, media_root, ignore_errors=True)
+
+        with override_settings(MEDIA_ROOT=media_root):
+            user = make_user(username='m1b', email='m1b@example.com')
+            session = make_session(exam=make_exam(instructor=user))
+            upload = SimpleUploadedFile(
+                'm1b.mp4', fake_video_bytes(b'm1b'), content_type='video/mp4',
+            )
+            serializer = VideoUploadSerializer(
+                data={'session': str(session.id), 'file': upload},
+                context={'request': request_for(user)},
+            )
+            self.assertTrue(serializer.is_valid(), serializer.errors)
+            serializer.save()
+            job = AnalysisJob.objects.create(session=session)
+
+            with mock.patch('apis.ai.analyze_video', return_value=fake_analysis_result()), \
+                    mock.patch('apis.services._attach_alert_evidence', return_value=2):
+                services.build_ai_report(session, job=job)
+
+        job.refresh_from_db()
+        self.assertTrue(job.metadata.get('evidence_incomplete'))
+        self.assertEqual(job.metadata.get('evidence_incomplete_count'), 2)
+
+
+class ActivitySeriesQueryTests(APITestCase):
+    """H7: the activity chart is two grouped queries, not 2·N per-day COUNTs.
+
+    Verifies both correctness (counts land on the right days, out-of-window rows
+    are excluded) and that the query count is a small constant independent of how
+    many rows or days are involved.
+    """
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+        self.addCleanup(self.settings_override.disable)
+        self.addCleanup(shutil.rmtree, self.media_root, ignore_errors=True)
+        self.user = make_user(username='chart', email='chart@example.com')
+        self.exam = make_exam(instructor=self.user)
+
+    @staticmethod
+    def _days_ago(offset):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        return timezone.now() - timedelta(days=offset)
+
+    def _video_on(self, day_offset):
+        """Create a session + video uploaded *day_offset* days ago; return the session."""
+        session = make_session(exam=self.exam, student_identifier=f'v-{uuid.uuid4().hex[:6]}')
+        video = Video.objects.create(
+            session=session,
+            file=SimpleUploadedFile('v.mp4', fake_video_bytes(), content_type='video/mp4'),
+            file_hash=uuid.uuid4().hex,
+        )
+        # uploaded_at is auto_now_add, so bypass it with an UPDATE.
+        Video.objects.filter(pk=video.pk).update(uploaded_at=self._days_ago(day_offset))
+        return session
+
+    def _job_on(self, session, day_offset):
+        job = AnalysisJob.objects.create(session=session)
+        AnalysisJob.objects.filter(pk=job.pk).update(created_at=self._days_ago(day_offset))
+
+    def test_series_counts_map_to_correct_days(self):
+        from apis.services import activity_series_for
+
+        # Uploads: two today, one two days ago, one outside the 7-day window.
+        s_today_a = self._video_on(0)
+        s_today_b = self._video_on(0)
+        s_old = self._video_on(2)
+        self._video_on(8)  # out of window — must be excluded
+        # Analyses: one today, two one-day-ago.
+        self._job_on(s_today_a, 0)
+        self._job_on(s_today_b, 1)
+        self._job_on(s_old, 1)
+
+        series = activity_series_for(self.user)
+
+        self.assertEqual(len(series['videos']), 7)
+        self.assertEqual(len(series['analyses']), 7)
+        # days run oldest -> newest: idx 6 = today, 5 = yesterday, 4 = two days ago.
+        self.assertEqual(series['videos'][6], 2)
+        self.assertEqual(series['videos'][4], 1)
+        self.assertEqual(sum(series['videos']), 3)  # the 8-days-ago upload is dropped
+        self.assertEqual(series['analyses'][6], 1)
+        self.assertEqual(series['analyses'][5], 2)
+        self.assertEqual(sum(series['analyses']), 3)
+
+    def test_query_count_is_constant_regardless_of_volume(self):
+        from apis.services import activity_series_for
+
+        for _ in range(6):
+            session = self._video_on(0)
+            self._job_on(session, 0)
+
+        # One grouped query per series (videos, analyses) — never 2·N.
+        with self.assertNumQueries(2):
+            activity_series_for(self.user)
+
+
+class NotifyUsersEmailOffloadTests(APITestCase):
+    """H9: notify_users writes in-app notices inline but offloads SMTP to the queue.
+
+    A request that resolves many supervisors must not block on N sequential
+    emails. The notifications stay synchronous; the email fan-out is enqueued
+    (async) or sent inline only when the queue is eager (dev/test default).
+    """
+
+    @staticmethod
+    def _make_users(n):
+        return [make_user(username=f'sup{i}', email=f'sup{i}@example.com') for i in range(n)]
+
+    def test_inapp_notifications_created_for_all_users(self):
+        from apis.services import notify_users
+
+        users = self._make_users(3)
+        notify_users(users, Notification.NotifType.EXAM_UPDATED, 'Title', 'Body')
+
+        for user in users:
+            self.assertEqual(Notification.objects.filter(recipient=user).count(), 1)
+
+    def test_eager_queue_sends_emails_inline(self):
+        from django.core import mail
+
+        from apis.services import notify_users
+
+        users = self._make_users(3)
+        notify_users(users, Notification.NotifType.EXAM_UPDATED, 'Subj', 'Body')
+
+        self.assertEqual(len(mail.outbox), 3)
+        self.assertEqual({m.to[0] for m in mail.outbox}, {u.email for u in users})
+
+    def test_async_queue_enqueues_email_job_and_skips_inline_send(self):
+        from django.core import mail
+
+        from apis.services import notify_users
+        from apis.tasks import send_notification_emails
+
+        users = self._make_users(2)
+        fake_queue = mock.Mock()
+        fake_queue.is_async = True
+
+        with mock.patch('django_rq.get_queue', return_value=fake_queue):
+            notify_users(users, Notification.NotifType.EXAM_CANCELLED, 'Subj', 'Body')
+
+        # In-app notices are still written inline.
+        self.assertEqual(Notification.objects.filter(recipient__in=users).count(), 2)
+        # The SMTP fan-out was handed to the queue, not run on this thread.
+        fake_queue.enqueue.assert_called_once()
+        args = fake_queue.enqueue.call_args.args
+        self.assertIs(args[0], send_notification_emails)
+        self.assertEqual(set(args[1]), {u.email for u in users})
+        self.assertEqual(args[2], 'Subj')
+        self.assertEqual(len(mail.outbox), 0)  # nothing emailed on the HTTP thread
+
+    def test_worker_sends_one_email_per_recipient_and_skips_blanks(self):
+        from django.core import mail
+
+        from apis.tasks import send_notification_emails
+
+        sent = send_notification_emails(['a@example.com', '', 'b@example.com'], 'S', 'B')
+
+        self.assertEqual(sent, 2)  # the blank address is skipped
+        self.assertEqual({m.to[0] for m in mail.outbox}, {'a@example.com', 'b@example.com'})
+
+
+class DeleteExpiredVideosCommandTests(TestCase):
+    """M6: ``delete_expired_videos`` survives files it cannot delete.
+
+    A stored video file held open (a worker mid-analysis, or a lingering
+    handle on Windows) makes ``file.delete()`` raise ``OSError``. The command
+    must keep that Video row (so the file is retried, not orphaned) and must
+    not let one stuck file abort the sweep and strand every later expired
+    video.
+    """
+
+    def setUp(self):
+        self.media_root = tempfile.mkdtemp()
+        self.settings_override = override_settings(MEDIA_ROOT=self.media_root)
+        self.settings_override.enable()
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_root, ignore_errors=True)
+
+    def _expired_video(self, student_identifier, content):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        session = make_session(student_identifier=student_identifier)
+        return Video.objects.create(
+            session=session,
+            file=SimpleUploadedFile(
+                f'{student_identifier}.mp4', content, content_type='video/mp4'),
+            original_filename=f'{student_identifier}.mp4',
+            file_hash=hashlib.sha256(content).hexdigest(),
+            expires_at=timezone.now() - timedelta(days=1),
+        )
+
+    def test_deletes_expired_video_file_and_row(self):
+        video = self._expired_video('gone', b'expired video bytes')
+        stored_path = Path(self.media_root) / video.file.name
+        self.assertTrue(stored_path.exists())
+
+        call_command('delete_expired_videos', verbosity=0)
+
+        self.assertFalse(Video.objects.filter(id=video.id).exists())
+        self.assertFalse(stored_path.exists())
+        self.assertTrue(
+            AuditLog.objects.filter(
+                action=AuditLog.ActionType.VIDEO_DELETED,
+                target_resource=str(video.id),
+            ).exists())
+
+    def test_dry_run_deletes_nothing(self):
+        video = self._expired_video('keep', b'still here bytes')
+        stored_path = Path(self.media_root) / video.file.name
+
+        call_command('delete_expired_videos', '--dry-run', verbosity=0)
+
+        self.assertTrue(Video.objects.filter(id=video.id).exists())
+        self.assertTrue(stored_path.exists())
+        self.assertFalse(
+            AuditLog.objects.filter(action=AuditLog.ActionType.VIDEO_DELETED).exists())
+
+    def test_locked_file_keeps_row_and_skips_audit(self):
+        from django.core.files.storage import FileSystemStorage
+
+        video = self._expired_video('locked', b'locked video bytes')
+
+        with mock.patch.object(
+            FileSystemStorage, 'delete', autospec=True,
+            side_effect=OSError('file is in use'),
+        ):
+            call_command('delete_expired_videos', verbosity=0)
+
+        # Row kept so the file is retried next run, not orphaned.
+        self.assertTrue(Video.objects.filter(id=video.id).exists())
+        self.assertFalse(
+            AuditLog.objects.filter(action=AuditLog.ActionType.VIDEO_DELETED).exists())
+
+    def test_one_locked_file_does_not_strand_later_videos(self):
+        from django.core.files.storage import FileSystemStorage
+
+        self._expired_video('first', b'first video bytes')
+        self._expired_video('second', b'second video bytes')
+
+        original_delete = FileSystemStorage.delete
+        state = {'calls': 0}
+
+        def flaky_delete(self, name):
+            state['calls'] += 1
+            if state['calls'] == 1:
+                raise OSError('file is in use')
+            return original_delete(self, name)
+
+        with mock.patch.object(
+            FileSystemStorage, 'delete', autospec=True, side_effect=flaky_delete,
+        ):
+            call_command('delete_expired_videos', verbosity=0)
+
+        # One stuck file is kept; the other is still deleted in the same run.
+        self.assertEqual(Video.objects.count(), 1)
+        self.assertEqual(
+            AuditLog.objects.filter(action=AuditLog.ActionType.VIDEO_DELETED).count(), 1)
 
 
 class PreanalyzeDemosCommandTests(TestCase):

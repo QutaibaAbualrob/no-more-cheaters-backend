@@ -49,6 +49,11 @@ class AlertEvent:
     start_sec: float
     end_sec: float
     frame_count: int           # number of sampled frames that contributed
+    # The detection box at ``start_sec`` (the first contributing frame). For
+    # object behaviours (phone/laptop) this is the OBJECT's box, used downstream
+    # to attribute the alert to the person actually near the object rather than
+    # the largest person in frame. ``None`` only for events built without a box.
+    bbox: tuple | None = None
 
     @property
     def duration_sec(self) -> float:
@@ -67,6 +72,11 @@ class AnalysisResult:
     events: list[AlertEvent]
     annotated_video_path: str | None
     metadata: dict = field(default_factory=dict)
+    # Per-person tracks built from the YOLO person boxes harvested during the
+    # analysis pass (H6). The service layer uses this to attribute and box people
+    # in evidence images without re-scanning the video. ``None`` only when the
+    # caller cannot build one; the evidence layer then falls back to its own scan.
+    person_index: object | None = None
 
 
 def _collect_frame_detections(
@@ -74,14 +84,21 @@ def _collect_frame_detections(
     object_detector: ObjectDetector,
     pose_analyzer: PoseAnalyzer,
     sample_every_n: int,
-) -> tuple[list[FrameDetection], int]:
+) -> tuple[list[FrameDetection], int, list[tuple]]:
     """Run both detectors over every sampled frame.
 
     The two detectors are independent per frame; they are invoked back to back
     here. (They could be fanned out to threads, but sharing a single CUDA model
     across threads is fragile, so the pipeline keeps them sequential.)
+
+    Alongside the behaviour detections this also harvests, per sampled frame, the
+    full set of person bounding boxes the pose model already produced — returned
+    as ``person_frames`` (``[(timestamp_sec, [bbox_xyxy, …]), …]``). The evidence
+    layer tracks people from these YOLO boxes rather than scanning the video a
+    third time with a Haar cascade (H6).
     """
     detections: list[FrameDetection] = []
+    person_frames: list[tuple] = []
     frames_analyzed = 0
     for sample in iter_sampled_frames(video_path, sample_every_n=sample_every_n):
         frames_analyzed += 1
@@ -95,17 +112,27 @@ def _collect_frame_detections(
                     timestamp_sec=sample.timestamp_sec,
                 )
             )
-        for pose in pose_analyzer.analyze(sample.frame):
-            detections.append(
-                FrameDetection(
-                    behavior_type=pose.behavior_type,
-                    confidence=pose.confidence,
-                    bbox=pose.bbox,
-                    frame_number=sample.frame_number,
-                    timestamp_sec=sample.timestamp_sec,
+        pose_detections, person_boxes = pose_analyzer.analyze_frame(sample.frame)
+        # Looking-away is opt-in (config.ENABLE_LOOKING_AWAY): its alerts are
+        # suppressed by default because the 2D heuristic is unreliable on oblique
+        # cameras. The pose pass still runs unconditionally — its person boxes are
+        # harvested below for evidence tracking (H6) regardless of the gate.
+        if config.ENABLE_LOOKING_AWAY:
+            for pose in pose_detections:
+                detections.append(
+                    FrameDetection(
+                        behavior_type=pose.behavior_type,
+                        confidence=pose.confidence,
+                        bbox=pose.bbox,
+                        frame_number=sample.frame_number,
+                        timestamp_sec=sample.timestamp_sec,
+                    )
                 )
+        if person_boxes:
+            person_frames.append(
+                (sample.timestamp_sec, [bbox for bbox, _conf in person_boxes])
             )
-    return detections, frames_analyzed
+    return detections, frames_analyzed, person_frames
 
 
 def _bbox_center(bbox) -> tuple[float, float, float] | None:
@@ -126,19 +153,47 @@ def _bbox_center(bbox) -> tuple[float, float, float] | None:
 
 
 def _same_track(center_a, center_b, factor: float = 0.75) -> bool:
-    """Whether two bbox centres are close enough to be the same person/object.
+    """Whether two *known* bbox centres are close enough to be the same person.
 
     The distance threshold scales with box size so it adapts to camera distance.
-    Either centre being ``None`` (no usable box) returns ``True`` — such
-    detections fall back to pure temporal merging rather than spawning spurious
-    extra events.
+    Both centres must be present: a ``None`` centre means the detection had no
+    usable box, and with no location we cannot prove two detections share a
+    person, so this returns ``False``. The missing-box case is handled by the
+    caller's temporal fallback (see :func:`consolidate_events`) — it is
+    deliberately NOT collapsed here, because returning ``True`` on ``None``
+    merged two different students who both fell back to ``(0,0,0,0)`` into a
+    single event and under-counted people (H11).
     """
     if center_a is None or center_b is None:
-        return True
+        return False
     ax, ay, a_size = center_a
     bx, by, b_size = center_b
     distance = ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
     return distance <= factor * max(a_size, b_size)
+
+
+def _infer_sample_step(detections: list[FrameDetection]) -> int:
+    """Infer the frame-sampling stride from the smallest positive frame gap.
+
+    Frames are sampled every Nth frame, so adjacent samples differ by N. The
+    smallest positive difference between any two detection frame numbers is that
+    stride; falls back to 1 when it cannot be determined.
+    """
+    frames = sorted({d.frame_number for d in detections})
+    step = min((b - a for a, b in zip(frames, frames[1:])), default=0)
+    return step if step > 0 else 1
+
+
+def _longest_consecutive_run(frame_numbers: list[int], step: int) -> int:
+    """Length of the longest run of consecutive sampled frames (gap == *step*)."""
+    frames = sorted(set(frame_numbers))
+    if not frames:
+        return 0
+    best = run = 1
+    for prev, current in zip(frames, frames[1:]):
+        run = run + 1 if (current - prev) == step else 1
+        best = max(best, run)
+    return best
 
 
 def consolidate_events(
@@ -153,21 +208,35 @@ def consolidate_events(
     (or two phones in different hands) become two events rather than collapsing
     into one. Within a track, detections whose gap is within *merge_window_sec*
     merge into a single event (max confidence across its frames); a gap larger
-    than the window starts a fresh event for that person. Events shorter than
-    *min_duration_sec* are dropped as noise. Returns events sorted by start time.
+    than the window starts a fresh event for that person.
+
+    Surviving events must clear two noise gates:
+
+    * **Duration** — soft pose cues (looking away) must last at least
+      *min_duration_sec*. Direct object evidence (phone/laptop) is always kept,
+      even a single sighting, since a momentary glimpse is a genuine violation.
+    * **Consecutive frames** — a ``LOOKING_AWAY`` event must additionally span at
+      least :data:`config.LOOKING_AWAY_MIN_CONSECUTIVE` *consecutive* sampled
+      frames, so a single momentary glance (or scattered jitter) never alerts.
+
+    Returns events sorted by start time.
     """
-    events: list[AlertEvent] = []
+    sample_step = _infer_sample_step(detections)
 
     by_type: dict[str, list[FrameDetection]] = {}
     for det in detections:
         by_type.setdefault(det.behavior_type, []).append(det)
 
+    # (event, [frame_numbers]) pairs, so the consecutive-frame gate can inspect
+    # exactly which sampled frames backed each consolidated event.
+    built: list[tuple[AlertEvent, list[int]]] = []
+
     for behavior_type, items in by_type.items():
         items.sort(key=lambda d: d.timestamp_sec)
-        # Each open track: {'event', 'last_ts', 'center'}. A detection extends an
-        # existing track only when it is within the merge window AND spatially on
-        # the same person; otherwise it opens a new event (new person or a
-        # resumed behaviour after a long gap).
+        # Each open track: {'event', 'frames', 'last_ts', 'center'}. A detection
+        # extends an existing track only when it is within the merge window AND
+        # spatially on the same person; otherwise it opens a new event (new
+        # person or a resumed behaviour after a long gap).
         tracks: list[dict] = []
         for det in items:
             center = _bbox_center(det.bbox)
@@ -175,6 +244,20 @@ def consolidate_events(
             for track in tracks:
                 if (det.timestamp_sec - track['last_ts']) > merge_window_sec:
                     continue
+                if center is None or track['center'] is None:
+                    # At least one side has no usable box, so we cannot place
+                    # them spatially. Fall back to temporal continuity — but
+                    # only across *different* frames. Two detections of the
+                    # same behaviour in the SAME frame are necessarily
+                    # different people (the pose model emits at most one
+                    # looking-away per person per frame), so they must not
+                    # collapse into one event (H11). ``items`` is sorted by
+                    # timestamp, so ``last_ts >= det.timestamp_sec`` means the
+                    # track already has a detection from this very frame.
+                    if track['last_ts'] >= det.timestamp_sec:
+                        continue
+                    match = track
+                    break
                 if _same_track(center, track['center']):
                     match = track
                     break
@@ -186,26 +269,36 @@ def consolidate_events(
                     start_sec=det.timestamp_sec,
                     end_sec=det.timestamp_sec,
                     frame_count=1,
+                    bbox=det.bbox,  # the box at start_sec, for spatial attribution
                 )
-                events.append(event)
-                tracks.append({'event': event, 'last_ts': det.timestamp_sec, 'center': center})
+                frames = [det.frame_number]
+                built.append((event, frames))
+                tracks.append({
+                    'event': event, 'frames': frames,
+                    'last_ts': det.timestamp_sec, 'center': center,
+                })
             else:
                 event = match['event']
                 event.end_sec = det.timestamp_sec
                 event.confidence = max(event.confidence, det.confidence)
                 event.frame_count += 1
+                match['frames'].append(det.frame_number)
                 match['last_ts'] = det.timestamp_sec
                 if center is not None:
                     match['center'] = center  # follow slow movement across frames
 
-    # Drop too-brief events as noise — but ONLY for soft pose cues. Direct
-    # object evidence (a phone/laptop in frame) is always kept, even a single
-    # sighting, since a momentary glimpse is still a genuine violation.
-    survivors = [
-        e for e in events
-        if e.behavior_type in config.DIRECT_EVIDENCE_BEHAVIORS
-        or e.duration_sec >= min_duration_sec
-    ]
+    survivors: list[AlertEvent] = []
+    for event, frames in built:
+        if event.behavior_type in config.DIRECT_EVIDENCE_BEHAVIORS:
+            survivors.append(event)  # objects bypass both noise gates
+            continue
+        if event.duration_sec < min_duration_sec:
+            continue
+        if event.behavior_type == config.LOOKING_AWAY:
+            if _longest_consecutive_run(frames, sample_step) < config.LOOKING_AWAY_MIN_CONSECUTIVE:
+                continue
+        survivors.append(event)
+
     survivors.sort(key=lambda e: e.start_sec)
     return survivors
 
@@ -237,6 +330,19 @@ def _default_output_path(video_path: str) -> str:
 
     path = Path(video_path)
     return str(path.with_name(f'{path.stem}_annotated.mp4'))
+
+
+def _reencode_timeout_for(duration_sec: float) -> float:
+    """ffmpeg timeout budget for re-encoding a *duration_sec*-long video (M7).
+
+    The annotated re-encode runs over the WHOLE recording, so a fixed clip-sized
+    timeout would kill a long but healthy transcode. We allow several times
+    real-time and clamp to a sane range: a floor that covers ffmpeg start-up plus
+    very short clips, and a hard ceiling so a genuinely wedged process still can't
+    hold the worker indefinitely.
+    """
+    floor, ceiling, realtime_factor = 120.0, 1800.0, 6.0
+    return max(floor, min(ceiling, (duration_sec or 0.0) * realtime_factor))
 
 
 def _write_annotated_video(
@@ -278,37 +384,42 @@ def _write_annotated_video(
 
     by_frame = _surviving_detections_by_frame(detections, events)
 
+    # The whole intermediate lifecycle is wrapped so the ``.raw.mp4`` is never
+    # orphaned (M8): on success it is removed or moved onto the final path; on an
+    # unexpected crash between writing and re-encoding the finally still deletes
+    # it. ``_safe_remove`` no-ops when the file is already gone.
     try:
-        frame_number = 0
-        while True:
-            grabbed, frame = capture.read()
-            if not grabbed:
-                break
+        try:
+            frame_number = 0
+            while True:
+                grabbed, frame = capture.read()
+                if not grabbed:
+                    break
 
-            timestamp = frame_number / meta.fps if meta.fps else 0.0
-            active = [e for e in events if e.start_sec <= timestamp <= e.end_sec]
+                timestamp = frame_number / meta.fps if meta.fps else 0.0
+                active = [e for e in events if e.start_sec <= timestamp <= e.end_sec]
 
-            for det in by_frame.get(frame_number, ()):  # boxes on sampled frames
-                _draw_detection(cv2, frame, det)
-            if active:
-                _draw_event_banner(cv2, frame, active)
+                for det in by_frame.get(frame_number, ()):  # boxes on sampled frames
+                    _draw_detection(cv2, frame, det)
+                if active:
+                    _draw_event_banner(cv2, frame, active)
 
-            writer.write(frame)
-            frame_number += 1
+                writer.write(frame)
+                frame_number += 1
+        finally:
+            capture.release()
+            writer.release()
+
+        if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+            return None
+
+        if not _reencode_h264(raw_path, str(output_path),
+                              timeout=_reencode_timeout_for(meta.duration_sec)):
+            # No ffmpeg (or it failed/timed out): keep the OpenCV mp4v output.
+            os.replace(raw_path, str(output_path))
+        return str(output_path)
     finally:
-        capture.release()
-        writer.release()
-
-    if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
         _safe_remove(raw_path)
-        return None
-
-    if _reencode_h264(raw_path, str(output_path)):
-        _safe_remove(raw_path)
-    else:
-        # No ffmpeg (or it failed): keep the OpenCV mp4v output at the final path.
-        os.replace(raw_path, str(output_path))
-    return str(output_path)
 
 
 def _draw_detection(cv2, frame, det: FrameDetection) -> None:
@@ -375,10 +486,16 @@ def analyze_video(
     pose_analyzer = pose_analyzer or PoseAnalyzer(keypoint_confidence=pose_confidence)
 
     meta = read_metadata(video_path)
-    detections, frames_analyzed = _collect_frame_detections(
+    detections, frames_analyzed, person_frames = _collect_frame_detections(
         video_path, object_detector, pose_analyzer, sample_every_n
     )
     events = consolidate_events(detections)
+
+    # Build the per-person index from the YOLO boxes already gathered above, so
+    # evidence attribution reuses this pass instead of a separate Haar sweep (H6).
+    from .face_tracker import index_from_person_boxes
+
+    person_index = index_from_person_boxes(person_frames, meta.width, meta.height)
 
     annotated_path = None
     if annotate and events:
@@ -425,4 +542,5 @@ def analyze_video(
         events=events,
         annotated_video_path=annotated_path,
         metadata=metadata,
+        person_index=person_index,
     )

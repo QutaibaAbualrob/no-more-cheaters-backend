@@ -12,6 +12,10 @@ from ultralytics import YOLO
 
 IMG_SIZE = 1280
 TARGET_CLASSES = {67: "📱 PHONE", 63: "💻 LAPTOP", 73: "📖 BOOK", 75: "📟 REMOTE"}
+# Per-class keep thresholds, matching the production pipeline (apis/ai/config.py).
+# Laptop is kept HIGH because YOLO reads sheets of exam paper as "laptop" with
+# confidence up to ~0.79; 0.85 rejects them. Phone is kept low (real target).
+CLASS_FLOORS = {67: 0.30, 63: 0.85}
 
 # --- Gather images ---
 if len(sys.argv) > 1:
@@ -53,7 +57,10 @@ for img_path in images:
             conf = float(box.conf[0])
             name = model.names[cls]
             if cls in TARGET_CLASSES:
-                phones.append(f"{TARGET_CLASSES[cls]} — conf {conf:.2f}")
+                # Apply the per-class floor so paper "laptops" drop out, matching
+                # production. Classes without a floor (book/remote) are kept as-is.
+                if conf >= CLASS_FLOORS.get(cls, 0.0):
+                    phones.append(f"{TARGET_CLASSES[cls]} — conf {conf:.2f}")
             elif cls != 0:
                 others.append(f"{name} — conf {conf:.2f}")
 
@@ -84,15 +91,21 @@ for img_path in images:
             print(f"     Person {i+1}: ⚠ weak keypoints")
             continue
 
+        # Shoulder-width-normalized horizontal offset (scale-invariant), matching
+        # the production heuristic's mandatory V2 vote. NOTE: this is only
+        # reliable on a roughly FRONTAL camera — on an oblique/overhead shot
+        # perspective offsets the nose for forward-facing students too, which is
+        # why looking-away is OFF by default in the pipeline (AI_ENABLE_LOOKING_AWAY).
+        shoulder_width = abs(l_shoulder[0] - r_shoulder[0]) or 1e-3
         shoulder_mid_x = (l_shoulder[0] + r_shoulder[0]) / 2
-        horiz_diff = abs(nose[0] - shoulder_mid_x)
+        ratio = abs(nose[0] - shoulder_mid_x) / shoulder_width
 
-        if horiz_diff > 80:
-            print(f"     Person {i+1}: 🔄 HEAD TURNED BACK  (diff: {horiz_diff:.0f}px)")
-        elif horiz_diff > 40:
-            print(f"     Person {i+1}: 👀 LOOKING SIDEWAYS  (diff: {horiz_diff:.0f}px)")
+        if ratio > 0.55:
+            print(f"     Person {i+1}: 🔄 HEAD TURNED BACK  (ratio: {ratio:.2f})")
+        elif ratio > 0.35:
+            print(f"     Person {i+1}: 👀 LOOKING SIDEWAYS  (ratio: {ratio:.2f})")
         else:
-            print(f"     Person {i+1}: ✅ FACING FORWARD    (diff: {horiz_diff:.0f}px)")
+            print(f"     Person {i+1}: ✅ FACING FORWARD    (ratio: {ratio:.2f})")
 
 print(f"\n{'='*50}")
 print("  Done.")
