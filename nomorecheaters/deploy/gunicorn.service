@@ -9,10 +9,12 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now nomorecheaters
 #
-# NOTE: this runs the web app only. The django-rq worker that executes the AI
-# analysis pipeline is a SEPARATE process — run `manage.py rqworker default`
-# under its own unit (rqworker.service) with the same venv/env. Without it,
-# enqueued jobs sit in QUEUED forever (unless RQ_ASYNC is off).
+# NOTE: the AI analysis pipeline runs NATIVELY in-process here — with RQ_ASYNC
+# off (the default) an upload runs run_analysis() synchronously inside the
+# request, so no Redis and no separate worker process are needed. The trade-off
+# is that the upload request blocks until analysis finishes, which is why the
+# --timeout below is large; keep it comfortably above your longest expected
+# analysis time or long videos will be killed mid-process (worker timeout).
 
 [Unit]
 Description=No More Cheaters Gunicorn daemon
@@ -23,13 +25,19 @@ User=YOUR_DEPLOY_USER
 Group=www-data
 WorkingDirectory=/PATH/TO/no-more-cheaters-backend/nomorecheaters
 
-# Load DJANGO_DEBUG=false, secret key, DB + Redis URLs, ALLOWED_HOSTS, etc.
-EnvironmentFile=/PATH/TO/no-more-cheaters-backend/nomorecheaters/.env
+# Optional env file. Settings are hardcoded in settings.py (DB, ALLOWED_HOSTS,
+# CORS/CSRF, FRONTEND_URL all baked in), so this file may not exist — the
+# leading '-' tells systemd to start anyway if it's missing.
+EnvironmentFile=-/PATH/TO/no-more-cheaters-backend/nomorecheaters/.env
 
+# --timeout is large because analysis runs in-request (see NOTE above). Each
+# sync worker can process one analysis at a time, so --workers also caps how
+# many uploads can be analysed concurrently — raise it (and your instance size)
+# if you need more parallelism.
 ExecStart=/PATH/TO/venv/bin/gunicorn \
     --workers 3 \
     --bind 127.0.0.1:8000 \
-    --timeout 120 \
+    --timeout 1800 \
     nomorecheaters.wsgi:application
 
 Restart=on-failure

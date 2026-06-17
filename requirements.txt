@@ -36,3 +36,15 @@ dj-rest-auth
 django-rq
 rq
 redis
+
+# ── Production / EC2 deployment ───────────────────────────────────────────────
+# WSGI server that Nginx proxies to (see deploy/gunicorn.service).
+gunicorn
+
+# MySQL driver — the default database (settings.DATABASES). mysqlclient is the
+# Django-recommended C driver; it needs system libs at install time:
+#   Ubuntu/Debian (EC2): sudo apt install -y default-libmysqlclient-dev build-essential pkg-config
+#   Amazon Linux 2023:   sudo dnf install -y mariadb-connector-c-devel gcc
+# Windows dev installs a prebuilt wheel (no compiler needed). To skip MySQL
+# locally, set DB_ENGINE=django.db.backends.sqlite3 and you don't need this.
+mysqlclient

@@ -1,0 +1,35 @@
+# ── No More Cheaters — Caddy reverse proxy (automatic HTTPS) ─────────────────
+#
+# Lightweight alternative to nginx.conf + Certbot for running the backend behind
+# HTTPS on EC2. Caddy automatically obtains and renews a Let's Encrypt
+# certificate for the domains below — no manual cert step.
+#
+# It proxies every request to the Django server running on 127.0.0.1:8000
+# (e.g. `python manage.py runserver 127.0.0.1:8000`). Because the app runs with
+# DEBUG=True, Django itself serves /media/ and /static/, so Caddy just forwards
+# everything — no file_server blocks needed here.
+#
+# Requirements:
+#   - DNS A records for both names point at this box's Elastic IP (done).
+#   - Security group allows inbound 80 (ACME challenge + redirect) and 443.
+#   - Port 8000 does NOT need to be public — Caddy reaches it over localhost.
+#
+# Install (Ubuntu):
+#   sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+#   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+#   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+#   sudo apt update && sudo apt install -y caddy
+#   sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+#
+# Caddy runs as a systemd service out of the box and auto-starts on reboot.
+
+nomorecheater.online, www.nomorecheater.online {
+	# Forward everything to the Django dev server on localhost.
+	reverse_proxy 127.0.0.1:8000
+
+	# Exam videos can be large; allow big uploads (mirror the app's 1 GiB cap).
+	request_body {
+		max_size 1024MB
+	}
+}

@@ -67,7 +67,14 @@ DEBUG = env_bool('DJANGO_DEBUG', True)
 # In DEBUG we default to the usual local hosts so dev works with no config.
 ALLOWED_HOSTS = env_list(
     'DJANGO_ALLOWED_HOSTS',
-    ['localhost', '127.0.0.1'] if DEBUG else [],
+    [
+        # Production backend (EC2, behind Nginx + Certbot)
+        'nomorecheater.online',
+        'www.nomorecheater.online',
+        # Local dev
+        'localhost',
+        '127.0.0.1',
+    ],
 )
 
 
@@ -125,6 +132,9 @@ MIDDLEWARE = [
 CORS_ALLOWED_ORIGINS = env_list(
     'CORS_ALLOWED_ORIGINS',
     [
+        # Production frontend (Vercel)
+        "https://nomorecheater.site",
+        # Local dev
         "http://localhost:3000",
         "http://localhost:8000",
         "http://localhost:5173",
@@ -132,9 +142,23 @@ CORS_ALLOWED_ORIGINS = env_list(
     ],
 )
 
+# Origins Django trusts for unsafe (POST/PUT/DELETE) cross-origin requests.
+# Django 4+ requires the scheme, e.g. "https://app.nomorecheater.online".
+# Behind the Nginx proxy this must list the public frontend + API origin(s).
+CSRF_TRUSTED_ORIGINS = env_list(
+    'CSRF_TRUSTED_ORIGINS',
+    [
+        # Production frontend (Vercel)
+        'https://nomorecheater.site',
+        # Local dev
+        'http://localhost:5173',
+        'http://127.0.0.1:5173',
+    ],
+)
+
 # Base URL of the React SPA. Used to build the email-confirmation link so it
 # lands on the frontend's /account/verify-email/<key> page instead of the API.
-FRONTEND_URL = env('FRONTEND_URL', 'http://localhost:5173')
+FRONTEND_URL = env('FRONTEND_URL', 'https://nomorecheater.site')
 
 
 ROOT_URLCONF = 'nomorecheaters.urls'
@@ -192,20 +216,40 @@ AUTHENTICATION_BACKENDS = [
 
 WSGI_APPLICATION = 'nomorecheaters.wsgi.application'
 
+# Behind the Caddy reverse proxy (which terminates HTTPS and forwards plain HTTP
+# to the dev server), trust its X-Forwarded-Proto header. Without this, Django
+# thinks every request is HTTP and builds http:// media/static URLs, which the
+# HTTPS frontend would then block as mixed content. Set unconditionally because
+# we run with DEBUG=True (the `if not DEBUG` hardening block below is skipped).
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
 
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
-
-# Defaults to local SQLite (zero-config dev); override via env for production
-# (e.g. ENGINE=django.db.backends.postgresql + the DB_* vars below).
+#
+# Hardcoded MySQL running locally ON the EC2 instance itself (no RDS).
+# Everything is hardcoded on purpose — no environment variables.
+# Create the database on the EC2 host with:
+#   CREATE DATABASE mydb CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+#   CREATE USER 'mydb'@'localhost' IDENTIFIED BY 'mydb';
+#   GRANT ALL PRIVILEGES ON mydb.* TO 'mydb'@'localhost';
 DATABASES = {
     'default': {
-        'ENGINE': env('DB_ENGINE', 'django.db.backends.sqlite3'),
-        'NAME': env('DB_NAME', str(BASE_DIR / 'db.sqlite3')),
-        'USER': env('DB_USER', ''),
-        'PASSWORD': env('DB_PASSWORD', ''),
-        'HOST': env('DB_HOST', ''),
-        'PORT': env('DB_PORT', ''),
+        'ENGINE': 'django.db.backends.mysql',
+        'NAME': 'mydb',
+        'USER': 'mydb',
+        'PASSWORD': 'mydb',
+        'HOST': 'localhost',
+        'PORT': '3306',
+        # Keep a connection open for 60s instead of reconnecting per request —
+        # meaningful under Gunicorn's persistent workers.
+        'CONN_MAX_AGE': 60,
+        # utf8mb4 = full Unicode; STRICT mode errors loudly on bad data instead
+        # of silently truncating it.
+        'OPTIONS': {
+            'charset': 'utf8mb4',
+            'sql_mode': 'STRICT_TRANS_TABLES',
+        },
     }
 }
 
@@ -312,6 +356,35 @@ MAX_UPLOAD_SIZE_BYTES = 1024 * 1024 * 1024  # 1 GiB
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 AUTH_USER_MODEL = 'apis.User'
+
+
+# ── Production security hardening ─────────────────────────────────────────────
+# Active only when DEBUG is off (i.e. on EC2). Local dev over plain HTTP is
+# unaffected. These assume the app sits behind the Nginx reverse proxy in
+# deploy/nginx.conf, which terminates TLS and forwards X-Forwarded-Proto.
+if not DEBUG:
+    # Trust the proxy's X-Forwarded-Proto so Django knows the original request
+    # was HTTPS (Gunicorn itself receives plain HTTP from Nginx).
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+    # Redirect any HTTP request to HTTPS. Disable via SECURE_SSL_REDIRECT=false
+    # if you terminate TLS elsewhere or are still on a bare-IP/HTTP setup.
+    SECURE_SSL_REDIRECT = env_bool('SECURE_SSL_REDIRECT', True)
+
+    # Only send session / CSRF cookies over HTTPS.
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+
+    # HSTS: tell browsers to stick to HTTPS. Starts at 0 (opt-in) so a
+    # misconfigured cert can't lock users out; raise once HTTPS is confirmed
+    # stable (e.g. 31536000 = 1 year) and enable the subdomain/preload flags.
+    SECURE_HSTS_SECONDS = int(env('SECURE_HSTS_SECONDS', '0'))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool('SECURE_HSTS_INCLUDE_SUBDOMAINS', False)
+    SECURE_HSTS_PRELOAD = env_bool('SECURE_HSTS_PRELOAD', False)
+
+    # Defence-in-depth headers.
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_REFERRER_POLICY = 'same-origin'
 
 
 
