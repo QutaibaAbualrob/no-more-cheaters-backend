@@ -950,6 +950,8 @@ class WorkspaceInviteView(APIView):
         invitee = User.objects.filter(email__iexact=invitee_email).first()
         if invitee is None:
             raise NotFound('No user found with this email')
+        if invitee.id == request.user.id:
+            raise ValidationError('You cannot invite yourself')
         if invitee.is_superuser or invitee.role == User.Role.ADMIN:
             raise ValidationError('Cannot invite admin users')
         if invitee.role not in (User.Role.INSTRUCTOR, User.Role.DEAN):

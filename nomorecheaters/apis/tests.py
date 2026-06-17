@@ -981,6 +981,23 @@ class SendWorkspaceInviteMembershipTests(TestCase):
         invite = send_workspace_invite(dean, instructor, exam=exam)
         self.assertEqual(invite.exam_id, exam.id)
 
+    def test_self_invite_rejected(self):
+        """A dean cannot invite themselves into their own workspace.
+
+        Accepting such an invite would make the owner a member of their own
+        workspace and corrupt accepted_instructor_rows.
+        """
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        from apis.models import WorkspaceInvite
+        from apis.services import send_workspace_invite
+
+        dean, _instructor, workspace = self._setup()
+        with self.assertRaises(DRFValidationError):
+            send_workspace_invite(dean, dean, workspace=workspace)
+        self.assertFalse(WorkspaceInvite.objects.filter(
+            workspace=workspace, instructor=dean).exists())
+
 
 class InviteRespondMethodTests(APITestCase):
     """Invite accept/decline must be POST, not a GET with side effects."""
