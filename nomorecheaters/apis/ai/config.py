@@ -91,12 +91,37 @@ POSE_MODEL = os.getenv('AI_POSE_MODEL', 'yolo11x-pose.pt')
 # of imgsz.
 OBJECT_IMGSZ = max(32, _env_int('AI_OBJECT_IMGSZ', 960))
 POSE_IMGSZ = max(32, _env_int('AI_POSE_IMGSZ', 960))
-# FP16 inference — GPU-only (errors on CPU), passed to predict() only when the
-# resolved device is not the CPU. Opt-in.
-OBJECT_HALF = _env_bool('AI_OBJECT_HALF', False)
+# FP16 (half-precision) inference. Applied to predict() ONLY when the resolved
+# device is a GPU — FP16 gives no benefit on CPU and some torch ops reject it
+# (Ultralytics guards it, but there is no reason to pass it), so both detectors
+# gate it on `device != 'cpu'`. Because of that gate it can safely default ON: on
+# a GPU it roughly halves inference cost and VRAM at negligible accuracy loss, and
+# on CPU it is simply never passed. AI_HALF is the master switch; AI_OBJECT_HALF /
+# AI_POSE_HALF override it per model (AI_OBJECT_HALF is kept for back-compat with
+# older deploys that set it explicitly).
+HALF = _env_bool('AI_HALF', True)
+OBJECT_HALF = _env_bool('AI_OBJECT_HALF', HALF)
+POSE_HALF = _env_bool('AI_POSE_HALF', HALF)
 # Class-agnostic NMS. Near-inert because the detector is restricted to classes
 # {phone, laptop}; opt-in only, default off.
 OBJECT_AGNOSTIC_NMS = _env_bool('AI_AGNOSTIC_NMS', False)
+
+# Warm each model with a one-shot dummy inference when it is first loaded, so the
+# first real frame of the first job doesn't pay the CUDA-context / cuDNN-autotune
+# / weight-upload latency. Best-effort — a failed warmup never blocks analysis.
+WARMUP = _env_bool('AI_WARMUP', True)
+
+# --- Video re-encode (annotated video + evidence clips) ----------------------
+# The annotated full-length video and each evidence clip are re-encoded to a
+# browser-playable H.264 file. NVENC (h264_nvenc) offloads that to the NVIDIA
+# GPU's dedicated hardware encoder — far faster than CPU libx264 on long videos —
+# but it needs an ffmpeg built WITH h264_nvenc (the bundled imageio-ffmpeg is not)
+# and an NVIDIA GPU. So it is best-effort with a guaranteed libx264 fallback:
+#   "auto" (default) → use NVENC when the ffmpeg binary advertises it, else
+#                      libx264; a failed NVENC run also falls back. NVENC can never
+#                      *break* a re-encode, only speed it up.
+#   "off"            → always libx264 (CPU). Forces CPU encoding.
+NVENC = os.getenv('AI_NVENC', 'auto').strip().lower()
 
 # --- Inference device --------------------------------------------------------
 # AI_DEVICE controls where YOLO runs:
@@ -134,7 +159,18 @@ def resolve_device():
             device = 'cpu'
 
     _resolved_device = device
-    logger.info('Running YOLO on device: %s', device)
+    if device == 0:
+        try:
+            import torch
+
+            logger.info(
+                'YOLO inference device: GPU 0 - %s (torch %s, CUDA %s)',
+                torch.cuda.get_device_name(0), torch.__version__, torch.version.cuda,
+            )
+        except Exception:  # noqa: BLE001 — device-name lookup is best-effort logging
+            logger.info('YOLO inference device: GPU 0')
+    else:
+        logger.info('YOLO inference device: CPU (no CUDA available or AI_DEVICE=cpu)')
     return device
 
 # --- Frame sampling ----------------------------------------------------------
