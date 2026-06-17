@@ -193,18 +193,18 @@ NOSE_SHOULDER_SIDEWAYS = _env_float('AI_NOSE_SHOULDER_SIDEWAYS', 0.35)
 NOSE_SHOULDER_TURNED = _env_float('AI_NOSE_SHOULDER_TURNED', 0.55)
 LOOKING_AWAY_MIN_VOTES = max(1, _env_int('AI_LOOKING_AWAY_VOTES', 2))
 
-# Master switch for looking-away detection. DEFAULT OFF.
+# Master switch for looking-away detection. DEFAULT ON.
 #
-# The heuristic is sound for a FRONTAL (student-facing) camera, but NOT for an
-# oblique/ceiling/wide camera: perspective alone displaces the nose horizontally
-# and hides one ear for *forward-facing* students, so the whole class trips it
-# (this footage flagged 7 of 12 forward/down-facing students). Enable it
-# (AI_ENABLE_LOOKING_AWAY=true) only with a roughly frontal camera; for an
-# oblique camera a dedicated 3D head-pose model (6DRepNet / L2CS-Net) is the
-# proper path. The pose pass still runs when this is off (it harvests the YOLO
-# person boxes used for evidence, H6) — only the looking-away *alerts* are
-# suppressed.
-ENABLE_LOOKING_AWAY = _env_bool('AI_ENABLE_LOOKING_AWAY', False)
+# WARNING: the 2-D head-yaw heuristic is sound for a FRONTAL (student-facing)
+# camera, but NOT for an oblique/ceiling/wide camera: perspective alone displaces
+# the nose horizontally and hides one ear for *forward-facing* students, so the
+# whole class trips it (one test clip flagged 7 of 12 forward/down-facing
+# students). On an oblique camera, disable it with AI_ENABLE_LOOKING_AWAY=false
+# (a real OS env var — this project's runtime does not load a .env file); the
+# proper path there is a dedicated 3D head-pose model (6DRepNet / L2CS-Net). The
+# pose pass still runs when this is off (it harvests the YOLO person boxes used
+# for evidence, H6) — only the looking-away *alerts* are suppressed.
+ENABLE_LOOKING_AWAY = _env_bool('AI_ENABLE_LOOKING_AWAY', True)
 
 # A looking-away event must contain at least this many *consecutive* sampled
 # frames before it becomes an alert — a single momentary glance never counts.
