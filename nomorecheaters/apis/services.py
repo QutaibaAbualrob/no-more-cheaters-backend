@@ -147,7 +147,15 @@ def send_workspace_invite(dean, instructor, exam=None, workspace=None):
     layer so callers that bypass the view — management commands, scripts, the
     pre-analyze importer — cannot create a duplicate invite for an existing
     member either.
+
+    A dean inviting *themselves* is rejected: accepting such an invite would make
+    the workspace owner a member of their own workspace, which pollutes
+    ``accepted_instructor_rows`` (the single source of truth for a dean's
+    assignable instructors) and lets the owner be picked as their own supervisor.
     """
+    if instructor.id == dean.id:
+        raise ValidationError('You cannot invite yourself')
+
     if workspace is not None and WorkspaceMembership.objects.filter(
             workspace=workspace, instructor=instructor).exists():
         raise ValidationError('This user is already a member of this workspace')
