@@ -447,6 +447,11 @@ class SessionReportView(APIView):
             # The annotated full-length video (boxes/labels drawn on flagged
             # frames), produced by the analysis pipeline. None until analysis runs.
             'annotated_video_url': absolute((job.metadata or {}).get('annotated_video_url')) if job else None,
+            # Per-person box tracks (source-frame pixel coords) for the live
+            # client-side overlay drawn over the original video. None for jobs
+            # analysed before this existed; the player then uses the annotated
+            # video instead. Coords are not URLs, so they pass through verbatim.
+            'overlay': (job.metadata or {}).get('overlay') if job else None,
         }
 
         if report is None:

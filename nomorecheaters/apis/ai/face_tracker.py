@@ -119,6 +119,90 @@ class PersonIndex:
                 result[person_id] = best[1]
         return result
 
+    def person_for_box(self, timestamp_sec: float, object_bbox, max_gap_sec: float = 2.0):
+        """Return ``(person_id, person_bbox)`` for the person nearest *object_bbox*.
+
+        Attributes a detected object (a phone/laptop box) to the person actually
+        holding/next to it, instead of the largest person in frame. Among the
+        people sighted within *max_gap_sec* of *timestamp_sec*, it prefers the one
+        whose box **contains the object's centre**; ties and non-containment fall
+        back to the greatest box overlap (IoU), then to the nearest centre. Returns
+        ``(None, None)`` when there is no usable box or nobody was sighted near the
+        time, so the caller falls back to its time-based pick (:meth:`query`).
+        """
+        if not object_bbox:
+            return None, None
+        ox1, oy1, ox2, oy2 = object_bbox
+        ocx, ocy = (ox1 + ox2) / 2.0, (oy1 + oy2) / 2.0
+
+        best = None  # (contains_centre, iou, -centre_distance)
+        for person_id, bbox in self.persons_at(timestamp_sec, max_gap_sec).items():
+            bx1, by1, bx2, by2 = bbox
+            contains = 1 if (bx1 <= ocx <= bx2 and by1 <= ocy <= by2) else 0
+            iou = _iou(object_bbox, bbox)
+            bcx, bcy = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
+            dist = ((ocx - bcx) ** 2 + (ocy - bcy) ** 2) ** 0.5
+            score = (contains, iou, -dist)
+            if best is None or score > best[0]:
+                best = (score, person_id, bbox)
+        if best is None:
+            return None, None
+        return best[1], best[2]
+
+    def to_overlay_dict(self, max_points_per_person: int = 3000) -> dict:
+        """Serialize the tracks for the frontend's client-side box overlay.
+
+        Returns ``{frame_width, frame_height, persons: {pid: [[t, x1, y1, x2, y2],
+        …]}}`` — integer pixel coords in source-frame space (the same space the
+        original video plays in, so the browser scales them with a simple
+        letterbox transform) and times in seconds rounded to milliseconds.
+
+        Long tracks are stride-downsampled to *max_points_per_person* so the JSON
+        the report ships stays small; the overlay interpolates between the
+        surviving samples, so on-screen motion stays smooth. The first and last
+        sample of every track are always kept so a box never appears late or
+        vanishes early.
+        """
+        def _point(sample):
+            ts, bbox = sample
+            x1, y1, x2, y2 = bbox
+            return [round(float(ts), 3), int(round(x1)), int(round(y1)),
+                    int(round(x2)), int(round(y2))]
+
+        persons: dict = {}
+        for person_id, samples in self.tracks.items():
+            if not samples:
+                continue
+            step = 1
+            if max_points_per_person and len(samples) > max_points_per_person:
+                step = (len(samples) // max_points_per_person) + 1
+            points = [_point(samples[i]) for i in range(0, len(samples), step)]
+            if (len(samples) - 1) % step != 0:
+                points.append(_point(samples[-1]))  # keep the true track end
+            persons[person_id] = points
+
+        return {
+            'frame_width': self.frame_width,
+            'frame_height': self.frame_height,
+            'persons': persons,
+        }
+
+
+def _iou(box_a, box_b) -> float:
+    """Intersection-over-union of two ``(x1, y1, x2, y2)`` boxes (0.0 if disjoint)."""
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = ix2 - ix1, iy2 - iy1
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
 
 def _cascade():
     """Load the bundled frontal-face Haar cascade, or ``None`` if unavailable."""
@@ -246,12 +330,70 @@ def _assign_faces(tracks: list[_Track], faces, timestamp: float, match_threshold
         best_track.count += 1
 
 
+# How many seconds of video we are willing to decode forward to correct a
+# keyframe-snapped seek. Bounds the forward-decode so a backend whose reported
+# position never advances cannot spin; 12s comfortably exceeds any real keyframe
+# (GOP) interval, so a genuine snap is always reached within the budget.
+_MAX_SEEK_CORRECTION_SEC = 12.0
+
+
+def _seek_to_frame(capture, target_frame: int, fps: float) -> None:
+    """Position *capture* so the next ``read()`` returns ``target_frame``.
+
+    ``cap.set(CAP_PROP_POS_FRAMES, n)`` lands on the nearest *preceding* keyframe
+    on many backends (notably OpenCV's FFmpeg backend on Windows), so the next
+    read can be several seconds *before* the requested frame — the root cause of
+    evidence clips/snapshots starting before the detected moment. When the
+    backend reports where it actually landed and that is *before* the target, we
+    decode forward (``grab``) to the real frame.
+
+    Defensive by construction: if the backend reports ``0``/garbage or claims it
+    is already at/after the target — i.e. we cannot trust the position — no frames
+    are skipped and we fall back to the backend's own seek, so this is never worse
+    than the bare ``set``. The forward-decode is bounded by
+    :data:`_MAX_SEEK_CORRECTION_SEC` so it can never spin.
+    """
+    import cv2
+
+    capture.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+    try:
+        landed = int(capture.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+    except Exception:  # noqa: BLE001 — unreadable position → trust the raw seek
+        return
+    # Only correct a genuine backward snap. landed == 0 (common "don't know"
+    # reading) or landed >= target (already accurate, or a lying backend) is left
+    # untouched so we never skip a whole clip's worth of frames on a backend that
+    # cannot report position.
+    if not (0 < landed < target_frame):
+        return
+    budget = int(max(1.0, fps) * _MAX_SEEK_CORRECTION_SEC)
+    for _ in range(min(target_frame - landed, budget)):
+        if not capture.grab():
+            break
+
+
+def _boxes_from_index(person_index, timestamp_sec: float):
+    """Per-frame ``[(person_id, bbox), …]`` from a :class:`PersonIndex`, or ``None``.
+
+    Used by :func:`extract_clip` to move the overlay with the people across the
+    clip. Fully defensive: any error (or an index that is not a real
+    ``PersonIndex``) yields ``None`` so the caller falls back to its static box.
+    """
+    try:
+        live = person_index.persons_at(timestamp_sec)
+    except Exception:  # noqa: BLE001 — best-effort: fall back to the static box
+        return None
+    if not live:
+        return None
+    return list(live.items())
+
+
 def _read_frame_at(capture, timestamp_sec: float, fps: float):
     """Seek a capture to *timestamp_sec* and return that frame (or ``None``)."""
     import cv2
 
     target = max(0, int(round(timestamp_sec * fps)))
-    capture.set(cv2.CAP_PROP_POS_FRAMES, target)
+    _seek_to_frame(capture, target, fps)
     grabbed, frame = capture.read()
     if grabbed:
         return frame
@@ -509,20 +651,29 @@ def _reencode_h264(src_path: str, dst_path: str, timeout: float = 120) -> bool:
 
 def extract_clip(video_path: str, timestamp_sec: float, out_path: str,
                  before: float = 0.0, after: float = 3.0,
-                 boxes=None, flagged_person_id=None, behavior_label: str = '') -> bool:
+                 boxes=None, flagged_person_id=None, behavior_label: str = '',
+                 person_index=None) -> bool:
     """Save a clip spanning ``[t-before, t+after]`` to *out_path* (mp4).
 
     Defaults capture ``[t, t+3s]`` — the clip starts exactly AT the detected
     cheating moment and shows the 3 seconds of evidence after it, rather than
     the second before it. The end is naturally clamped to the video duration
-    (the read loop stops when frames run out) and the start is clamped to 0.
+    (the read loop stops when frames run out) and the start is clamped to 0. The
+    seek itself is keyframe-corrected (see :func:`_seek_to_frame`) so the clip
+    actually begins at *timestamp_sec* rather than at the preceding keyframe,
+    which on some backends sits several seconds earlier.
 
     When *boxes* (an iterable of ``(person_id, bbox_xyxy)``) is supplied, the
     same overlay drawn on the snapshot is baked onto EVERY clip frame — a green
     box+behaviour label on the flagged person and gray boxes on others — so the
-    instructor watching the clip sees exactly who was flagged. The bbox is held
-    static across the clip (re-detecting per frame is too slow); with a centred
-    fallback box when nobody was tracked.
+    instructor watching the clip sees exactly who was flagged.
+
+    When *person_index* (a :class:`PersonIndex`) is also supplied, the overlay
+    *follows* the people across the clip: each frame uses the boxes tracked
+    nearest that moment, falling back to the static *boxes* whenever the index has
+    no sighting of the flagged person near that frame, so the green box never
+    blinks out. Omit it to keep the boxes static (re-detecting per frame is too
+    slow); a centred fallback box is used when nobody was tracked at all.
 
     The frames are first written with OpenCV; the result is then re-encoded to
     browser-friendly H.264 with ffmpeg when that binary is installed (see
@@ -572,14 +723,22 @@ def extract_clip(video_path: str, timestamp_sec: float, out_path: str,
     try:
         written = 0
         try:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            _seek_to_frame(capture, start_frame, fps)
             current = start_frame
             while current <= end_frame:
                 grabbed, frame = capture.read()
                 if not grabbed:
                     break
-                if drawable:
-                    _draw_person_boxes(cv2, frame, drawable, flagged_person_id, behavior_label)
+                # Move the overlay with the people when an index is available;
+                # otherwise (or when the flagged person isn't sighted near this
+                # frame) keep the static box so the green box never disappears.
+                frame_boxes = drawable
+                if person_index is not None:
+                    live = _boxes_from_index(person_index, current / fps)
+                    if live is not None and any(pid == flagged_person_id for pid, _ in live):
+                        frame_boxes = live
+                if frame_boxes:
+                    _draw_person_boxes(cv2, frame, frame_boxes, flagged_person_id, behavior_label)
                 elif fallback is not None:
                     _draw_box_with_label(cv2, frame, fallback[0], _FLAGGED_COLOR, fallback[1])
                 writer.write(frame)

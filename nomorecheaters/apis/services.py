@@ -855,11 +855,26 @@ def _attach_alert_evidence(video, session, alerts, person_index=None):
         # evidence the way an un-caught exception would (M1).
         failed_artifacts: list[str] = []
         try:
+            # Extract evidence at the precise event-start time the pipeline
+            # recorded (float), not the integer Alert.timestamp_sec: flooring to
+            # the whole second shifted every clip/snapshot up to ~1s earlier than
+            # the detected moment. Falls back to the integer when start_sec is
+            # absent (e.g. a demo/legacy alert).
+            start = float((alert.metadata or {}).get('start_sec', alert.timestamp_sec))
+
             person_id, bbox, others = 'person_1', None, {}
+            object_bbox = (alert.metadata or {}).get('object_bbox')
             if index is not None:
                 try:
-                    person_id, bbox = index.query(alert.timestamp_sec)
-                    others = index.persons_at(alert.timestamp_sec)
+                    others = index.persons_at(start)
+                    # Object evidence (phone/laptop): attribute to the person
+                    # actually near the object box, not the largest person in
+                    # frame. Falls back to the time-based pick when there is no
+                    # object box or no person overlaps it.
+                    if object_bbox and hasattr(index, 'person_for_box'):
+                        person_id, bbox = index.person_for_box(start, object_bbox)
+                    if bbox is None:
+                        person_id, bbox = index.query(start)
                 except Exception:  # noqa: BLE001
                     person_id, bbox, others = 'person_1', None, {}
 
@@ -887,7 +902,7 @@ def _attach_alert_evidence(video, session, alerts, person_index=None):
 
             # 1. Clean face crop → avatar (stored in metadata).
             try:
-                if extract_face_crop(video_path, alert.timestamp_sec, bbox,
+                if extract_face_crop(video_path, start, bbox,
                                       str(media_root / crop_rel), head_fraction=head_fraction):
                     metadata['crop_url'] = f'{media_url}/{crop_rel}'
             except Exception:  # noqa: BLE001
@@ -896,7 +911,7 @@ def _attach_alert_evidence(video, session, alerts, person_index=None):
             # 2. Full annotated frame → main evidence image (snapshot_url).
             try:
                 if extract_annotated_frame(
-                    video_path, alert.timestamp_sec, boxes_list, person_id,
+                    video_path, start, boxes_list, person_id,
                     behavior_label, str(media_root / frame_rel),
                 ):
                     alert.snapshot_url = f'{media_url}/{frame_rel}'
@@ -906,8 +921,9 @@ def _attach_alert_evidence(video, session, alerts, person_index=None):
             # 3. 3-second clip with the overlay on every frame (clip_url).
             try:
                 if extract_clip(
-                    video_path, alert.timestamp_sec, str(media_root / clip_rel),
+                    video_path, start, str(media_root / clip_rel),
                     boxes=boxes_list, flagged_person_id=person_id, behavior_label=behavior_label,
+                    person_index=index,
                 ):
                     alert.clip_url = f'{media_url}/{clip_rel}'
             except Exception:  # noqa: BLE001
@@ -994,6 +1010,9 @@ def build_ai_report(session, job=None):
                 'end_sec': round(event.end_sec, 3),
                 'duration_sec': round(event.duration_sec, 3),
                 'frame_count': event.frame_count,
+                # The object's box at start_sec, so evidence attribution can pick
+                # the person actually near the phone/laptop (see person_for_box).
+                'object_bbox': [int(round(v)) for v in event.bbox] if event.bbox else None,
             },
         )
         for event in result.events
@@ -1077,6 +1096,13 @@ def build_ai_report(session, job=None):
                 'analysis': result.metadata,
                 'annotated_video_path': result.annotated_video_path,
                 'annotated_video_url': _media_url_for(result.annotated_video_path),
+                # Per-person box tracks for the frontend's live overlay: the
+                # client draws these on top of the original video synced to
+                # playback, so boxes no longer have to be baked into a re-encoded
+                # copy. None when no index was built (the player then falls back to
+                # the annotated video). Best-effort — serialization never aborts a
+                # report.
+                'overlay': _overlay_payload(getattr(result, 'person_index', None)),
                 # Surface partial-evidence runs so the frontend can flag that some
                 # alerts are missing their snapshot/clip rather than implying the
                 # absence means "nothing happened" (M1).
@@ -1094,6 +1120,22 @@ def build_ai_report(session, job=None):
             job.save(update_fields=update_fields)
 
     return report
+
+
+def _overlay_payload(person_index):
+    """Serialize a :class:`PersonIndex` for the frontend overlay, or ``None``.
+
+    Best-effort: a missing index, one without ``to_overlay_dict`` (e.g. a test
+    double), or any serialization error yields ``None`` so the report still
+    builds — the player simply falls back to the annotated video.
+    """
+    if person_index is None or not hasattr(person_index, 'to_overlay_dict'):
+        return None
+    try:
+        return person_index.to_overlay_dict()
+    except Exception:  # noqa: BLE001 — overlay is a nicety, never fatal
+        logger.exception('Failed to serialize person tracks for overlay')
+        return None
 
 
 def _media_url_for(filesystem_path):

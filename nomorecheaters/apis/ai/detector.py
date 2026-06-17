@@ -49,6 +49,11 @@ class AlertEvent:
     start_sec: float
     end_sec: float
     frame_count: int           # number of sampled frames that contributed
+    # The detection box at ``start_sec`` (the first contributing frame). For
+    # object behaviours (phone/laptop) this is the OBJECT's box, used downstream
+    # to attribute the alert to the person actually near the object rather than
+    # the largest person in frame. ``None`` only for events built without a box.
+    bbox: tuple | None = None
 
     @property
     def duration_sec(self) -> float:
@@ -264,6 +269,7 @@ def consolidate_events(
                     start_sec=det.timestamp_sec,
                     end_sec=det.timestamp_sec,
                     frame_count=1,
+                    bbox=det.bbox,  # the box at start_sec, for spatial attribution
                 )
                 frames = [det.frame_number]
                 built.append((event, frames))
