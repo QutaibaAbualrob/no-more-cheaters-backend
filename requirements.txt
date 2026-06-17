@@ -11,6 +11,17 @@ requests
 python-dotenv
 
 # AI Pipeline — YOLO video analysis (numpy backs frame arrays / bbox math)
+# GPU NOTE: ultralytics pulls in torch transitively, often the CPU-only build
+# (torch x.y.z+cpu) — in which case YOLO silently runs on CPU. To run on an NVIDIA
+# GPU (local RTX 3070 or the AWS g4dn T4), install a CUDA build whose index matches
+# your torch version. For torch 2.12.x that is the CUDA 13.0 (cu130) index:
+#   pip uninstall -y torch torchvision torchaudio
+#   pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130
+# then verify: python -c "import torch; print(torch.cuda.is_available())"  # -> True
+# (No torchaudio wheel on cu130, and the pipeline doesn't use it. cu128/cu129 stop
+# at older torch — pick the index for YOUR version at download.pytorch.org/whl.)
+# Do NOT pin a CUDA wheel here; it breaks CPU-only / Windows dev installs.
+# Full guide: ../no-more-cheaters-plan/ai_arch/07_gpu_deployment.md
 ultralytics
 opencv-python-headless
 numpy

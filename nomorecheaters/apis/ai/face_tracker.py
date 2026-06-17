@@ -26,11 +26,16 @@ rather than raising, so a missing artifact never fails the whole analysis.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
+
+from . import config
+
+logger = logging.getLogger(__name__)
 
 
 # Greedy-matching distance threshold, as a fraction of the frame diagonal. A
@@ -608,38 +613,54 @@ def _ffmpeg_exe():
         return None
 
 
-def _reencode_h264(src_path: str, dst_path: str, timeout: float = 120) -> bool:
-    """Re-encode *src_path* to a browser-playable H.264 MP4 at *dst_path*.
+# H.264 codec arg sets shared by both re-encode targets (annotated video + clips).
+# Both pin yuv420p (the pixel format browsers require) and +faststart so the file
+# streams inline; the source carries no audio (-an).
+_LIBX264_VIDEO_ARGS = ('-vcodec', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an')
+# NVENC: H.264 on the NVIDIA GPU's hardware encoder. No -preset so it works across
+# ffmpeg versions (the named/p1-p7 preset sets differ); the default is plenty fast.
+_NVENC_VIDEO_ARGS = ('-c:v', 'h264_nvenc', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an')
 
-    OpenCV writes the temp clip as ``mp4v`` (MPEG-4 Part 2), which Chrome/Firefox
-    play poorly or not at all (they show one frame then freeze). We transcode to
-    ``libx264`` + ``yuv420p`` (the pixel format browsers require) with
-    ``+faststart`` so the clip streams inline. ffmpeg comes from the system or
-    the bundled :func:`_ffmpeg_exe`. Returns ``True`` only when a non-empty output
-    file was produced; the caller keeps the mp4v clip otherwise, so a missing
-    ffmpeg never breaks analysis.
+# Cached NVENC capability probe result for this process: None=unprobed, then bool.
+_NVENC_SUPPORTED = None
 
-    *timeout* bounds the ffmpeg call so a wedged process can never hang the rq
-    worker forever (M7). The default suits the short evidence clips; the
-    full-length annotated-video re-encode passes a larger, duration-scaled
-    budget (see :func:`apis.ai.detector._reencode_timeout_for`) so a long but
-    healthy transcode is not killed prematurely. A timeout — like any ffmpeg
-    failure — returns ``False``, leaving the caller to fall back to the mp4v file.
+
+def _nvenc_available(ffmpeg: str) -> bool:
+    """Whether to use NVENC: enabled via ``AI_NVENC`` AND this ffmpeg lists it.
+
+    Probed once per process by reading ``ffmpeg -encoders`` for ``h264_nvenc`` and
+    cached, so a CPU-only ffmpeg doesn't pay a wasted NVENC attempt on every clip.
+    Deliberately defensive — a capability probe must never raise into the encode
+    path, so any unexpected failure resolves to "not available" (use libx264).
     """
-    ffmpeg = _ffmpeg_exe()
-    if not ffmpeg:
+    global _NVENC_SUPPORTED
+    if str(config.NVENC).strip().lower() in ('off', 'false', '0', 'no'):
         return False
+    if _NVENC_SUPPORTED is not None:
+        return _NVENC_SUPPORTED
+
+    supported = False
+    try:
+        probe = subprocess.run(
+            [ffmpeg, '-hide_banner', '-encoders'],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=20, text=True,
+        )
+        listing = getattr(probe, 'stdout', '') or ''
+        supported = getattr(probe, 'returncode', 1) == 0 and 'h264_nvenc' in listing
+    except Exception:  # noqa: BLE001 — probe must never break encoding; fall back to CPU
+        supported = False
+
+    _NVENC_SUPPORTED = supported
+    logger.info('Video re-encode codec: %s', 'h264_nvenc (GPU)' if supported else 'libx264 (CPU)')
+    return supported
+
+
+def _run_ffmpeg_encode(ffmpeg, src_path, dst_path, video_args, timeout) -> bool:
+    """Run one ffmpeg transcode with *video_args*; True iff it produced a non-empty file."""
     try:
         result = subprocess.run(
-            [
-                ffmpeg, '-y',
-                '-i', str(src_path),
-                '-vcodec', 'libx264',
-                '-pix_fmt', 'yuv420p',
-                '-movflags', '+faststart',
-                '-an',  # the source clip carries no audio track
-                str(dst_path),
-            ],
+            [ffmpeg, '-y', '-i', str(src_path), *video_args, str(dst_path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=timeout,
@@ -647,6 +668,42 @@ def _reencode_h264(src_path: str, dst_path: str, timeout: float = 120) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return result.returncode == 0 and os.path.exists(dst_path) and os.path.getsize(dst_path) > 0
+
+
+def _reencode_h264(src_path: str, dst_path: str, timeout: float = 120) -> bool:
+    """Re-encode *src_path* to a browser-playable H.264 MP4 at *dst_path*.
+
+    OpenCV writes the temp clip as ``mp4v`` (MPEG-4 Part 2), which Chrome/Firefox
+    play poorly or not at all (they show one frame then freeze). We transcode to
+    H.264 + ``yuv420p`` (the pixel format browsers require) with ``+faststart`` so
+    the clip streams inline. ffmpeg comes from the system or the bundled
+    :func:`_ffmpeg_exe`. Returns ``True`` only when a non-empty output file was
+    produced; the caller keeps the mp4v clip otherwise, so a missing ffmpeg never
+    breaks analysis.
+
+    Codec selection: when ``AI_NVENC`` allows it and the ffmpeg binary advertises
+    ``h264_nvenc``, the GPU hardware encoder is used (far faster than CPU libx264
+    on long videos). libx264 is ALWAYS kept as a fallback, so a missing/old NVENC,
+    an exhausted encoder session, or a driver mismatch only makes the re-encode run
+    on the CPU — it can never *break* it.
+
+    *timeout* bounds each ffmpeg call so a wedged process can never hang the rq
+    worker forever (M7). The default suits the short evidence clips; the
+    full-length annotated-video re-encode passes a larger, duration-scaled budget
+    (see :func:`apis.ai.detector._reencode_timeout_for`) so a long but healthy
+    transcode is not killed prematurely. A timeout — like any ffmpeg failure —
+    returns ``False`` (after the libx264 fallback also fails), leaving the caller
+    to fall back to the mp4v file.
+    """
+    ffmpeg = _ffmpeg_exe()
+    if not ffmpeg:
+        return False
+    if _nvenc_available(ffmpeg):
+        if _run_ffmpeg_encode(ffmpeg, src_path, dst_path, _NVENC_VIDEO_ARGS, timeout):
+            return True
+        logger.warning('h264_nvenc re-encode failed; falling back to libx264 (CPU)')
+        _safe_remove(dst_path)  # drop any partial NVENC output before the CPU retry
+    return _run_ffmpeg_encode(ffmpeg, src_path, dst_path, _LIBX264_VIDEO_ARGS, timeout)
 
 
 def extract_clip(video_path: str, timestamp_sec: float, out_path: str,

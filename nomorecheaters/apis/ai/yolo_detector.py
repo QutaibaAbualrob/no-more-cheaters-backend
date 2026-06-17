@@ -56,12 +56,19 @@ class ObjectDetector:
 
     @property
     def model(self):
-        """Lazily load (and on first run, download) the YOLO weights onto the device."""
-        if self._model is None:
-            from ultralytics import YOLO
+        """Lazily load the YOLO weights onto the device (cached + warmed per process).
 
-            self._model = YOLO(self.model_path)
-            self._model.to(self.device)
+        Delegates to the shared model cache so a long-lived worker loads each
+        weights file once and reuses it across jobs, with a one-shot warmup on
+        first load. Ultralytics downloads the weights here if not already cached.
+        """
+        if self._model is None:
+            from .model_cache import load_model
+
+            self._model = load_model(
+                self.model_path, self.device,
+                half=self.half, warmup_imgsz=self.imgsz,
+            )
         return self._model
 
     def detect(self, frame) -> list[Detection]:
@@ -77,8 +84,9 @@ class ObjectDetector:
             'verbose': False,
             'device': self.device,
         }
-        # FP16 only works on GPU; passing half=True on CPU raises. Gate on the
-        # resolved device, NOT on `if self.half` alone (device 0 is falsy).
+        # FP16 helps only on GPU (no benefit on CPU, and some torch ops reject it),
+        # so pass half=True only when the device is not CPU. Gate on the resolved
+        # device, NOT on `if self.half` alone (device 0 is falsy).
         if self.half and self.device != 'cpu':
             predict_kwargs['half'] = True
 

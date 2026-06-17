@@ -59,6 +59,7 @@ class PoseAnalyzer:
         nose_shoulder_turned: float = config.NOSE_SHOULDER_TURNED,
         min_votes: int = config.LOOKING_AWAY_MIN_VOTES,
         imgsz: int = config.POSE_IMGSZ,
+        half: bool = config.POSE_HALF,
     ):
         self.model_path = model_path
         self.keypoint_confidence = keypoint_confidence
@@ -73,18 +74,26 @@ class PoseAnalyzer:
         self.nose_shoulder_turned = max(nose_shoulder_sideways + 1e-3, nose_shoulder_turned)
         self.min_votes = max(1, int(min_votes))
         self.imgsz = imgsz
+        self.half = half
         # `0` means GPU; `'cpu'` means CPU. Resolved at analysis time.
         self.device = device if device is not None else config.resolve_device()
         self._model = None
 
     @property
     def model(self):
-        """Lazily load (and on first run, download) the pose weights onto the device."""
-        if self._model is None:
-            from ultralytics import YOLO
+        """Lazily load the pose weights onto the device (cached + warmed per process).
 
-            self._model = YOLO(self.model_path)
-            self._model.to(self.device)
+        Delegates to the shared model cache so a long-lived worker loads the pose
+        weights once and reuses them across jobs, with a one-shot warmup on first
+        load. Ultralytics downloads the weights here if not already cached.
+        """
+        if self._model is None:
+            from .model_cache import load_model
+
+            self._model = load_model(
+                self.model_path, self.device,
+                half=self.half, warmup_imgsz=self.imgsz,
+            )
         return self._model
 
     def analyze(self, frame) -> list[PoseDetection]:
@@ -103,6 +112,11 @@ class PoseAnalyzer:
         """
         # Pass device explicitly; `0` (GPU) is falsy so it must not be gated.
         predict_kwargs = {'verbose': False, 'device': self.device, 'imgsz': self.imgsz}
+        # FP16 helps only on GPU (no benefit on CPU, and some torch ops reject it),
+        # so pass half=True only when the device is not CPU. Gate on the resolved
+        # device, NOT on `if self.half` alone (device 0 is falsy).
+        if self.half and self.device != 'cpu':
+            predict_kwargs['half'] = True
 
         results = self.model(frame, **predict_kwargs)
 
