@@ -70,10 +70,16 @@ def fake_analysis_result(behavior_type=Alert.BehaviorType.LOOKING_AWAY):
         duration_sec=3.0,
         frame_count=3,
         timestamp_sec=30,
+        # Mirror AlertEvent.bbox (the object's box at start_sec). build_ai_report
+        # reads event.bbox directly, so the stand-in must expose it or the real
+        # report path raises AttributeError and the job is marked FAILED.
+        bbox=None,
     )
     return SimpleNamespace(
         events=[event],
         annotated_video_path=None,
+        # Mirror AnalysisResult.person_index (read via getattr in build_ai_report).
+        person_index=None,
         metadata={
             'events_by_type': {str(behavior_type): 1},
             'total_events': 1,

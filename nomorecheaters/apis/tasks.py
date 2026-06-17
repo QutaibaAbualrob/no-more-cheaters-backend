@@ -126,6 +126,23 @@ def run_analysis(job_id, actor_id=None):
     session = job.session
     actor = User.objects.filter(id=actor_id).first() if actor_id else None
 
+    # Log the resolved inference device at the START of every analysis job. The
+    # AI layer's resolve_device() logs the device only once per worker process
+    # (the result is cached), so without this a long-lived worker records the
+    # device for its first job only. Emitting it here gives per-job provenance of
+    # whether the run used the GPU or fell back to CPU. Best-effort: a device
+    # lookup failure must never block the analysis that follows.
+    try:
+        from .ai import config as ai_config
+
+        device = ai_config.resolve_device()
+        logger.info(
+            'run_analysis %s: analysing session %s on %s',
+            job_id, session.id, 'GPU' if device != 'cpu' else 'CPU',
+        )
+    except Exception:  # noqa: BLE001 — device logging is observability, not core work
+        logger.exception('Could not resolve inference device for job %s', job_id)
+
     # build_ai_report runs the heavy pipeline and manages its own short DB
     # transactions internally; it is deliberately NOT wrapped in an outer
     # transaction here, so no connection/locks are held during the minutes of
